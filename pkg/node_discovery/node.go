@@ -6,6 +6,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/golang/protobuf/proto"
+
+	pb "github.com/nexusriot/rezoagwe/pkg/proto"
 )
 
 const (
@@ -115,7 +119,13 @@ func DiscoverNodes(bootstrapAddr string) []string {
 	}
 	defer conn.Close()
 
-	_, err = conn.Write([]byte("DISCOVER"))
+	dm := pb.BootstrapMessage{Action: pb.BootstrapAction_DISCOVER}
+	data, err := proto.Marshal(&dm)
+	if err != nil {
+		fmt.Println("Error marshalling DISCOVER message:", err)
+		return nil
+	}
+	_, err = conn.Write(data)
 	if err != nil {
 		fmt.Println("Error sending DISCOVER message:", err)
 		return nil
@@ -139,9 +149,12 @@ func RegisterNode(bootstrapAddr, nodeAddr string) {
 		return
 	}
 	defer conn.Close()
-
-	message := fmt.Sprintf("REGISTER:%s", nodeAddr)
-	_, err = conn.Write([]byte(message))
+	msg := pb.BootstrapMessage{
+		Action: pb.BootstrapAction_REGISTER,
+		Host:   &pb.Host{Host: nodeAddr},
+	}
+	toSend, err := proto.Marshal(&msg)
+	_, err = conn.Write(toSend)
 	if err != nil {
 		fmt.Println("Error sending REGISTER message:", err)
 	}

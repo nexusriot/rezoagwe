@@ -2,10 +2,15 @@ package node_bootstrap
 
 import (
 	"fmt"
+	"go.uber.org/zap"
 	"net"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/golang/protobuf/proto"
+
+	pb "github.com/nexusriot/rezoagwe/pkg/proto"
 )
 
 const (
@@ -14,13 +19,18 @@ const (
 )
 
 type BootstrapNode struct {
-	mu    sync.Mutex
-	nodes map[string]time.Time
+	mu     sync.Mutex
+	nodes  map[string]time.Time
+	logger *zap.Logger
 }
 
 func NewBootstrapNode() *BootstrapNode {
+	var loggerConfig = zap.NewProductionConfig()
+	loggerConfig.Level.SetLevel(zap.DebugLevel)
+	logger, _ := loggerConfig.Build()
 	return &BootstrapNode{
-		nodes: make(map[string]time.Time),
+		nodes:  make(map[string]time.Time),
+		logger: logger,
 	}
 }
 
@@ -62,14 +72,19 @@ func HandleBootstrap(bn *BootstrapNode, conn *net.UDPConn) {
 			fmt.Println("Error reading from UDP:", err)
 			continue
 		}
+		loaded := new(pb.BootstrapMessage)
+		err = proto.Unmarshal(buf[:n], loaded)
+		if err != nil {
+			bn.logger.Error("Failed to unmarshal b message", zap.Error(err))
+		}
 
-		message := strings.TrimSpace(string(buf[:n]))
-		if message == "DISCOVER" {
+		if loaded.Action == pb.BootstrapAction_DISCOVER {
 			nodes := bn.GetNodes()
 			response := strings.Join(nodes, ",")
 			conn.WriteToUDP([]byte(response), addr)
-		} else if strings.HasPrefix(message, "REGISTER:") {
-			nodeAddress := strings.TrimPrefix(message, "REGISTER:")
+
+		} else if loaded.Action == pb.BootstrapAction_REGISTER {
+			nodeAddress := loaded.Host.GetHost()
 			bn.RegisterNode(nodeAddress)
 			conn.WriteToUDP([]byte("REGISTERED"), addr)
 			fmt.Printf("Nodes: %s\n", bn.GetNodes())
