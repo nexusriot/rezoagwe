@@ -1,4 +1,4 @@
-package node_bootstrap
+package model
 
 import (
 	"fmt"
@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/golang/protobuf/proto"
-
 	pb "github.com/nexusriot/rezoagwe/pkg/proto"
 )
 
@@ -17,6 +16,11 @@ const (
 	BroadcastPort = 9999
 	NodeTimeout   = 10000 * time.Second
 )
+
+type Model struct {
+	mu    sync.Mutex
+	nodes map[string]time.Time
+}
 
 type BootstrapNode struct {
 	mu     sync.Mutex
