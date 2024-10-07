@@ -1,12 +1,12 @@
 package controller
 
 import (
-	"github.com/gdamore/tcell/v2"
 	"net"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/gdamore/tcell/v2"
 	"github.com/golang/protobuf/proto"
 
 	"github.com/nexusriot/rezoagwe/pkg/bootstrap/model"
@@ -36,7 +36,7 @@ func NewController(
 	return &controller
 }
 
-func (c *Controller) HandleBootstrap(conn *net.UDPConn, wg *sync.WaitGroup) {
+func (c *Controller) HandleBootstrap(conn *net.UDPConn, wg *sync.WaitGroup, uch chan<- []string) {
 	buf := make([]byte, 1024)
 	for {
 		n, addr, err := conn.ReadFromUDP(buf)
@@ -59,16 +59,17 @@ func (c *Controller) HandleBootstrap(conn *net.UDPConn, wg *sync.WaitGroup) {
 		} else if loaded.Action == pb.BootstrapAction_REGISTER {
 			nodeAddress := loaded.Host.GetHost()
 			c.model.RegisterNode(nodeAddress)
-			conn.WriteToUDP([]byte("REGISTERED"), addr)
+			//conn.WriteToUDP([]byte("REGISTERED"), addr)
 			//fmt.Printf("Nodes: %s\n", c.model.GetNodes())
-			c.fill()
+			updates := c.model.GetNodes()[:]
+			uch <- updates
 		}
 	}
 }
 
-func (c *Controller) fill() {
+func (c *Controller) fill(nodes []string) {
 	c.view.List.Clear()
-	for _, node := range c.model.GetNodes() {
+	for _, node := range nodes {
 		c.view.List.SetMainTextColor(tcell.Color31)
 		c.view.List.AddItem(node, node, 0, func() {
 		})
@@ -83,6 +84,7 @@ func (c *Controller) Start() error {
 		IP: net.ParseIP("0.0.0.0"),
 	}
 	var wg sync.WaitGroup
+	updateCh := make(chan []string)
 	conn, err := net.ListenUDP("udp", &addr)
 	if err == nil {
 		//fmt.Println("Error starting UDP server:", err)
@@ -95,14 +97,30 @@ func (c *Controller) Start() error {
 		}()
 		//fmt.Printf("Bootstrap node is listening on port %d\n", bn.broadcastPort)
 		wg.Add(1)
-		go c.HandleBootstrap(conn, &wg)
+		go c.HandleBootstrap(conn, &wg, updateCh)
 		c.view.List.SetChangedFunc(func(i int, s string, s2 string, r rune) {
 			_, cur := c.view.List.GetItemText(i)
 			cur = strings.TrimSpace(cur)
 		})
-		c.fill()
-		c.view.App.Run()
-		return nil
+
+		go func() {
+			for {
+				select {
+				case nodes, ok := <-updateCh:
+					if ok {
+						//c.fill(nodes)
+						c.view.List.Clear()
+						c.view.List.SetMainTextColor(tcell.Color31)
+						for _, node := range nodes {
+							c.view.List.AddItem(node, node, 0, func() {
+							})
+						}
+					}
+				default:
+				}
+			}
+		}()
+		return c.view.App.Run()
 	} else {
 		return err
 	}

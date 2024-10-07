@@ -5,11 +5,6 @@ import (
 	"time"
 )
 
-const (
-	BroadcastPort = 9999
-	NodeTimeout   = 10000 * time.Second
-)
-
 type Model struct {
 	BroadcastPort int
 	NodeTimeout   time.Duration
@@ -43,7 +38,7 @@ func (bn *Model) RemoveStaleNodes() {
 	defer bn.mu.Unlock()
 	now := time.Now()
 	for address, timestamp := range bn.nodes {
-		if now.Sub(timestamp) > NodeTimeout {
+		if now.Sub(timestamp) > bn.NodeTimeout {
 			delete(bn.nodes, address)
 		}
 	}
