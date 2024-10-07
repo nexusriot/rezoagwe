@@ -7,11 +7,10 @@ import (
 
 // View ...
 type View struct {
-	App     *tview.Application
-	Frame   *tview.Frame
-	Pages   *tview.Pages
-	List    *tview.List
-	Details *tview.TextView
+	App   *tview.Application
+	Frame *tview.Frame
+	Pages *tview.Pages
+	List  *tview.List
 }
 
 // NewView ...
@@ -20,20 +19,11 @@ func NewView() *View {
 	list := tview.NewList().
 		ShowSecondaryText(false)
 	list.SetBorder(true).
+		SetTitle("Nodes").
 		SetTitleAlign(tview.AlignLeft)
-
-	tv := tview.NewTextView().
-		SetDynamicColors(true).
-		SetRegions(true).
-		SetWordWrap(true).
-		SetChangedFunc(func() {
-			app.Draw()
-		})
-	tv.SetBorder(true).SetTitle("Details")
 
 	main := tview.NewFlex()
 	main.AddItem(list, 0, 2, true)
-	main.AddItem(tv, 0, 3, false)
 
 	pages := tview.NewPages().
 		AddPage("main", main, true, true)
@@ -48,7 +38,6 @@ func NewView() *View {
 		frame,
 		pages,
 		list,
-		tv,
 	}
 
 	return &v

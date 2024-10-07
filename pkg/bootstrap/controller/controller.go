@@ -1,7 +1,7 @@
 package controller
 
 import (
-	"fmt"
+	"github.com/gdamore/tcell/v2"
 	"net"
 	"strings"
 	"sync"
@@ -67,9 +67,11 @@ func (c *Controller) HandleBootstrap(conn *net.UDPConn, wg *sync.WaitGroup) {
 }
 
 func (c *Controller) fill() {
-	c.view.Details.Clear()
-	for node := range c.model.GetNodes() {
-		fmt.Fprintf(c.view.Details, "[green] Node name: [white] %s\n", node)
+	c.view.List.Clear()
+	for _, node := range c.model.GetNodes() {
+		c.view.List.SetMainTextColor(tcell.Color31)
+		c.view.List.AddItem(node, node, 0, func() {
+		})
 	}
 
 }
@@ -98,6 +100,7 @@ func (c *Controller) Start() error {
 			_, cur := c.view.List.GetItemText(i)
 			cur = strings.TrimSpace(cur)
 		})
+		c.fill()
 		c.view.App.Run()
 		return nil
 	} else {
