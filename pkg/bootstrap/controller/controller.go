@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"fmt"
 	"net"
 	"strings"
 	"sync"
@@ -8,6 +9,7 @@ import (
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/golang/protobuf/proto"
+	"github.com/rivo/tview"
 
 	"github.com/nexusriot/rezoagwe/pkg/bootstrap/model"
 	"github.com/nexusriot/rezoagwe/pkg/bootstrap/view"
@@ -28,6 +30,7 @@ func NewController(
 ) *Controller {
 	m := model.NewModel(broadcastPort, nodeTimeout)
 	v := view.NewView()
+	v.Frame.AddText(fmt.Sprintf("Rezoagve Bootstrap 0.0.1 PoC"), true, tview.AlignCenter, tcell.ColorGreen)
 	controller := Controller{
 		debug: debug,
 		view:  v,
@@ -36,7 +39,7 @@ func NewController(
 	return &controller
 }
 
-func (c *Controller) HandleBootstrap(conn *net.UDPConn, wg *sync.WaitGroup, uch chan<- []string) {
+func (c *Controller) HandleBootstrap(conn *net.UDPConn, wg *sync.WaitGroup, uch chan<- struct{}) {
 	buf := make([]byte, 1024)
 	for {
 		n, addr, err := conn.ReadFromUDP(buf)
@@ -61,30 +64,31 @@ func (c *Controller) HandleBootstrap(conn *net.UDPConn, wg *sync.WaitGroup, uch 
 			c.model.RegisterNode(nodeAddress)
 			//conn.WriteToUDP([]byte("REGISTERED"), addr)
 			//fmt.Printf("Nodes: %s\n", c.model.GetNodes())
-			updates := c.model.GetNodes()[:]
-			uch <- updates
+			uch <- struct{}{}
 		}
 	}
 }
 
 func (c *Controller) fill(nodes []string) {
-	c.view.List.Clear()
-	for _, node := range nodes {
-		c.view.List.SetMainTextColor(tcell.Color31)
-		c.view.List.AddItem(node, node, 0, func() {
-		})
-	}
-
+	c.view.App.QueueUpdateDraw(func() {
+		c.view.List.Clear()
+		for _, node := range nodes {
+			c.view.List.SetMainTextColor(tcell.Color31)
+			c.view.List.AddItem(node, node, 0, func() {
+			})
+		}
+	})
 }
 
 func (c *Controller) Start() error {
+
 	addr := net.UDPAddr{
 		Port: c.model.BroadcastPort,
 		// Todo: run on 127.0.0.1
 		IP: net.ParseIP("0.0.0.0"),
 	}
 	var wg sync.WaitGroup
-	updateCh := make(chan []string)
+	updateCh := make(chan struct{})
 	conn, err := net.ListenUDP("udp", &addr)
 	if err == nil {
 		//fmt.Println("Error starting UDP server:", err)
@@ -106,15 +110,9 @@ func (c *Controller) Start() error {
 		go func() {
 			for {
 				select {
-				case nodes, ok := <-updateCh:
+				case _, ok := <-updateCh:
 					if ok {
-						//c.fill(nodes)
-						c.view.List.Clear()
-						c.view.List.SetMainTextColor(tcell.Color31)
-						for _, node := range nodes {
-							c.view.List.AddItem(node, node, 0, func() {
-							})
-						}
+						c.fill(c.model.GetNodes())
 					}
 				default:
 				}
