@@ -1,59 +1,48 @@
-package node_discovery
+package controller
 
 import (
 	"fmt"
+	"github.com/gdamore/tcell/v2"
+	"github.com/rivo/tview"
 	"net"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/golang/protobuf/proto"
 
+	"github.com/nexusriot/rezoagwe/pkg/discovery/model"
+	"github.com/nexusriot/rezoagwe/pkg/discovery/view"
 	pb "github.com/nexusriot/rezoagwe/pkg/proto"
 )
 
-const (
-	broadcastPort     = 9999
-	discoveryInterval = 5 * time.Second
-)
-
-type KVStore struct {
-	mu    sync.RWMutex
-	store map[string]string
+type Controller struct {
+	debug bool
+	view  *view.View
+	model *model.Model
 }
 
-func NewKVStore() *KVStore {
-	return &KVStore{
-		store: make(map[string]string),
+func NewController(
+	debug bool,
+	broadcastPort int,
+) *Controller {
+	m := model.NewModel()
+	v := view.NewView()
+	v.Frame.AddText(fmt.Sprintf("Rezoagve Discovery Node v.0.0.1 PoC"), true, tview.AlignCenter, tcell.ColorGreen)
+	controller := Controller{
+		debug: debug,
+		view:  v,
+		model: m,
 	}
+	return &controller
 }
 
-func (kv *KVStore) Set(key, value string) {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-	kv.store[key] = value
-}
-
-func (kv *KVStore) Get(key string) (string, bool) {
-	kv.mu.RLock()
-	defer kv.mu.RUnlock()
-	val, ok := kv.store[key]
-	return val, ok
-}
-
-func (kv *KVStore) Delete(key string) {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-	delete(kv.store, key)
-}
-
-func HandleConnection(conn *net.UDPConn, kv *KVStore, nodes *sync.Map) {
+func (c *Controller) HandleConnection(conn *net.UDPConn) {
 	buf := make([]byte, 1024)
 
 	for {
 		n, addr, err := conn.ReadFromUDP(buf)
 		if err != nil {
-			fmt.Println("Error reading from UDP:", err)
+			//fmt.Println("Error reading from UDP:", err)
 			continue
 		}
 
@@ -73,25 +62,77 @@ func HandleConnection(conn *net.UDPConn, kv *KVStore, nodes *sync.Map) {
 				continue
 			}
 			value := parts[2]
-			kv.Set(key, value)
-			propagate(nodes, message)
+			c.model.Store.Set(key, value)
+			propagate(c.model.Nodes, message)
 			conn.WriteToUDP([]byte("OK"), addr)
 		case "GET":
-			value, ok := kv.Get(key)
+			value, ok := c.model.Store.Get(key)
 			if ok {
 				conn.WriteToUDP([]byte(value), addr)
 			} else {
 				conn.WriteToUDP([]byte("Key not found"), addr)
 			}
 		case "DELETE":
-			kv.Delete(key)
-			propagate(nodes, message)
+			c.model.Store.Delete(key)
+			propagate(c.model.Nodes, message)
 			conn.WriteToUDP([]byte("OK"), addr)
 		default:
 			conn.WriteToUDP([]byte("Unknown command"), addr)
 		}
 	}
 }
+
+func (c *Controller) Start() error {
+	return c.view.App.Run()
+}
+
+//package main
+//
+//import (
+//"fmt"
+//"net"
+//"os"
+//"sync"
+//
+//nd "github.com/nexusriot/rezoagwe/pkg/discovery"
+//)
+
+//func main() {
+//	if len(os.Args) < 3 {
+//		fmt.Println("Usage: kv_node_discovery <address> <bootstrap_address>")
+//		return
+//	}
+//
+//	address := os.Args[1]
+//	bootstrapAddress := os.Args[2]
+//	nodes := &sync.Map{}
+//
+//	nd.RegisterNode(bootstrapAddress, address)
+//
+//	discoveredNodes := nd.DiscoverNodes(bootstrapAddress)
+//	for _, node := range discoveredNodes {
+//		if node != "" && node != address {
+//			nodes.Store(node, true)
+//		}
+//	}
+//
+//	addr, err := net.ResolveUDPAddr("udp", address)
+//	if err != nil {
+//		fmt.Println("Error resolving address:", err)
+//		return
+//	}
+//	conn, err := net.ListenUDP("udp", addr)
+//	if err != nil {
+//		fmt.Println("Error starting UDP server:", err)
+//		return
+//	}
+//	defer conn.Close()
+//
+//	kv := nd.NewKVStore()
+//	fmt.Printf("UDP node is listening on %s\n", address)
+//
+//	nd.HandleConnection(conn, kv, nodes)
+//}
 
 func propagate(nodes *sync.Map, message string) {
 	nodes.Range(func(key, value interface{}) bool {
