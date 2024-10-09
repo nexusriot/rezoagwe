@@ -1,10 +1,16 @@
 syntax = "proto3";
+option go_package = "github.com/nexusriot/rezoagwe/proto";
 
 package rezoagwe;
 
 enum BootstrapAction {
     DISCOVER = 0;
     REGISTER = 1;
+}
+
+enum DiscoveryAction {
+  SET = 0;
+  DELETE = 1;
 }
 
 message Host {
@@ -21,4 +27,5 @@ message Payload {
   string Key = 1;
   bytes Value = 2;
   repeated Host hosts = 3;
+  DiscoveryAction action = 4;
 }
