@@ -3,6 +3,7 @@ package model
 import (
 	"fmt"
 	"github.com/golang/protobuf/proto"
+	"github.com/google/uuid"
 	pb "github.com/nexusriot/rezoagwe/pkg/proto"
 	log "github.com/sirupsen/logrus"
 	"net"
@@ -45,10 +46,12 @@ type Model struct {
 	Nodes         *sync.Map
 	BootstrapAddr string
 	NodeAddr      string
+	NodeUUID      string
 }
 
 func NewModel(bootstrapAddr, nodeAddr string) *Model {
 	controller := Model{
+		NodeUUID:      uuid.New().String(),
 		BootstrapAddr: bootstrapAddr,
 		NodeAddr:      nodeAddr,
 		Store:         NewKVStore(),
@@ -73,6 +76,20 @@ func (bn *Model) RegisterNode() {
 	if err != nil {
 		log.Errorf("Error sending REGISTER message: %s", err)
 	}
+}
+
+func (bn *Model) GetNodes() []string {
+	var res []string
+
+	bn.Nodes.Range(func(key, value interface{}) bool {
+		res = append(res, key.(string))
+		return true
+	})
+	return res
+}
+
+func (bn *Model) GetStore() map[string]string {
+	return bn.Store.store
 }
 
 func (bn *Model) DiscoverNodes() []string {

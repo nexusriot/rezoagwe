@@ -72,8 +72,8 @@ func (c *Controller) HandleBootstrap(conn *net.UDPConn, wg *sync.WaitGroup, uch 
 func (c *Controller) fill(nodes []string) {
 	c.view.App.QueueUpdateDraw(func() {
 		c.view.List.Clear()
+		c.view.List.SetMainTextColor(tcell.Color31)
 		for _, node := range nodes {
-			c.view.List.SetMainTextColor(tcell.Color31)
 			c.view.List.AddItem(node, node, 0, func() {
 			})
 		}

@@ -2,6 +2,8 @@ package controller
 
 import (
 	"fmt"
+	"sync"
+
 	"github.com/gdamore/tcell/v2"
 	"github.com/golang/protobuf/proto"
 	"github.com/rivo/tview"
@@ -35,7 +37,7 @@ func NewController(
 	return &controller
 }
 
-func (c *Controller) HandleConnection(conn *net.UDPConn) {
+func (c *Controller) HandleConnection(conn *net.UDPConn, wg *sync.WaitGroup, dich chan<- struct{}) {
 
 	buf := make([]byte, 1024)
 	for {
@@ -66,10 +68,14 @@ func (c *Controller) HandleConnection(conn *net.UDPConn) {
 			continue
 		}
 		c.propagate(loaded)
+		dich <- struct{}{}
 	}
 }
 
 func (c *Controller) Start() error {
+
+	var wg sync.WaitGroup
+	diCh := make(chan struct{})
 
 	// move to network methods
 	c.model.RegisterNode()
@@ -78,6 +84,8 @@ func (c *Controller) Start() error {
 	for _, node := range discoveredNodes {
 		if node != "" && node != c.model.NodeAddr {
 			c.model.Nodes.Store(node, true)
+			// TODO - > improve discover
+
 		}
 	}
 	addr, err := net.ResolveUDPAddr("udp", c.model.NodeAddr)
@@ -90,10 +98,25 @@ func (c *Controller) Start() error {
 	}
 	defer conn.Close()
 	log.Infof("UDP node is listening on %s", addr)
+	wg.Add(1)
+	go c.HandleConnection(conn, &wg, diCh)
 
-	go c.HandleConnection(conn)
-
+	c.fillNodes()
+	c.fillDetails()
 	c.setInput()
+
+	go func() {
+		for {
+			select {
+			case _, ok := <-diCh:
+				if ok {
+					c.fillStoreQ()
+				}
+			default:
+			}
+		}
+	}()
+
 	return c.view.App.Run()
 }
 
@@ -104,7 +127,8 @@ func (c *Controller) create() *tcell.EventKey {
 		value := createForm.GetFormItem(1).(*tview.InputField).GetText()
 		if key != "" {
 			log.Debugf("Creating record: key: %s, value: %s", key, value)
-			c.model.Store.Set(key, value)
+			c.store(key, value)
+			c.view.Pages.RemovePage("modal")
 		}
 	})
 	createForm.AddButton("Quit", func() {
@@ -112,6 +136,16 @@ func (c *Controller) create() *tcell.EventKey {
 	})
 	c.view.Pages.AddPage("modal", c.view.ModalEdit(createForm, 60, 11), true, true)
 	return nil
+}
+
+func (c *Controller) fillNodes() {
+	nodes := c.model.GetNodes()
+	c.view.NodeList.Clear()
+	c.view.NodeList.SetMainTextColor(tcell.Color31)
+	for _, node := range nodes {
+		c.view.NodeList.AddItem(node, node, 0, func() {
+		})
+	}
 }
 
 func (c *Controller) setInput() {
@@ -138,6 +172,40 @@ func (c *Controller) setInput() {
 func (c *Controller) Stop() {
 	log.Debugf("exit...")
 	c.view.App.Stop()
+}
+
+func (c *Controller) fillDetails() {
+	c.view.Details.Clear()
+	fmt.Fprintf(c.view.Details, "[blue] Node Uuid -> [gray] %s\n", c.model.NodeUUID)
+	fmt.Fprintf(c.view.Details, "[blue] Node Address -> [gray] %s\n\n", c.model.NodeAddr)
+	fmt.Fprintf(c.view.Details, "[green] Bootstrap -> [white] %s\n", c.model.BootstrapAddr)
+}
+
+func (c *Controller) fillStoreQ() {
+	c.view.App.QueueUpdateDraw(func() {
+		c.view.List.Clear()
+		for key, value := range c.model.GetStore() {
+			kv := fmt.Sprintf("%s:%s", key, value)
+			c.view.List.AddItem(kv, kv, 0, func() {
+			})
+		}
+	})
+}
+
+func (c *Controller) store(key, value string) {
+	c.model.Store.Set(key, value)
+	msg := pb.Payload{
+		Action: pb.DiscoveryAction_SET,
+		Key:    key,
+		Value:  []byte(value),
+	}
+	c.propagate(&msg)
+	c.view.List.Clear()
+	for key, value := range c.model.GetStore() {
+		kv := fmt.Sprintf("%s:%s", key, value)
+		c.view.List.AddItem(kv, kv, 0, func() {
+		})
+	}
 }
 
 func (c *Controller) propagate(message *pb.Payload) {
