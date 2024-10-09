@@ -66,7 +66,7 @@ func NewView() *View {
 	}
 
 	frame := tview.NewFrame(pages)
-	frame.AddText("[]", false, tview.AlignCenter, tcell.ColorWhite)
+	frame.AddText("[::b][c[][::-] Create key [::b][Ctrl+q][::-] Quit", false, tview.AlignCenter, tcell.ColorWhite)
 
 	app.SetRoot(frame, true)
 
@@ -81,4 +81,20 @@ func NewView() *View {
 	}
 
 	return &v
+}
+
+func (v *View) NewCreateForm(header string) *tview.Form {
+	form := tview.NewForm().
+		AddInputField("Key", "", 30, nil, nil).
+		AddInputField("Value", "", 30, nil, nil)
+	form.SetBorder(true)
+	form.SetTitle(header)
+	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
+		case tcell.KeyEsc:
+			v.Pages.RemovePage("modal")
+		}
+		return event
+	})
+	return form
 }

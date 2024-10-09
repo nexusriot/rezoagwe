@@ -3,12 +3,10 @@ package controller
 import (
 	"fmt"
 	"github.com/gdamore/tcell/v2"
-	"github.com/rivo/tview"
-	"net"
-	"strings"
-	"sync"
-
 	"github.com/golang/protobuf/proto"
+	"github.com/rivo/tview"
+	log "github.com/sirupsen/logrus"
+	"net"
 
 	"github.com/nexusriot/rezoagwe/pkg/discovery/model"
 	"github.com/nexusriot/rezoagwe/pkg/discovery/view"
@@ -23,9 +21,10 @@ type Controller struct {
 
 func NewController(
 	debug bool,
-	broadcastPort int,
+	bootstrapAddr,
+	nodeAddr string,
 ) *Controller {
-	m := model.NewModel()
+	m := model.NewModel(bootstrapAddr, nodeAddr)
 	v := view.NewView()
 	v.Frame.AddText(fmt.Sprintf("Rezoagve Discovery Node v.0.0.1 PoC"), true, tview.AlignCenter, tcell.ColorGreen)
 	controller := Controller{
@@ -37,105 +36,112 @@ func NewController(
 }
 
 func (c *Controller) HandleConnection(conn *net.UDPConn) {
+
 	buf := make([]byte, 1024)
-
 	for {
-		n, addr, err := conn.ReadFromUDP(buf)
+		n, _, err := conn.ReadFromUDP(buf)
 		if err != nil {
-			//fmt.Println("Error reading from UDP:", err)
+			log.Errorf("Error reading from UDP: %s", err)
 			continue
 		}
 
-		message := strings.TrimSpace(string(buf[:n]))
-		parts := strings.SplitN(message, " ", 3)
+		loaded := new(pb.Payload)
+		err = proto.Unmarshal(buf[:n], loaded)
 
-		if len(parts) < 2 {
-			conn.WriteToUDP([]byte("Invalid command"), addr)
+		if err != nil {
+			log.Errorf("Error Unmarshal message: %s", err)
 			continue
 		}
 
-		command, key := parts[0], parts[1]
-		switch command {
-		case "SET":
-			if len(parts) < 3 {
-				conn.WriteToUDP([]byte("SET command requires a value"), addr)
-				continue
-			}
-			value := parts[2]
-			c.model.Store.Set(key, value)
-			propagate(c.model.Nodes, message)
-			conn.WriteToUDP([]byte("OK"), addr)
-		case "GET":
-			value, ok := c.model.Store.Get(key)
-			if ok {
-				conn.WriteToUDP([]byte(value), addr)
-			} else {
-				conn.WriteToUDP([]byte("Key not found"), addr)
-			}
-		case "DELETE":
-			c.model.Store.Delete(key)
-			propagate(c.model.Nodes, message)
-			conn.WriteToUDP([]byte("OK"), addr)
+		switch loaded.Action {
+
+		case pb.DiscoveryAction_SET:
+			c.model.Store.Set(loaded.Key, string(loaded.Value))
+
+		case pb.DiscoveryAction_DELETE:
+			c.model.Store.Delete(loaded.Key)
+
 		default:
-			conn.WriteToUDP([]byte("Unknown command"), addr)
+			log.Errorf("Unknown discovery action: %s", loaded.Action)
+			continue
 		}
+		c.propagate(loaded)
 	}
 }
 
 func (c *Controller) Start() error {
+
+	// move to network methods
+	c.model.RegisterNode()
+
+	discoveredNodes := c.model.DiscoverNodes()
+	for _, node := range discoveredNodes {
+		if node != "" && node != c.model.NodeAddr {
+			c.model.Nodes.Store(node, true)
+		}
+	}
+	addr, err := net.ResolveUDPAddr("udp", c.model.NodeAddr)
+	if err != nil {
+		log.Panicf("Error resolving address: %s", err)
+	}
+	conn, err := net.ListenUDP("udp", addr)
+	if err != nil {
+		log.Panicf("Error starting UDP server: %s", err)
+	}
+	defer conn.Close()
+	log.Infof("UDP node is listening on %s", addr)
+
+	go c.HandleConnection(conn)
+
+	c.setInput()
 	return c.view.App.Run()
 }
 
-//package main
-//
-//import (
-//"fmt"
-//"net"
-//"os"
-//"sync"
-//
-//nd "github.com/nexusriot/rezoagwe/pkg/discovery"
-//)
+func (c *Controller) create() *tcell.EventKey {
+	createForm := c.view.NewCreateForm(fmt.Sprintf("New key"))
+	createForm.AddButton("Save", func() {
+		key := createForm.GetFormItem(0).(*tview.InputField).GetText()
+		value := createForm.GetFormItem(1).(*tview.InputField).GetText()
+		if key != "" {
+			log.Debugf("Creating record: key: %s, value: %s", key, value)
+			c.model.Store.Set(key, value)
+		}
+	})
+	createForm.AddButton("Quit", func() {
+		c.view.Pages.RemovePage("modal")
+	})
+	c.view.Pages.AddPage("modal", c.view.ModalEdit(createForm, 60, 11), true, true)
+	return nil
+}
 
-//func main() {
-//	if len(os.Args) < 3 {
-//		fmt.Println("Usage: kv_node_discovery <address> <bootstrap_address>")
-//		return
-//	}
-//
-//	address := os.Args[1]
-//	bootstrapAddress := os.Args[2]
-//	nodes := &sync.Map{}
-//
-//	nd.RegisterNode(bootstrapAddress, address)
-//
-//	discoveredNodes := nd.DiscoverNodes(bootstrapAddress)
-//	for _, node := range discoveredNodes {
-//		if node != "" && node != address {
-//			nodes.Store(node, true)
-//		}
-//	}
-//
-//	addr, err := net.ResolveUDPAddr("udp", address)
-//	if err != nil {
-//		fmt.Println("Error resolving address:", err)
-//		return
-//	}
-//	conn, err := net.ListenUDP("udp", addr)
-//	if err != nil {
-//		fmt.Println("Error starting UDP server:", err)
-//		return
-//	}
-//	defer conn.Close()
-//
-//	kv := nd.NewKVStore()
-//	fmt.Printf("UDP node is listening on %s\n", address)
-//
-//	nd.HandleConnection(conn, kv, nodes)
-//}
+func (c *Controller) setInput() {
+	c.view.App.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
+		case tcell.KeyCtrlQ:
+			c.Stop()
+			return nil
+		}
+		return event
+	})
+	c.view.List.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
+		case tcell.KeyRune:
+			switch event.Rune() {
+			case 'c':
+				return c.create()
+			}
+		}
+		return event
+	})
 
-func propagate(nodes *sync.Map, message string) {
-	nodes.Range(func(key, value interface{}) bool {
+}
+func (c *Controller) Stop() {
+	log.Debugf("exit...")
+	c.view.App.Stop()
+}
+
+func (c *Controller) propagate(message *pb.Payload) {
+	c.model.Nodes.Range(func(key, value interface{}) bool {
 		addr, err := net.ResolveUDPAddr("udp", key.(string))
 		if err != nil {
 			fmt.Println("Error resolving address:", err)
@@ -147,56 +153,9 @@ func propagate(nodes *sync.Map, message string) {
 			return true
 		}
 		defer conn.Close()
-		conn.Write([]byte(message))
+		toSend, err := proto.Marshal(message)
+		_, err = conn.Write(toSend)
+		conn.Write(toSend)
 		return true
 	})
-}
-
-func DiscoverNodes(bootstrapAddr string) []string {
-	conn, err := net.Dial("udp", bootstrapAddr)
-	if err != nil {
-		fmt.Println("Error connecting to bootstrap node:", err)
-		return nil
-	}
-	defer conn.Close()
-
-	dm := pb.BootstrapMessage{Action: pb.BootstrapAction_DISCOVER}
-	data, err := proto.Marshal(&dm)
-	if err != nil {
-		fmt.Println("Error marshalling DISCOVER message:", err)
-		return nil
-	}
-	_, err = conn.Write(data)
-	if err != nil {
-		fmt.Println("Error sending DISCOVER message:", err)
-		return nil
-	}
-
-	buf := make([]byte, 1024)
-	n, err := conn.Read(buf)
-	if err != nil {
-		fmt.Println("Error reading response:", err)
-		return nil
-	}
-
-	response := strings.TrimSpace(string(buf[:n]))
-	return strings.Split(response, ",")
-}
-
-func RegisterNode(bootstrapAddr, nodeAddr string) {
-	conn, err := net.Dial("udp", bootstrapAddr)
-	if err != nil {
-		fmt.Println("Error connecting to bootstrap node:", err)
-		return
-	}
-	defer conn.Close()
-	msg := pb.BootstrapMessage{
-		Action: pb.BootstrapAction_REGISTER,
-		Host:   &pb.Host{Host: nodeAddr},
-	}
-	toSend, err := proto.Marshal(&msg)
-	_, err = conn.Write(toSend)
-	if err != nil {
-		fmt.Println("Error sending REGISTER message:", err)
-	}
 }

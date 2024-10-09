@@ -1,6 +1,12 @@
 package model
 
 import (
+	"fmt"
+	"github.com/golang/protobuf/proto"
+	pb "github.com/nexusriot/rezoagwe/pkg/proto"
+	log "github.com/sirupsen/logrus"
+	"net"
+	"strings"
 	"sync"
 )
 
@@ -35,14 +41,67 @@ func (kv *KVStore) Delete(key string) {
 }
 
 type Model struct {
-	Store *KVStore
-	Nodes *sync.Map
+	Store         *KVStore
+	Nodes         *sync.Map
+	BootstrapAddr string
+	NodeAddr      string
 }
 
-func NewModel() *Model {
+func NewModel(bootstrapAddr, nodeAddr string) *Model {
 	controller := Model{
-		Store: NewKVStore(),
-		Nodes: &sync.Map{},
+		BootstrapAddr: bootstrapAddr,
+		NodeAddr:      nodeAddr,
+		Store:         NewKVStore(),
+		Nodes:         &sync.Map{},
 	}
 	return &controller
+}
+
+func (bn *Model) RegisterNode() {
+	conn, err := net.Dial("udp", bn.BootstrapAddr)
+	if err != nil {
+		log.Errorf("Error connecting to bootstrap node: %s", err)
+		return
+	}
+	defer conn.Close()
+	msg := pb.BootstrapMessage{
+		Action: pb.BootstrapAction_REGISTER,
+		Host:   &pb.Host{Host: bn.NodeAddr},
+	}
+	toSend, err := proto.Marshal(&msg)
+	_, err = conn.Write(toSend)
+	if err != nil {
+		log.Errorf("Error sending REGISTER message: %s", err)
+	}
+}
+
+func (bn *Model) DiscoverNodes() []string {
+	conn, err := net.Dial("udp", bn.BootstrapAddr)
+	if err != nil {
+		log.Errorf("Error connecting to bootstrap node: %s", err)
+		return nil
+	}
+	defer conn.Close()
+
+	dm := pb.BootstrapMessage{Action: pb.BootstrapAction_DISCOVER}
+	data, err := proto.Marshal(&dm)
+	if err != nil {
+		log.Errorf("Error marshalling DISCOVER message: %s", err)
+		return nil
+	}
+	_, err = conn.Write(data)
+	if err != nil {
+		log.Errorf("Error sending DISCOVER message: %s", err)
+		return nil
+	}
+
+	buf := make([]byte, 1024)
+	n, err := conn.Read(buf)
+	if err != nil {
+		fmt.Println("Error reading response:", err)
+		return nil
+	}
+
+	response := strings.TrimSpace(string(buf[:n]))
+	return strings.Split(response, ",")
 }
