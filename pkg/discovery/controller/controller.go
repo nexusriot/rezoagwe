@@ -2,13 +2,14 @@ package controller
 
 import (
 	"fmt"
+	"net"
+	"strings"
 	"sync"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/golang/protobuf/proto"
 	"github.com/rivo/tview"
 	log "github.com/sirupsen/logrus"
-	"net"
 
 	"github.com/nexusriot/rezoagwe/pkg/discovery/model"
 	"github.com/nexusriot/rezoagwe/pkg/discovery/view"
@@ -163,6 +164,8 @@ func (c *Controller) setInput() {
 			switch event.Rune() {
 			case 'c':
 				return c.create()
+			case 'd':
+				return c.delete()
 			}
 		}
 		return event
@@ -226,4 +229,46 @@ func (c *Controller) propagate(message *pb.Payload) {
 		conn.Write(toSend)
 		return true
 	})
+}
+
+func (c *Controller) del(key string) {
+	c.model.Store.Delete(key)
+	msg := pb.Payload{
+		Action: pb.DiscoveryAction_DELETE,
+		Key:    key,
+	}
+	c.propagate(&msg)
+	c.view.List.Clear()
+	for key, value := range c.model.GetStore() {
+		kv := fmt.Sprintf("%s:%s", key, value)
+		c.view.List.AddItem(kv, kv, 0, func() {
+		})
+	}
+}
+
+func (c *Controller) delete() *tcell.EventKey {
+	if c.view.List.GetItemCount() == 0 {
+		return nil
+	}
+	var err error
+	i := c.view.List.GetCurrentItem()
+	_, cur := c.view.List.GetItemText(i)
+	cur = strings.TrimSpace(cur)
+	parts := strings.Split(cur, ":")
+	key := parts[0]
+	if _, ok := c.model.GetStore()[key]; ok {
+		delQ := c.view.NewDeleteQ(cur)
+		delQ.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
+			if buttonLabel == "ok" {
+				c.del(key)
+				if err != nil {
+					c.view.Pages.RemovePage("modal")
+					return
+				}
+			}
+			c.view.Pages.RemovePage("modal")
+		})
+		c.view.Pages.AddPage("modal", c.view.ModalEdit(delQ, 20, 7), true, true)
+	}
+	return nil
 }
