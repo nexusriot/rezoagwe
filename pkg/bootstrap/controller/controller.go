@@ -10,6 +10,7 @@ import (
 	"github.com/gdamore/tcell/v2"
 	"github.com/golang/protobuf/proto"
 	"github.com/rivo/tview"
+	log "github.com/sirupsen/logrus"
 
 	"github.com/nexusriot/rezoagwe/pkg/bootstrap/model"
 	"github.com/nexusriot/rezoagwe/pkg/bootstrap/view"
@@ -44,7 +45,7 @@ func (c *Controller) HandleBootstrap(conn *net.UDPConn, wg *sync.WaitGroup, uch 
 	for {
 		n, addr, err := conn.ReadFromUDP(buf)
 		if err != nil {
-			//fmt.Println("Error reading from UDP:", err)
+			log.Errorf("Error reading from UDP: %s", err)
 			continue
 		}
 		loaded := new(pb.BootstrapMessage)
@@ -62,8 +63,7 @@ func (c *Controller) HandleBootstrap(conn *net.UDPConn, wg *sync.WaitGroup, uch 
 		} else if loaded.Action == pb.BootstrapAction_REGISTER {
 			nodeAddress := loaded.Host.GetHost()
 			c.model.RegisterNode(nodeAddress)
-			//conn.WriteToUDP([]byte("REGISTERED"), addr)
-			//fmt.Printf("Nodes: %s\n", c.model.GetNodes())
+			log.Debugf("Nodes: %s\n", c.model.GetNodes())
 			uch <- struct{}{}
 		}
 	}
@@ -80,6 +80,22 @@ func (c *Controller) fill(nodes []string) {
 	})
 }
 
+func (c *Controller) setInput() {
+	c.view.App.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
+		case tcell.KeyCtrlQ:
+			c.Stop()
+			return nil
+		}
+		return event
+	})
+}
+
+func (c *Controller) Stop() {
+	log.Debugf("exit...")
+	c.view.App.Stop()
+}
+
 func (c *Controller) Start() error {
 
 	addr := net.UDPAddr{
@@ -91,7 +107,7 @@ func (c *Controller) Start() error {
 	updateCh := make(chan struct{})
 	conn, err := net.ListenUDP("udp", &addr)
 	if err == nil {
-		//fmt.Println("Error starting UDP server:", err)
+		log.Errorf("Error starting UDP server: %s", err)
 		defer conn.Close()
 		go func() {
 			for {
@@ -99,13 +115,14 @@ func (c *Controller) Start() error {
 				time.Sleep(c.model.NodeTimeout / 2)
 			}
 		}()
-		//fmt.Printf("Bootstrap node is listening on port %d\n", bn.broadcastPort)
+		log.Debugf("Bootstrap node is listening on port %d\n", c.model.BroadcastPort)
 		wg.Add(1)
 		go c.HandleBootstrap(conn, &wg, updateCh)
 		c.view.List.SetChangedFunc(func(i int, s string, s2 string, r rune) {
 			_, cur := c.view.List.GetItemText(i)
 			cur = strings.TrimSpace(cur)
 		})
+		c.setInput()
 
 		go func() {
 			for {

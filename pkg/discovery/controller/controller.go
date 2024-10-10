@@ -78,7 +78,7 @@ func (c *Controller) Start() error {
 	var wg sync.WaitGroup
 	diCh := make(chan struct{})
 
-	// move to network methods
+	// TODO: move to network methods
 	c.model.RegisterNode()
 
 	discoveredNodes := c.model.DiscoverNodes()
@@ -91,7 +91,7 @@ func (c *Controller) Start() error {
 	}
 	addr, err := net.ResolveUDPAddr("udp", c.model.NodeAddr)
 	if err != nil {
-		log.Panicf("Error resolving address: %s", err)
+		log.Errorf("Error resolving address: %s", err)
 	}
 	conn, err := net.ListenUDP("udp", addr)
 	if err != nil {
@@ -170,8 +170,8 @@ func (c *Controller) setInput() {
 		}
 		return event
 	})
-
 }
+
 func (c *Controller) Stop() {
 	log.Debugf("exit...")
 	c.view.App.Stop()

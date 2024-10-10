@@ -29,7 +29,7 @@ func NewView() *View {
 		AddPage("main", main, true, true)
 
 	frame := tview.NewFrame(pages)
-	frame.AddText("[]", false, tview.AlignCenter, tcell.ColorWhite)
+	frame.AddText("[::b][Ctrl+q][::-] Quit", false, tview.AlignCenter, tcell.ColorWhite)
 
 	app.SetRoot(frame, true)
 

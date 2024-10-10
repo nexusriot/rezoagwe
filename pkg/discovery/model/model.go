@@ -1,14 +1,15 @@
 package model
 
 import (
-	"fmt"
-	"github.com/golang/protobuf/proto"
-	"github.com/google/uuid"
-	pb "github.com/nexusriot/rezoagwe/pkg/proto"
-	log "github.com/sirupsen/logrus"
 	"net"
 	"strings"
 	"sync"
+
+	"github.com/golang/protobuf/proto"
+	"github.com/google/uuid"
+	log "github.com/sirupsen/logrus"
+
+	pb "github.com/nexusriot/rezoagwe/pkg/proto"
 )
 
 type KVStore struct {
@@ -115,7 +116,7 @@ func (bn *Model) DiscoverNodes() []string {
 	buf := make([]byte, 1024)
 	n, err := conn.Read(buf)
 	if err != nil {
-		fmt.Println("Error reading response:", err)
+		log.Errorf("Error reading response: %ы", err)
 		return nil
 	}
 

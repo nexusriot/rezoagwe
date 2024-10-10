@@ -3,6 +3,8 @@ package model
 import (
 	"sync"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 )
 
 type Model struct {
@@ -29,8 +31,8 @@ func (bn *Model) RegisterNode(address string) {
 	bn.mu.Lock()
 	defer bn.mu.Unlock()
 	bn.nodes[address] = time.Now()
-	//fmt.Printf("Registred node: %s\n", address)
-	//fmt.Printf("nodes: %s\n", bn.nodes)
+	log.Debugf("Registred node: %s", address)
+	log.Debugf("nodes: %s", bn.nodes)
 }
 
 func (bn *Model) RemoveStaleNodes() {
@@ -47,8 +49,8 @@ func (bn *Model) RemoveStaleNodes() {
 func (bn *Model) GetNodes() []string {
 	bn.mu.Lock()
 	defer bn.mu.Unlock()
-	nodes := []string{}
-	//fmt.Printf("Cur nodes: %s\n", bn.nodes)
+	var nodes []string
+	log.Debugf("Get nodes: %s", bn.nodes)
 	for address := range bn.nodes {
 		nodes = append(nodes, address)
 	}
