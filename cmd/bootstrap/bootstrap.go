@@ -1,11 +1,13 @@
 package main
 
 import (
+	"flag"
 	"time"
 
 	"github.com/nexusriot/rezoagwe/pkg/bootstrap/controller"
 )
 
 func main() {
-	controller.NewController(true, 9999, 1000*time.Second).Start()
+	port := flag.Int("port", 9999, "port number")
+	controller.NewController(true, *port, 1000*time.Second).Start()
 }
