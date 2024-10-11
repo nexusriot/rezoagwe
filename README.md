@@ -33,5 +33,5 @@ by default port is __9999__
 ```
 ./discovery -bootstrap :9999 -node :3138
 ```
-by default bootstrap is __:999__, node address is __:3137__
+by default bootstrap is __:9999__, node address is __:3137__
 
