@@ -1,11 +1,11 @@
 syntax = "proto3";
-option go_package = "github.com/nexusriot/rezoagwe/proto";
+option go_package = "github.com/nexusriot/rezoagwe/pkg/proto";
 
 package rezoagwe;
 
 enum BootstrapAction {
-    DISCOVER = 0;
-    REGISTER = 1;
+  DISCOVER = 0;
+  REGISTER = 1;
 }
 
 enum DiscoveryAction {
@@ -16,7 +16,6 @@ enum DiscoveryAction {
 message Host {
   string Host = 1;
 }
-
 
 message BootstrapMessage {
   BootstrapAction action = 1;

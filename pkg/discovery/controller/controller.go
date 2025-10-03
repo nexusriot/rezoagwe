@@ -7,9 +7,9 @@ import (
 	"sync"
 
 	"github.com/gdamore/tcell/v2"
-	"github.com/golang/protobuf/proto"
 	"github.com/rivo/tview"
 	log "github.com/sirupsen/logrus"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/nexusriot/rezoagwe/pkg/discovery/model"
 	"github.com/nexusriot/rezoagwe/pkg/discovery/view"
@@ -39,7 +39,6 @@ func NewController(
 }
 
 func (c *Controller) HandleConnection(conn *net.UDPConn, wg *sync.WaitGroup, dich chan<- struct{}) {
-
 	buf := make([]byte, 1024)
 	for {
 		n, _, err := conn.ReadFromUDP(buf)
@@ -50,20 +49,16 @@ func (c *Controller) HandleConnection(conn *net.UDPConn, wg *sync.WaitGroup, dic
 
 		loaded := new(pb.Payload)
 		err = proto.Unmarshal(buf[:n], loaded)
-
 		if err != nil {
 			log.Errorf("Error Unmarshal message: %s", err)
 			continue
 		}
 
 		switch loaded.Action {
-
 		case pb.DiscoveryAction_SET:
 			c.model.Store.Set(loaded.Key, string(loaded.Value))
-
 		case pb.DiscoveryAction_DELETE:
 			c.model.Store.Delete(loaded.Key)
-
 		default:
 			log.Errorf("Unknown discovery action: %s", loaded.Action)
 			continue
@@ -74,9 +69,8 @@ func (c *Controller) HandleConnection(conn *net.UDPConn, wg *sync.WaitGroup, dic
 }
 
 func (c *Controller) Start() error {
-
 	var wg sync.WaitGroup
-	diCh := make(chan struct{})
+	diCh := make(chan struct{}, 32)
 
 	// TODO: move to network methods
 	c.model.RegisterNode()
@@ -86,9 +80,9 @@ func (c *Controller) Start() error {
 		if node != "" && node != c.model.NodeAddr {
 			c.model.Nodes.Store(node, true)
 			// TODO - > improve discover
-
 		}
 	}
+
 	addr, err := net.ResolveUDPAddr("udp", c.model.NodeAddr)
 	if err != nil {
 		log.Errorf("Error resolving address: %s", err)
@@ -107,14 +101,8 @@ func (c *Controller) Start() error {
 	c.setInput()
 
 	go func() {
-		for {
-			select {
-			case _, ok := <-diCh:
-				if ok {
-					c.fillStoreQ()
-				}
-			default:
-			}
+		for range diCh {
+			c.fillStoreQ()
 		}
 	}()
 
@@ -144,8 +132,7 @@ func (c *Controller) fillNodes() {
 	c.view.NodeList.Clear()
 	c.view.NodeList.SetMainTextColor(tcell.Color31)
 	for _, node := range nodes {
-		c.view.NodeList.AddItem(node, node, 0, func() {
-		})
+		c.view.NodeList.AddItem(node, node, 0, func() {})
 	}
 }
 
@@ -189,8 +176,7 @@ func (c *Controller) fillStoreQ() {
 		c.view.List.Clear()
 		for key, value := range c.model.GetStore() {
 			kv := fmt.Sprintf("%s:%s", key, value)
-			c.view.List.AddItem(kv, kv, 0, func() {
-			})
+			c.view.List.AddItem(kv, kv, 0, func() {})
 		}
 	})
 }
@@ -206,8 +192,7 @@ func (c *Controller) store(key, value string) {
 	c.view.List.Clear()
 	for key, value := range c.model.GetStore() {
 		kv := fmt.Sprintf("%s:%s", key, value)
-		c.view.List.AddItem(kv, kv, 0, func() {
-		})
+		c.view.List.AddItem(kv, kv, 0, func() {})
 	}
 }
 
@@ -215,18 +200,23 @@ func (c *Controller) propagate(message *pb.Payload) {
 	c.model.Nodes.Range(func(key, value interface{}) bool {
 		addr, err := net.ResolveUDPAddr("udp", key.(string))
 		if err != nil {
-			fmt.Println("Error resolving address:", err)
+			log.Errorf("Error resolving address: %v", err)
 			return true
 		}
 		conn, err := net.DialUDP("udp", nil, addr)
 		if err != nil {
-			fmt.Println("Error connecting to node:", err)
+			log.Errorf("Error connecting to node: %v", err)
 			return true
 		}
 		defer conn.Close()
 		toSend, err := proto.Marshal(message)
-		_, err = conn.Write(toSend)
-		conn.Write(toSend)
+		if err != nil {
+			log.Errorf("marshal message: %v", err)
+			return true
+		}
+		if _, err := conn.Write(toSend); err != nil {
+			log.Errorf("write to %s failed: %v", key.(string), err)
+		}
 		return true
 	})
 }
@@ -241,8 +231,7 @@ func (c *Controller) del(key string) {
 	c.view.List.Clear()
 	for key, value := range c.model.GetStore() {
 		kv := fmt.Sprintf("%s:%s", key, value)
-		c.view.List.AddItem(kv, kv, 0, func() {
-		})
+		c.view.List.AddItem(kv, kv, 0, func() {})
 	}
 }
 
@@ -250,7 +239,6 @@ func (c *Controller) delete() *tcell.EventKey {
 	if c.view.List.GetItemCount() == 0 {
 		return nil
 	}
-	var err error
 	i := c.view.List.GetCurrentItem()
 	_, cur := c.view.List.GetItemText(i)
 	cur = strings.TrimSpace(cur)
@@ -261,10 +249,6 @@ func (c *Controller) delete() *tcell.EventKey {
 		delQ.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
 			if buttonLabel == "ok" {
 				c.del(key)
-				if err != nil {
-					c.view.Pages.RemovePage("modal")
-					return
-				}
 			}
 			c.view.Pages.RemovePage("modal")
 		})

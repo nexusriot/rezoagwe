@@ -8,9 +8,9 @@ import (
 	"time"
 
 	"github.com/gdamore/tcell/v2"
-	"github.com/golang/protobuf/proto"
 	"github.com/rivo/tview"
 	log "github.com/sirupsen/logrus"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/nexusriot/rezoagwe/pkg/bootstrap/model"
 	"github.com/nexusriot/rezoagwe/pkg/bootstrap/view"
@@ -27,7 +27,6 @@ func NewController(
 	debug bool,
 	broadcastPort int,
 	nodeTimeout time.Duration,
-
 ) *Controller {
 	m := model.NewModel(broadcastPort, nodeTimeout)
 	v := view.NewView()
@@ -74,8 +73,7 @@ func (c *Controller) fill(nodes []string) {
 		c.view.List.Clear()
 		c.view.List.SetMainTextColor(tcell.Color31)
 		for _, node := range nodes {
-			c.view.List.AddItem(node, node, 0, func() {
-			})
+			c.view.List.AddItem(node, node, 0, func() {})
 		}
 	})
 }
@@ -97,46 +95,44 @@ func (c *Controller) Stop() {
 }
 
 func (c *Controller) Start() error {
-
 	addr := net.UDPAddr{
 		Port: c.model.BroadcastPort,
 		// Todo: run on 127.0.0.1
 		IP: net.ParseIP("0.0.0.0"),
 	}
-	var wg sync.WaitGroup
-	updateCh := make(chan struct{})
-	conn, err := net.ListenUDP("udp", &addr)
-	if err == nil {
-		log.Errorf("Error starting UDP server: %s", err)
-		defer conn.Close()
-		go func() {
-			for {
-				c.model.RemoveStaleNodes()
-				time.Sleep(c.model.NodeTimeout / 2)
-			}
-		}()
-		log.Debugf("Bootstrap node is listening on port %d\n", c.model.BroadcastPort)
-		wg.Add(1)
-		go c.HandleBootstrap(conn, &wg, updateCh)
-		c.view.List.SetChangedFunc(func(i int, s string, s2 string, r rune) {
-			_, cur := c.view.List.GetItemText(i)
-			cur = strings.TrimSpace(cur)
-		})
-		c.setInput()
 
-		go func() {
-			for {
-				select {
-				case _, ok := <-updateCh:
-					if ok {
-						c.fill(c.model.GetNodes())
-					}
-				default:
-				}
-			}
-		}()
-		return c.view.App.Run()
-	} else {
+	var wg sync.WaitGroup
+	updateCh := make(chan struct{}, 32)
+
+	conn, err := net.ListenUDP("udp", &addr)
+	if err != nil {
+		log.Errorf("Error starting UDP server: %v", err)
 		return err
 	}
+	defer conn.Close()
+
+	go func() {
+		for {
+			c.model.RemoveStaleNodes()
+			time.Sleep(c.model.NodeTimeout / 2)
+		}
+	}()
+
+	log.Debugf("Bootstrap node is listening on port %d", c.model.BroadcastPort)
+	wg.Add(1)
+	go c.HandleBootstrap(conn, &wg, updateCh)
+
+	c.view.List.SetChangedFunc(func(i int, s string, s2 string, r rune) {
+		_, cur := c.view.List.GetItemText(i)
+		_ = strings.TrimSpace(cur)
+	})
+	c.setInput()
+
+	go func() {
+		for range updateCh {
+			c.fill(c.model.GetNodes())
+		}
+	}()
+
+	return c.view.App.Run()
 }

@@ -5,9 +5,9 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/google/uuid"
 	log "github.com/sirupsen/logrus"
+	"google.golang.org/protobuf/proto"
 
 	pb "github.com/nexusriot/rezoagwe/pkg/proto"
 )
@@ -73,15 +73,17 @@ func (bn *Model) RegisterNode() {
 		Host:   &pb.Host{Host: bn.NodeAddr},
 	}
 	toSend, err := proto.Marshal(&msg)
-	_, err = conn.Write(toSend)
 	if err != nil {
+		log.Errorf("Error marshalling REGISTER message: %s", err)
+		return
+	}
+	if _, err := conn.Write(toSend); err != nil {
 		log.Errorf("Error sending REGISTER message: %s", err)
 	}
 }
 
 func (bn *Model) GetNodes() []string {
 	var res []string
-
 	bn.Nodes.Range(func(key, value interface{}) bool {
 		res = append(res, key.(string))
 		return true
@@ -107,8 +109,7 @@ func (bn *Model) DiscoverNodes() []string {
 		log.Errorf("Error marshalling DISCOVER message: %s", err)
 		return nil
 	}
-	_, err = conn.Write(data)
-	if err != nil {
+	if _, err := conn.Write(data); err != nil {
 		log.Errorf("Error sending DISCOVER message: %s", err)
 		return nil
 	}
@@ -116,7 +117,7 @@ func (bn *Model) DiscoverNodes() []string {
 	buf := make([]byte, 1024)
 	n, err := conn.Read(buf)
 	if err != nil {
-		log.Errorf("Error reading response: %ы", err)
+		log.Errorf("Error reading response: %v", err)
 		return nil
 	}
 

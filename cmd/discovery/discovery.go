@@ -7,7 +7,6 @@ import (
 )
 
 func main() {
-
 	bootstrapAddr := flag.String("bootstrap", ":9999", "bootstrap address")
 	nodeAddr := flag.String("node", ":3137", "node address")
 	flag.Parse()

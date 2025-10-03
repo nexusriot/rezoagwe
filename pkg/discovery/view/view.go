@@ -68,7 +68,7 @@ func NewView() *View {
 	}
 
 	frame := tview.NewFrame(pages)
-	frame.AddText("[::b][c[][::-] Create key [::b][d[][::-] Delete key [::b][Ctrl+q][::-] Quit", false, tview.AlignCenter, tcell.ColorWhite)
+	frame.AddText("[::b][c][::-] Create key  [::b][d][::-] Delete key  [::b][Ctrl+q][::-] Quit", false, tview.AlignCenter, tcell.ColorWhite)
 
 	app.SetRoot(frame, true)
 
