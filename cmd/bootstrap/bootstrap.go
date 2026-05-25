@@ -9,5 +9,6 @@ import (
 
 func main() {
 	port := flag.Int("port", 9999, "port number")
-	controller.NewController(true, *port, 1000*time.Second).Start()
+	flag.Parse()
+	controller.NewController(true, *port, 15*time.Second).Start()
 }

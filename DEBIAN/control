@@ -1,0 +1,6 @@
+Package: rezoagwe
+Version: _version_
+Architecture: amd64
+Maintainer: Vladislav Ananev <nexus.riot@gmail.com>
+Description: PoC distributed KV store with chat (bootstrap + discovery TUI nodes)
+Installed-Size: 12000
