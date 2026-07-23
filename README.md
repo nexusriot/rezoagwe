@@ -22,9 +22,6 @@ For internals, wire protocol, and the failure model, see
 ### **Design (concept)**
 
 ![Pic](https://github.com/nexusriot/rezoagwe/blob/main/rezo_agwe.png)
-![Pic](https://github.com/nexusriot/rezoagwe/blob/main/bootstrap.png)
-![Pic](https://github.com/nexusriot/rezoagwe/blob/main/discovery.png)
-
 ---
 
 ### Features
