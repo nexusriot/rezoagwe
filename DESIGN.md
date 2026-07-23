@@ -137,16 +137,17 @@ byte[1..]  = body
 
 | Kind | Name           | Body encoding | Purpose                               |
 |------|----------------|---------------|---------------------------------------|
-| 0    | `KV`           | protobuf `Payload` | KV SET / DELETE replication      |
+| 0    | `KV`           | JSON `KVUpdate` | versioned KV set / delete (LWW)     |
 | 1    | `Chat`         | JSON `ChatMessage` | chat broadcast                   |
 | 2    | `StateRequest` | JSON `StateRequest` | "send me your full KV"          |
-| 3    | `StateResponse`| JSON `StateResponse` | full KV snapshot reply         |
+| 3    | `StateResponse`| JSON `StateResponse` | versioned KV entries + recent chat |
 | 4    | `PeerGossip`   | JSON `PeerGossip` | "here are the peers I know"       |
 | 5    | `Hello`        | JSON `Hello`     | "hi, I am `addr`" (peer learning)  |
+| 6    | `Goodbye`      | JSON `Goodbye`   | "I am shutting down" (clean leave) |
 
-This way the existing protobuf-generated code stays untouched while new
-features can ship as ordinary Go structs with JSON tags. The envelope
-costs exactly 1 byte per packet.
+Every discovery message is a plain Go struct with JSON tags; protobuf is now
+used only for the bootstrap handshake. New features ship as new kinds without
+regenerating any code, and the envelope costs exactly 1 byte per packet.
 
 ---
 
@@ -169,8 +170,12 @@ stale-node sweeper. Nothing else happens until someone REGISTERs.
    bootstrap. This causes existing nodes to learn the new node back
    (without requiring bootstrap to push updates).
 5. **State sync**: pick one random peer and send `StateRequest`. That
-   peer replies with `StateResponse` containing its full KV snapshot,
-   which the new node `Replace`s into its own store.
+   peer replies with `StateResponse` carrying its full KV store as
+   versioned entries (tombstones included) — which the new node
+   *merges* under last-write-wins rather than overwriting, so a local
+   edit made before the reply arrives isn't clobbered — plus its recent
+   chat history, which the new node prepends to its (usually empty)
+   chat log so the pane has context on join.
 6. **Start gossip loop**: every 10 s, send `PeerGossip` (containing the
    full known-peer list) to one random peer. The receiver learns any
    unknown addresses and `Hello`s back so the relationship is
@@ -180,10 +185,15 @@ stale-node sweeper. Nothing else happens until someone REGISTERs.
 ### 4.3 Steady state
 
 * **KV writes**: a user creates/deletes a key in the TUI. The local
-  store is mutated and a `Payload` (SET or DELETE) is broadcast as a
-  `KindKV` envelope to every known peer. Each peer applies it on
-  receipt. *No anti-entropy is performed* — if a packet is lost, the
-  two stores diverge until the next overlapping write. This is a known
+  store stamps the mutation with a per-key version (a Lamport counter
+  plus this node's address as tiebreak) and broadcasts a versioned
+  `KVUpdate` as a `KindKV` envelope to every known peer. Each peer
+  applies it only if the version is newer than what it holds, so
+  concurrent writes to the same key converge to the same value on every
+  node; a delete is a versioned tombstone, so a stale set can't
+  resurrect the key. *No anti-entropy is performed* — if a packet is
+  lost outright, the two stores stay divergent until the next
+  overlapping write or a state resync on rejoin. This remains a known
   PoC limitation.
 * **Chat**: typed text becomes a `ChatMessage` (sender addr, nick,
   text, unix timestamp), broadcast to every known peer. The receiver
@@ -201,20 +211,51 @@ stale-node sweeper. Nothing else happens until someone REGISTERs.
 ### 4.4 Failure model
 
 * **Bootstrap dies after startup**: the cluster keeps working —
-  bootstrap is only used at join. New nodes joining while bootstrap is
-  down cannot find anyone. Discovery nodes also send a REGISTER
+  bootstrap is only used at join. Discovery nodes also send a REGISTER
   heartbeat to bootstrap every 5 s so that bootstrap forgets dead
   clients within its 15 s timeout.
+* **Bootstrap unreachable at join**: a joining node no longer hangs.
+  `DiscoverNodes` reads the roster with a bounded deadline
+  (`DiscoverTimeout`, 2 s by default), so a down bootstrap — or a lost
+  DISCOVER / reply, which UDP permits — degrades to "no peers learned":
+  the node still opens its TUI and serves its persisted store. While it
+  knows no peers, the 5 s heartbeat loop keeps re-registering *and*
+  re-DISCOVERing, so it joins automatically once bootstrap is reachable.
 * **A discovery node dies**: every discovery node tracks a last-seen
   timestamp per peer (updated on any incoming packet). A peer with no
   traffic for 15 s is evicted locally. Heartbeats are kept fresh by
   the 5 s Hello-fan-out and the 10 s PeerGossip.
-* **Packet loss**: lost KV writes diverge silently. Lost gossip is
-  resent on the next tick. Lost state-sync response leaves a node with
-  an empty store until the next write arrives.
+* **A discovery node exits cleanly** (`Ctrl+Q`): before quitting it
+  broadcasts a `Goodbye` to every known peer, so peers drop it and emit
+  the "left" chat line immediately instead of waiting out the 15 s
+  eviction. Goodbye is best-effort UDP like everything else — if it is
+  lost, the peer simply falls back to timeout eviction.
+* **Packet loss**: a lost KV write leaves that key divergent until the
+  next overlapping write or a state resync — versioning makes the
+  eventual reconcile deterministic, but nothing actively re-sends. Lost
+  gossip is resent on the next tick. A lost state-sync reply leaves the
+  joiner on its persisted store until it retries the join.
 
 These trade-offs are intentional for a PoC; see §6 for the next-step
 items.
+
+### 4.5 Persistence
+
+Each discovery node persists its KV store to a JSON file (`-data`, default
+`<config dir>/rezoagwe/<node>.json`; the path is derived from the node
+address so co-located nodes don't clobber each other). The file is rewritten
+atomically (temp file + rename) after every mutation — local writes,
+replicated writes from peers, and state-sync merges alike — gated on a
+monotonically increasing generation so a slow, out-of-order write can never
+regress the on-disk copy. The file records each entry's version and the
+node's Lamport clock (tombstones included), so after a restart the node's new
+writes still sort after everything it had already seen. On startup the node
+loads this file *before* contacting bootstrap, so its keys survive a restart.
+Pass `-data -` to disable persistence entirely.
+
+Chat history is deliberately **not** persisted to disk: a rejoining node
+repopulates its chat pane from a peer's `StateResponse` (§4.2 step 5)
+instead.
 
 ---
 
@@ -239,12 +280,19 @@ items.
 | Area               | Limitation                                | Possible fix                                |
 |--------------------|-------------------------------------------|---------------------------------------------|
 | Transport          | UDP, single packet, no acks               | Switch to TCP for state sync; chunk         |
-| State sync         | Asks one random peer; if it lies, lose    | Quorum read or value timestamps             |
-| Replication        | Best-effort broadcast, no ordering        | Per-key Lamport clocks; anti-entropy gossip |
+| Replication        | Per-key Lamport-clock LWW converges concurrent writes, but a dropped packet is never re-sent | Anti-entropy / Merkle reconcile on gossip |
+| State sync         | Pulls from one random peer and merges by version (can't clobber newer local data), but a peer with gaps yields gaps | Pull from a quorum; anti-entropy |
 | Liveness           | Heartbeat is best-effort UDP; no quorum   | Acked ping + quorum membership view         |
 | Security           | Plain UDP, no auth                        | DTLS or pre-shared key + HMAC               |
 | Bootstrap          | Single point of failure for new joiners   | Multiple seed addresses; mDNS               |
-| Chat history       | In-memory ring of 500 lines per node      | Persistent log; sync on join                |
+| Bootstrap roster   | DISCOVER reply is one UDP datagram (now ≤64 KB); a very large roster still won't fit | Length-prefix / chunk, or TCP |
+| Chat history       | Synced from a peer on join; not persisted | Persist the chat ring to disk too           |
+| State sync size    | KV entries + chat ride in one UDP datagram (≤64 KB) | Chunk / switch to TCP for large state |
+| Tombstones         | Deleted keys are kept forever as tombstones | GC tombstones once cluster-wide consensus is certain |
+| Diagnostics        | `log.Debugf` is inert (level never raised) and stderr logs would scribble over the TUI | Log to a file, gated by a real `-debug` flag |
+
+For a prioritized, actionable version of this list — with effort estimates and
+what's already shipped — see [ROADMAP.md](ROADMAP.md).
 
 ---
 

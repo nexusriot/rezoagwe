@@ -16,11 +16,12 @@
 #   uconsole          linux/arm64            (ClockworkPi uConsole, CM4)
 #   pizero2w          linux/arm64            (Raspberry Pi Zero 2 W, 64-bit OS)
 #   pizero2w-armhf    linux/arm  GOARM=7     (Pi Zero 2 W, 32-bit Raspberry Pi OS)
+#   licheerv          linux/riscv64          (LicheeRV Nano (W), riscv64)
 #   darwin            darwin/amd64 + arm64
 #   windows           windows/amd64
 #
 # Debian packages (.deb via dpkg-deb) — each .deb ships BOTH binaries:
-#   deb-amd64  deb-i386  deb-arm64  deb-armhf   ->  build/<pkg>.deb
+#   deb-amd64  deb-i386  deb-arm64  deb-armhf  deb-riscv64  ->  build/<pkg>.deb
 #
 # Override version:   make debs VERSION=0.0.3
 # ---------------------------------------------------------------------------
@@ -78,8 +79,9 @@ help:
 	@echo "  make uconsole           - linux/arm64 (ClockworkPi uConsole CM4)"
 	@echo "  make pizero2w           - linux/arm64 (Pi Zero 2 W, 64-bit OS)"
 	@echo "  make pizero2w-armhf     - linux/arm v7 (Pi Zero 2 W, 32-bit OS)"
+	@echo "  make licheerv           - linux/riscv64 (LicheeRV Nano (W))"
 	@echo "  make darwin windows     - macOS / Windows"
-	@echo "  make debs               - deb-amd64 + deb-i386 + deb-arm64 + deb-armhf"
+	@echo "  make debs               - deb-amd64 + deb-i386 + deb-arm64 + deb-armhf + deb-riscv64"
 	@echo "  make test | test-race | vet | fmt | tidy | clean"
 
 .PHONY: tidy
@@ -107,7 +109,7 @@ clean:
 	rm -rf $(BUILD_DIR) $(DIST_DIR) $(BIN_BOOT) $(BIN_DISC)
 
 .PHONY: all
-all: x86_64 x86_64-static linux-i686 freebsd-x86_64 uconsole pizero2w pizero2w-armhf darwin windows
+all: x86_64 x86_64-static linux-i686 freebsd-x86_64 uconsole pizero2w pizero2w-armhf licheerv darwin windows
 
 .PHONY: x86_64
 x86_64:
@@ -141,6 +143,10 @@ pizero2w:
 pizero2w-armhf:
 	$(call go_build_pair,linux,arm,pizero2w-linux-armv7,0,7)
 
+.PHONY: licheerv
+licheerv:
+	$(call go_build_pair,linux,riscv64,licheerv-linux-riscv64,0)
+
 .PHONY: darwin
 darwin:
 	$(call go_build_pair,darwin,amd64,darwin-amd64,0)
@@ -151,7 +157,7 @@ windows:
 	$(call go_build_pair,windows,amd64,windows-amd64,0,,.exe)
 
 .PHONY: debs
-debs: deb-amd64 deb-i386 deb-arm64 deb-armhf
+debs: deb-amd64 deb-i386 deb-arm64 deb-armhf deb-riscv64
 
 .PHONY: deb-amd64
 deb-amd64:
@@ -170,3 +176,8 @@ deb-arm64:
 .PHONY: deb-armhf
 deb-armhf:
 	$(call build_deb,armhf,arm,7)
+
+# riscv64 deb for the LicheeRV Nano (W).
+.PHONY: deb-riscv64
+deb-riscv64:
+	$(call build_deb,riscv64,riscv64)

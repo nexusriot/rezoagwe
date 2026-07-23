@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/gdamore/tcell/v2"
-	"github.com/golang/protobuf/proto"
 	"github.com/rivo/tview"
 	log "github.com/sirupsen/logrus"
 
@@ -32,13 +31,18 @@ type Controller struct {
 	filter   string
 }
 
+// stateSyncChatLines caps how many chat lines a node ships in a StateResponse.
+// The whole response is one UDP datagram, so this bounds its size.
+const stateSyncChatLines = 200
+
 func NewController(
 	debug bool,
 	bootstrapAddr,
 	nodeAddr,
-	nick string,
+	nick,
+	dataPath string,
 ) *Controller {
-	m := model.NewModel(bootstrapAddr, nodeAddr, nick)
+	m := model.NewModel(bootstrapAddr, nodeAddr, nick, dataPath)
 	v := view.NewView()
 	v.Frame.AddText("Rezoagwe Discovery Node v0.0.3", true, tview.AlignCenter, tcell.ColorGreen)
 	return &Controller{
@@ -66,15 +70,6 @@ func (c *Controller) sendTo(addr string, packet []byte) {
 	}
 }
 
-func (c *Controller) sendKV(addr string, msg *pb.Payload) {
-	body, err := proto.Marshal(msg)
-	if err != nil {
-		log.Errorf("marshal payload: %s", err)
-		return
-	}
-	c.sendTo(addr, pb.EncodeKV(body))
-}
-
 func (c *Controller) sendJSON(addr string, kind pb.MessageKind, v interface{}) {
 	pkt, err := pb.EncodeJSON(kind, v)
 	if err != nil {
@@ -82,19 +77,6 @@ func (c *Controller) sendJSON(addr string, kind pb.MessageKind, v interface{}) {
 		return
 	}
 	c.sendTo(addr, pkt)
-}
-
-func (c *Controller) broadcastKV(msg *pb.Payload) {
-	body, err := proto.Marshal(msg)
-	if err != nil {
-		log.Errorf("marshal payload: %s", err)
-		return
-	}
-	pkt := pb.EncodeKV(body)
-	c.model.Nodes.Range(func(key, _ interface{}) bool {
-		c.sendTo(key.(string), pkt)
-		return true
-	})
 }
 
 func (c *Controller) broadcastJSON(kind pb.MessageKind, v interface{}) {
@@ -138,6 +120,8 @@ func (c *Controller) HandleConnection(conn *net.UDPConn, updateCh chan<- struct{
 			c.handlePeerGossip(body)
 		case pb.KindHello:
 			c.handleHello(body)
+		case pb.KindGoodbye:
+			c.handleGoodbye(body)
 		default:
 			log.Errorf("unknown kind: %d", kind)
 		}
@@ -145,23 +129,17 @@ func (c *Controller) HandleConnection(conn *net.UDPConn, updateCh chan<- struct{
 }
 
 func (c *Controller) handleKV(body []byte, updateCh chan<- struct{}) {
-	loaded := new(pb.Payload)
-	if err := proto.Unmarshal(body, loaded); err != nil {
-		log.Errorf("unmarshal payload: %s", err)
+	var u pb.KVUpdate
+	if err := json.Unmarshal(body, &u); err != nil {
+		log.Errorf("unmarshal kv update: %s", err)
 		return
 	}
-	switch loaded.Action {
-	case pb.DiscoveryAction_SET:
-		c.model.Store.Set(loaded.Key, string(loaded.Value))
-	case pb.DiscoveryAction_DELETE:
-		c.model.Store.Delete(loaded.Key)
-	default:
-		log.Errorf("unknown kv action: %s", loaded.Action)
-		return
-	}
-	select {
-	case updateCh <- struct{}{}:
-	default:
+	// Merge under last-write-wins; only refresh the UI if it actually changed.
+	if c.model.Store.Apply(u) {
+		select {
+		case updateCh <- struct{}{}:
+		default:
+		}
 	}
 }
 
@@ -191,8 +169,10 @@ func (c *Controller) handleStateRequest(body []byte) {
 		return
 	}
 	c.model.TouchPeer(req.From)
-	snap := c.model.Store.Snapshot()
-	c.sendJSON(req.From, pb.KindStateResponse, pb.StateResponse{Store: snap})
+	c.sendJSON(req.From, pb.KindStateResponse, pb.StateResponse{
+		KV:   c.model.Store.Updates(),
+		Chat: lastN(c.model.ChatLog(), stateSyncChatLines),
+	})
 }
 
 func (c *Controller) handleStateResponse(body []byte, updateCh chan<- struct{}) {
@@ -201,10 +181,24 @@ func (c *Controller) handleStateResponse(body []byte, updateCh chan<- struct{}) 
 		log.Errorf("unmarshal state resp: %s", err)
 		return
 	}
-	c.model.Store.Replace(resp.Store)
-	select {
-	case updateCh <- struct{}{}:
-	default:
+	// Merge the peer's snapshot under last-write-wins rather than overwriting,
+	// so a local edit made before the sync arrived isn't clobbered by a stale
+	// value from the responder.
+	changed := false
+	for _, u := range resp.KV {
+		if c.model.Store.Apply(u) {
+			changed = true
+		}
+	}
+	if len(resp.Chat) > 0 {
+		c.model.PrependChat(resp.Chat)
+		c.refreshChat()
+	}
+	if changed {
+		select {
+		case updateCh <- struct{}{}:
+		default:
+		}
 	}
 }
 
@@ -250,6 +244,27 @@ func (c *Controller) handleHello(body []byte) {
 		c.announceJoin(h.From, h.Nick)
 		c.refreshNodes()
 	}
+}
+
+// handleGoodbye drops a peer that announced a clean shutdown. The nick is
+// resolved before removal (RemovePeer forgets it) so the "left" line renders
+// the same way an eviction would.
+func (c *Controller) handleGoodbye(body []byte) {
+	var g pb.Goodbye
+	if err := json.Unmarshal(body, &g); err != nil {
+		log.Errorf("unmarshal goodbye: %s", err)
+		return
+	}
+	if !c.model.HasPeer(g.From) {
+		return
+	}
+	nick := g.Nick
+	if nick == "" {
+		nick = c.model.NickOf(g.From)
+	}
+	c.model.RemovePeer(g.From)
+	c.announceLeave(g.From, nick)
+	c.refreshNodes()
 }
 
 func (c *Controller) Start() error {
@@ -348,11 +363,33 @@ func (c *Controller) heartbeatLoop() {
 	defer t.Stop()
 	for range t.C {
 		c.model.RegisterNode()
+		// Alone? The initial join may have raced bootstrap's startup or lost
+		// its DISCOVER packet — re-ask bootstrap and re-sync.
+		if len(c.model.GetNodes()) == 0 {
+			c.rejoin()
+		}
 		hello := c.helloMessage()
 		c.model.Nodes.Range(func(key, _ interface{}) bool {
 			c.sendJSON(key.(string), pb.KindHello, hello)
 			return true
 		})
+	}
+}
+
+// rejoin re-discovers peers from bootstrap and, if any are newly learned,
+// re-announces and pulls state. Used to recover from a join that happened
+// before bootstrap was reachable.
+func (c *Controller) rejoin() {
+	learned := false
+	for _, node := range c.model.DiscoverNodes() {
+		if c.model.AddPeer(node) {
+			learned = true
+		}
+	}
+	if learned {
+		c.helloAllPeers()
+		c.requestStateFromRandomPeer()
+		c.refreshNodes()
 	}
 }
 
@@ -378,6 +415,11 @@ func (c *Controller) evictLoop() {
 
 func (c *Controller) Stop() {
 	log.Debugf("exit...")
+	// Announce departure synchronously so every peer drops us at once instead
+	// of waiting out the eviction timeout. UDP writes only hand the datagram
+	// to the kernel, so this stays fast enough to run before App.Stop() even
+	// on the event-loop goroutine.
+	c.broadcastJSON(pb.KindGoodbye, pb.Goodbye{From: c.model.NodeAddr, Nick: c.model.NodeNick})
 	c.view.App.Stop()
 }
 
@@ -680,6 +722,17 @@ func (c *Controller) fillDetails() {
 	fmt.Fprintf(c.view.Details, "[blue]Node UUID    ->[gray] %s\n", c.model.NodeUUID)
 	fmt.Fprintf(c.view.Details, "[blue]Node Address ->[gray] %s\n", c.model.NodeAddr)
 	fmt.Fprintf(c.view.Details, "[green]Bootstrap    ->[white] %s\n", c.model.BootstrapAddr)
+	if c.model.DataPath != "" {
+		fmt.Fprintf(c.view.Details, "[green]Data         ->[white] %s\n", c.model.DataPath)
+	}
+}
+
+// lastN returns the final n elements of s (or all of s if shorter).
+func lastN(s []string, n int) []string {
+	if len(s) <= n {
+		return s
+	}
+	return s[len(s)-n:]
 }
 
 // previewValue returns a one-line, length-capped preview of value for the
@@ -754,21 +807,12 @@ func (c *Controller) fillStoreQ() {
 }
 
 func (c *Controller) store(key, value string) {
-	c.model.Store.Set(key, value)
-	c.broadcastKV(&pb.Payload{
-		Action: pb.DiscoveryAction_SET,
-		Key:    key,
-		Value:  []byte(value),
-	})
+	c.broadcastJSON(pb.KindKV, c.model.Store.Set(key, value))
 	c.fillStoreQ()
 }
 
 func (c *Controller) del(key string) {
-	c.model.Store.Delete(key)
-	c.broadcastKV(&pb.Payload{
-		Action: pb.DiscoveryAction_DELETE,
-		Key:    key,
-	})
+	c.broadcastJSON(pb.KindKV, c.model.Store.Delete(key))
 	c.fillStoreQ()
 }
 

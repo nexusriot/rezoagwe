@@ -15,7 +15,8 @@ case "$arch" in
   amd64)  goarch="amd64"; goarm="" ;;
   i386)   goarch="386";   goarm="" ;;
   arm64)  goarch="arm64"; goarm="" ;;
-  armhf)  goarch="arm";   goarm="7" ;;
+  armhf)   goarch="arm";     goarm="7" ;;
+  riscv64) goarch="riscv64"; goarm="" ;;
   *)      echo "unsupported architecture: $arch"; exit 1 ;;
 esac
 
