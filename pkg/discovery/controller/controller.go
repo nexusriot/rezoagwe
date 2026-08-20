@@ -1,12 +1,11 @@
 package controller
 
 import (
-	"encoding/json"
-	"errors"
 	"fmt"
-	"math/rand"
-	"net"
+	"os"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -15,412 +14,140 @@ import (
 	"github.com/rivo/tview"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/nexusriot/rezoagwe/pkg/discovery/model"
+	"github.com/nexusriot/rezoagwe/pkg/discovery/node"
 	"github.com/nexusriot/rezoagwe/pkg/discovery/view"
 	pb "github.com/nexusriot/rezoagwe/pkg/proto"
 )
 
+// Controller wires the node engine to the tview front end. It implements
+// node.Events.
 type Controller struct {
-	debug     bool
-	view      *view.View
-	model     *model.Model
-	listen    *net.UDPConn // shared sender + receiver
-	startedAt time.Time
+	view    *view.View
+	node    *node.Node
+	version string
+	httpAdr string
 
 	filterMu sync.RWMutex
 	filter   string
+
+	feedMu       sync.RWMutex
+	showActivity bool
+
+	// Refresh requests are coalesced through capacity-1 channels: engine
+	// goroutines must never block on the UI. QueueUpdateDraw waits for the
+	// tview event loop, and Ctrl+Q runs the engine shutdown *on* that loop —
+	// a direct call from a node goroutine would deadlock the two against each
+	// other.
+	kvCh    chan struct{}
+	peersCh chan struct{}
+	feedCh  chan struct{}
+	done    chan struct{}
+
+	stopOnce sync.Once
 }
 
-// stateSyncChatLines caps how many chat lines a node ships in a StateResponse.
-// The whole response is one UDP datagram, so this bounds its size.
-const stateSyncChatLines = 200
-
-func NewController(
-	debug bool,
-	bootstrapAddr,
-	nodeAddr,
-	nick,
-	dataPath string,
-) *Controller {
-	m := model.NewModel(bootstrapAddr, nodeAddr, nick, dataPath)
+func NewController(cfg node.Config, version string) (*Controller, error) {
 	v := view.NewView()
-	v.Frame.AddText("Rezoagwe Discovery Node v0.0.3", true, tview.AlignCenter, tcell.ColorGreen)
-	return &Controller{
-		debug:     debug,
-		view:      v,
-		model:     m,
-		startedAt: time.Now(),
+	v.Frame.AddText("Rezoagwe Discovery Node "+version, true, tview.AlignCenter, tcell.ColorGreen)
+	c := &Controller{
+		view:    v,
+		version: version,
+		kvCh:    make(chan struct{}, 1),
+		peersCh: make(chan struct{}, 1),
+		feedCh:  make(chan struct{}, 1),
+		done:    make(chan struct{}),
 	}
-}
-
-func (c *Controller) sendTo(addr string, packet []byte) {
-	udpAddr, err := net.ResolveUDPAddr("udp", addr)
+	n, err := node.New(cfg, c)
 	if err != nil {
-		log.Errorf("resolve %s: %s", addr, err)
-		return
+		return nil, err
 	}
-	conn, err := net.DialUDP("udp", nil, udpAddr)
-	if err != nil {
-		log.Errorf("dial %s: %s", addr, err)
-		return
-	}
-	defer conn.Close()
-	if _, err := conn.Write(packet); err != nil {
-		log.Errorf("write %s: %s", addr, err)
+	c.node = n
+	return c, nil
+}
+
+// Node exposes the engine so a caller can attach the HTTP gateway.
+func (c *Controller) Node() *node.Node { return c.node }
+
+// SetHTTPAddr records the gateway address for the details pane.
+func (c *Controller) SetHTTPAddr(addr string) { c.httpAdr = addr }
+
+func signal(ch chan struct{}) {
+	select {
+	case ch <- struct{}{}:
+	default:
 	}
 }
 
-func (c *Controller) sendJSON(addr string, kind pb.MessageKind, v interface{}) {
-	pkt, err := pb.EncodeJSON(kind, v)
-	if err != nil {
-		log.Errorf("encode kind=%d: %s", kind, err)
-		return
-	}
-	c.sendTo(addr, pkt)
-}
-
-func (c *Controller) broadcastJSON(kind pb.MessageKind, v interface{}) {
-	pkt, err := pb.EncodeJSON(kind, v)
-	if err != nil {
-		log.Errorf("encode kind=%d: %s", kind, err)
-		return
-	}
-	c.model.Nodes.Range(func(key, _ interface{}) bool {
-		c.sendTo(key.(string), pkt)
-		return true
-	})
-}
-
-func (c *Controller) HandleConnection(conn *net.UDPConn, updateCh chan<- struct{}) {
-	buf := make([]byte, 65535)
-	for {
-		n, _, err := conn.ReadFromUDP(buf)
-		if err != nil {
-			if errors.Is(err, net.ErrClosed) {
-				return
-			}
-			log.Errorf("read udp: %s", err)
-			continue
-		}
-		kind, body, err := pb.SplitKind(buf[:n])
-		if err != nil {
-			log.Errorf("split kind: %s", err)
-			continue
-		}
-		switch kind {
-		case pb.KindKV:
-			c.handleKV(body, updateCh)
-		case pb.KindChat:
-			c.handleChat(body)
-		case pb.KindStateRequest:
-			c.handleStateRequest(body)
-		case pb.KindStateResponse:
-			c.handleStateResponse(body, updateCh)
-		case pb.KindPeerGossip:
-			c.handlePeerGossip(body)
-		case pb.KindHello:
-			c.handleHello(body)
-		case pb.KindGoodbye:
-			c.handleGoodbye(body)
-		default:
-			log.Errorf("unknown kind: %d", kind)
-		}
-	}
-}
-
-func (c *Controller) handleKV(body []byte, updateCh chan<- struct{}) {
-	var u pb.KVUpdate
-	if err := json.Unmarshal(body, &u); err != nil {
-		log.Errorf("unmarshal kv update: %s", err)
-		return
-	}
-	// Merge under last-write-wins; only refresh the UI if it actually changed.
-	if c.model.Store.Apply(u) {
-		select {
-		case updateCh <- struct{}{}:
-		default:
-		}
-	}
-}
-
-func (c *Controller) handleChat(body []byte) {
-	var m pb.ChatMessage
-	if err := json.Unmarshal(body, &m); err != nil {
-		log.Errorf("unmarshal chat: %s", err)
-		return
-	}
-	c.model.TouchPeer(m.Sender)
-	if m.Nick != "" {
-		c.model.SetNick(m.Sender, m.Nick)
-	}
-	c.appendChat(c.formatChat(m.Sender, m.Nick, m.Text, m.TS))
-	// Learn about chat sender as a peer if we didn't know them.
-	if c.model.AddPeer(m.Sender) {
-		c.announceJoin(m.Sender, m.Nick)
-		c.refreshNodes()
-		c.sendJSON(m.Sender, pb.KindHello, c.helloMessage())
-	}
-}
-
-func (c *Controller) handleStateRequest(body []byte) {
-	var req pb.StateRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		log.Errorf("unmarshal state req: %s", err)
-		return
-	}
-	c.model.TouchPeer(req.From)
-	c.sendJSON(req.From, pb.KindStateResponse, pb.StateResponse{
-		KV:   c.model.Store.Updates(),
-		Chat: lastN(c.model.ChatLog(), stateSyncChatLines),
-	})
-}
-
-func (c *Controller) handleStateResponse(body []byte, updateCh chan<- struct{}) {
-	var resp pb.StateResponse
-	if err := json.Unmarshal(body, &resp); err != nil {
-		log.Errorf("unmarshal state resp: %s", err)
-		return
-	}
-	// Merge the peer's snapshot under last-write-wins rather than overwriting,
-	// so a local edit made before the sync arrived isn't clobbered by a stale
-	// value from the responder.
-	changed := false
-	for _, u := range resp.KV {
-		if c.model.Store.Apply(u) {
-			changed = true
-		}
-	}
-	if len(resp.Chat) > 0 {
-		c.model.PrependChat(resp.Chat)
-		c.refreshChat()
-	}
-	if changed {
-		select {
-		case updateCh <- struct{}{}:
-		default:
-		}
-	}
-}
-
-func (c *Controller) handlePeerGossip(body []byte) {
-	var g pb.PeerGossip
-	if err := json.Unmarshal(body, &g); err != nil {
-		log.Errorf("unmarshal gossip: %s", err)
-		return
-	}
-	c.model.TouchPeer(g.From)
-	if g.Nick != "" {
-		c.model.SetNick(g.From, g.Nick)
-	}
-	changed := false
-	if c.model.AddPeer(g.From) {
-		changed = true
-		c.announceJoin(g.From, g.Nick)
-		c.sendJSON(g.From, pb.KindHello, c.helloMessage())
-	}
-	for _, p := range g.Peers {
-		if c.model.AddPeer(p) {
-			changed = true
-			c.announceJoin(p, c.model.NickOf(p))
-			c.sendJSON(p, pb.KindHello, c.helloMessage())
-		}
-	}
-	if changed {
-		c.refreshNodes()
-	}
-}
-
-func (c *Controller) handleHello(body []byte) {
-	var h pb.Hello
-	if err := json.Unmarshal(body, &h); err != nil {
-		log.Errorf("unmarshal hello: %s", err)
-		return
-	}
-	c.model.TouchPeer(h.From)
-	if h.Nick != "" {
-		c.model.SetNick(h.From, h.Nick)
-	}
-	if c.model.AddPeer(h.From) {
-		c.announceJoin(h.From, h.Nick)
-		c.refreshNodes()
-	}
-}
-
-// handleGoodbye drops a peer that announced a clean shutdown. The nick is
-// resolved before removal (RemovePeer forgets it) so the "left" line renders
-// the same way an eviction would.
-func (c *Controller) handleGoodbye(body []byte) {
-	var g pb.Goodbye
-	if err := json.Unmarshal(body, &g); err != nil {
-		log.Errorf("unmarshal goodbye: %s", err)
-		return
-	}
-	if !c.model.HasPeer(g.From) {
-		return
-	}
-	nick := g.Nick
-	if nick == "" {
-		nick = c.model.NickOf(g.From)
-	}
-	c.model.RemovePeer(g.From)
-	c.announceLeave(g.From, nick)
-	c.refreshNodes()
-}
+func (c *Controller) KVChanged()       { signal(c.kvCh) }
+func (c *Controller) PeersChanged()    { signal(c.peersCh) }
+func (c *Controller) ChatChanged()     { signal(c.feedCh) }
+func (c *Controller) ActivityChanged() { signal(c.feedCh) }
 
 func (c *Controller) Start() error {
-	c.model.RegisterNode()
+	c.node.Start()
+	// Joining dials bootstrap and a peer, either of which can block on an
+	// unreachable host; the first frame must not wait on that.
+	go c.node.Join()
 
-	discovered := c.model.DiscoverNodes()
-	for _, node := range discovered {
-		c.model.AddPeer(node)
-	}
-
-	addr, err := net.ResolveUDPAddr("udp", c.model.NodeAddr)
-	if err != nil {
-		log.Errorf("resolve %s: %s", c.model.NodeAddr, err)
-		return err
-	}
-	conn, err := net.ListenUDP("udp", addr)
-	if err != nil {
-		log.Panicf("listen udp: %s", err)
-	}
-	defer conn.Close()
-	c.listen = conn
-	log.Infof("UDP node is listening on %s", addr)
-
-	updateCh := make(chan struct{}, 16)
-	go c.HandleConnection(conn, updateCh)
-
-	// Announce to existing peers + request state from a random one.
-	c.helloAllPeers()
-	c.requestStateFromRandomPeer()
-
-	// Periodic gossip: share our known peers with one random peer.
-	go c.gossipLoop()
-	// Periodic heartbeat: re-register with bootstrap + Hello every peer.
-	go c.heartbeatLoop()
-	// Periodic peer eviction: drop peers we haven't heard from in a while.
-	go c.evictLoop()
-
-	c.fillNodes()
+	// Only direct widget writes are safe here. Everything that repaints goes
+	// through QueueUpdateDraw, which is synchronous in this tview version: it
+	// blocks on a done channel that only the running event loop signals, so
+	// calling one before App.Run() deadlocks the main goroutine and the TUI
+	// never appears. The first paint of every pane therefore happens in
+	// refreshLoop and statusLoop, on their own goroutines, where blocking until
+	// Run() starts draining the queue is harmless.
 	c.fillDetails()
 	c.setInput()
 	c.view.HighlightFocus()
-	// NOTE: do NOT call refreshStatus() here. It goes through
-	// QueueUpdateDraw, which is synchronous in this tview version and
-	// blocks on a done channel that only the running event loop signals.
-	// Calling it before App.Run() would deadlock the main goroutine and
-	// the TUI would never start. statusLoop paints the first frame from
-	// its own goroutine, which is safe — it'll block harmlessly until
-	// App.Run() begins draining the update queue.
-	go c.statusLoop()
 
-	go func() {
-		for range updateCh {
-			c.fillStoreQ()
-		}
-	}()
+	go c.refreshLoop()
+	go c.statusLoop()
 
 	return c.view.App.Run()
 }
 
-func (c *Controller) helloAllPeers() {
-	c.model.Nodes.Range(func(key, _ interface{}) bool {
-		c.sendJSON(key.(string), pb.KindHello, pb.Hello{From: c.model.NodeAddr})
-		return true
+func (c *Controller) Stop() {
+	c.stopOnce.Do(func() {
+		log.Debugf("exit...")
+		close(c.done)
+		c.node.Stop()
+		c.view.App.Stop()
 	})
 }
 
-func (c *Controller) requestStateFromRandomPeer() {
-	peers := c.model.GetNodes()
-	if len(peers) == 0 {
-		return
+// refreshLoop paints the first frame and then repaints in response to engine
+// events. The initial paint lives here rather than in Start for the reason
+// documented there.
+func (c *Controller) refreshLoop() {
+	c.fillStore()
+	c.fillNodes()
+	c.fillFeed()
+	for {
+		select {
+		case <-c.done:
+			return
+		case <-c.kvCh:
+			c.fillStore()
+		case <-c.peersCh:
+			c.fillNodes()
+		case <-c.feedCh:
+			c.fillFeed()
+		}
 	}
-	peer := peers[rand.Intn(len(peers))]
-	c.sendJSON(peer, pb.KindStateRequest, pb.StateRequest{From: c.model.NodeAddr})
 }
 
-func (c *Controller) gossipLoop() {
-	t := time.NewTicker(10 * time.Second)
+func (c *Controller) statusLoop() {
+	c.refreshStatus()
+	t := time.NewTicker(1 * time.Second)
 	defer t.Stop()
-	for range t.C {
-		peers := c.model.GetNodes()
-		if len(peers) == 0 {
-			continue
-		}
-		target := peers[rand.Intn(len(peers))]
-		c.sendJSON(target, pb.KindPeerGossip, pb.PeerGossip{
-			From:  c.model.NodeAddr,
-			Nick:  c.model.NodeNick,
-			Peers: peers,
-		})
-	}
-}
-
-// heartbeatLoop keeps bootstrap and peers aware that we are still alive.
-func (c *Controller) heartbeatLoop() {
-	t := time.NewTicker(5 * time.Second)
-	defer t.Stop()
-	for range t.C {
-		c.model.RegisterNode()
-		// Alone? The initial join may have raced bootstrap's startup or lost
-		// its DISCOVER packet — re-ask bootstrap and re-sync.
-		if len(c.model.GetNodes()) == 0 {
-			c.rejoin()
-		}
-		hello := c.helloMessage()
-		c.model.Nodes.Range(func(key, _ interface{}) bool {
-			c.sendJSON(key.(string), pb.KindHello, hello)
-			return true
-		})
-	}
-}
-
-// rejoin re-discovers peers from bootstrap and, if any are newly learned,
-// re-announces and pulls state. Used to recover from a join that happened
-// before bootstrap was reachable.
-func (c *Controller) rejoin() {
-	learned := false
-	for _, node := range c.model.DiscoverNodes() {
-		if c.model.AddPeer(node) {
-			learned = true
+	for {
+		select {
+		case <-c.done:
+			return
+		case <-t.C:
+			c.refreshStatus()
 		}
 	}
-	if learned {
-		c.helloAllPeers()
-		c.requestStateFromRandomPeer()
-		c.refreshNodes()
-	}
-}
-
-func (c *Controller) helloMessage() pb.Hello {
-	return pb.Hello{From: c.model.NodeAddr, Nick: c.model.NodeNick}
-}
-
-// evictLoop drops peers from which no packet has arrived for a while.
-func (c *Controller) evictLoop() {
-	const threshold = 15 * time.Second
-	t := time.NewTicker(5 * time.Second)
-	defer t.Stop()
-	for range t.C {
-		if evicted := c.model.EvictStalePeers(threshold); len(evicted) > 0 {
-			for _, ep := range evicted {
-				log.Debugf("evicted stale peer %s", ep.Addr)
-				c.announceLeave(ep.Addr, ep.Nick)
-			}
-			c.refreshNodes()
-		}
-	}
-}
-
-func (c *Controller) Stop() {
-	log.Debugf("exit...")
-	// Announce departure synchronously so every peer drops us at once instead
-	// of waiting out the eviction timeout. UDP writes only hand the datagram
-	// to the kernel, so this stays fast enough to run before App.Stop() even
-	// on the event-loop goroutine.
-	c.broadcastJSON(pb.KindGoodbye, pb.Goodbye{From: c.model.NodeAddr, Nick: c.model.NodeNick})
-	c.view.App.Stop()
 }
 
 func (c *Controller) setInput() {
@@ -452,6 +179,18 @@ func (c *Controller) setInput() {
 				return c.edit()
 			case 'd':
 				return c.delete()
+			case 'h':
+				return c.history()
+			case 'm':
+				return c.metrics()
+			case 'a':
+				return c.toggleFeed()
+			case 'x':
+				return c.exportDialog()
+			case 'i':
+				return c.importDialog()
+			case '?':
+				return c.help()
 			case '/':
 				c.setFocus(c.view.Filter)
 				return nil
@@ -482,21 +221,10 @@ func (c *Controller) setInput() {
 			return
 		}
 		c.view.ChatInput.SetText("")
-		// Send off the tview event-loop goroutine: UDP dials should never
-		// be able to stall the UI, even if a peer address is unreachable.
-		go c.sendChat(text)
+		// Off the event-loop goroutine: sending dials peers, and an unreachable
+		// peer must never stall the UI.
+		go c.node.Submit(text)
 	})
-}
-
-func (c *Controller) sendChat(text string) {
-	m := pb.ChatMessage{
-		Sender: c.model.NodeAddr,
-		Nick:   c.model.NodeNick,
-		Text:   text,
-		TS:     time.Now().Unix(),
-	}
-	c.appendChat(c.formatChat(m.Sender, m.Nick, m.Text, m.TS))
-	c.broadcastJSON(pb.KindChat, m)
 }
 
 func (c *Controller) cycleFocus() {
@@ -520,33 +248,43 @@ func (c *Controller) setFocus(p tview.Primitive) {
 	c.view.HighlightFocus()
 }
 
-func (c *Controller) openKeyForm(title, initKey, initValue string, keyReadOnly bool) {
-	form, keyField, valueArea := c.view.NewKeyForm(title, initKey, initValue, keyReadOnly)
-	form.AddButton("Save", func() {
-		key := strings.TrimSpace(keyField.GetText())
-		value := valueArea.GetText()
-		c.view.Pages.RemovePage("modal")
-		c.setFocus(c.view.List)
+func (c *Controller) closeModal() {
+	c.view.Pages.RemovePage("modal")
+	c.setFocus(c.view.List)
+}
+
+func (c *Controller) showModal(p tview.Primitive, width, height int, focus tview.Primitive) {
+	c.view.Pages.AddPage("modal", c.view.ModalEdit(p, width, height), true, true)
+	c.view.App.SetFocus(focus)
+}
+
+func (c *Controller) openKeyForm(title, initKey, initValue string, ttl int64, keyReadOnly bool, guard *pb.Version) {
+	f := c.view.NewKeyForm(title, initKey, initValue, ttl, keyReadOnly)
+	f.Form.AddButton("Save", func() {
+		key := strings.TrimSpace(f.Key.GetText())
+		value := f.Value.GetText()
+		ttlSecs, _ := strconv.Atoi(strings.TrimSpace(f.TTL.GetText()))
+		cas := f.CAS.IsChecked()
+		c.closeModal()
 		if key == "" {
 			return
 		}
-		log.Debugf("save record: key=%q value=%q", key, value)
-		go c.store(key, value)
+		log.Debugf("save record: key=%q ttl=%d cas=%v", key, ttlSecs, cas)
+		go c.store(key, value, time.Duration(ttlSecs)*time.Second, cas, guard)
 	})
-	form.AddButton("Cancel", func() {
-		c.view.Pages.RemovePage("modal")
-		c.setFocus(c.view.List)
+	f.Form.AddButton("Cancel", func() {
+		c.closeModal()
 	})
-	c.view.Pages.AddPage("modal", c.view.ModalEdit(form, 70, 16), true, true)
+	height := 18
 	if keyReadOnly {
-		c.view.App.SetFocus(valueArea)
+		c.showModal(f.Form, 70, height, f.Value)
 	} else {
-		c.view.App.SetFocus(form)
+		c.showModal(f.Form, 70, height, f.Form)
 	}
 }
 
 func (c *Controller) create() *tcell.EventKey {
-	c.openKeyForm("New key", "", "", false)
+	c.openKeyForm("New key", "", "", 0, false, nil)
 	return nil
 }
 
@@ -554,40 +292,270 @@ func (c *Controller) edit() *tcell.EventKey {
 	key := c.currentSelectedKey()
 	if key == "" {
 		// No selection: fall through to a create flow so Enter is never a no-op.
-		c.openKeyForm("New key", "", "", false)
+		c.openKeyForm("New key", "", "", 0, false, nil)
 		return nil
 	}
-	val, _ := c.model.Store.Get(key)
-	c.openKeyForm("Edit "+key, key, val, true)
+	e, ok := c.node.Entry(key)
+	if !ok {
+		c.openKeyForm("New key", key, "", 0, false, nil)
+		return nil
+	}
+	var ttl int64
+	if e.ExpiresAt > 0 {
+		ttl = e.ExpiresAt - time.Now().Unix()
+		if ttl < 0 {
+			ttl = 0
+		}
+	}
+	// The version on screen is the guard: if a peer writes the same key while
+	// this dialog is open, a guarded save is refused instead of silently
+	// overwriting the newer value.
+	guard := e.Version
+	c.openKeyForm("Edit "+key, key, e.Value, ttl, true, &guard)
 	return nil
 }
 
-func (c *Controller) fillNodes() {
-	c.view.NodeList.Clear()
-	c.view.NodeList.SetMainTextColor(tcell.Color31)
-	for _, node := range c.model.GetNodes() {
-		n := node
-		nick := c.model.NickOf(n)
-		label := n
-		if nick != "" {
-			label = fmt.Sprintf("%s — %s", n, nick)
+func (c *Controller) delete() *tcell.EventKey {
+	key := c.currentSelectedKey()
+	if key == "" {
+		return nil
+	}
+	if _, ok := c.node.Get(key); !ok {
+		return nil
+	}
+	delQ := c.view.NewDeleteQ(key)
+	delQ.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
+		c.closeModal()
+		if buttonLabel == "ok" {
+			go c.node.Delete(key)
 		}
-		c.view.NodeList.AddItem(label, n, 0, func() {})
+	})
+	c.showModal(delQ, 20, 7, delQ)
+	return nil
+}
+
+func (c *Controller) store(key, value string, ttl time.Duration, cas bool, guard *pb.Version) {
+	if !cas {
+		c.node.Set(key, value, ttl)
+		return
+	}
+	expect := pb.Version{}
+	if guard != nil {
+		expect = *guard
+	}
+	if _, ok := c.node.CompareAndSet(key, value, ttl, expect); !ok {
+		c.notify("guarded write to %s refused: the key changed since the form opened", key)
 	}
 }
 
-func (c *Controller) refreshNodes() {
-	c.view.App.QueueUpdateDraw(func() {
-		c.fillNodes()
+// notify puts a local-only line in the feed.
+func (c *Controller) notify(format string, args ...interface{}) {
+	c.node.Model.AppendChat(pb.ChatEntry{
+		TS:   time.Now().Unix(),
+		Text: fmt.Sprintf(format, args...),
+		Kind: pb.ChatSystem,
 	})
+	c.ChatChanged()
 }
 
-func (c *Controller) refreshChat() {
-	lines := c.model.ChatLog()
+func (c *Controller) history() *tcell.EventKey {
+	key := c.currentSelectedKey()
+	if key == "" {
+		return nil
+	}
+	entries := c.node.History(key)
+	var b strings.Builder
+	if len(entries) == 0 {
+		b.WriteString("[gray]no recorded versions[-]\n")
+	}
+	// Newest first: the last thing that happened is what you are looking for.
+	for i := len(entries) - 1; i >= 0; i-- {
+		e := entries[i]
+		origin := "[aqua]remote[-]"
+		if e.Local {
+			origin = "[yellow]local[-]"
+		}
+		what := "set"
+		if e.Deleted {
+			what = "delete"
+		}
+		fmt.Fprintf(&b, "[white]v%d[-] [gray]%s[-] %s by [::b]%s[::-] %s\n",
+			e.Version.Counter, e.At.Format("15:04:05"), what,
+			c.node.Model.WriterName(e.Version.Node), origin)
+		if !e.Deleted {
+			fmt.Fprintf(&b, "    %s\n", tview.Escape(previewValue(e.Value)))
+		}
+	}
+	tv := c.view.NewTextModal("History of "+key, b.String())
+	c.showModal(tv, 80, 20, tv)
+	return nil
+}
+
+func (c *Controller) metrics() *tcell.EventKey {
+	s := c.node.Metrics.Snapshot()
+	var b strings.Builder
+	row := func(label string, v uint64) {
+		fmt.Fprintf(&b, "  [white]%-24s[-] [cyan]%d[-]\n", label, v)
+	}
+	b.WriteString("[::b]Traffic[::-]\n")
+	row("packets sent", s.PacketsSent)
+	row("packets received", s.PacketsRecv)
+	row("bytes sent", s.BytesSent)
+	row("bytes received", s.BytesRecv)
+	row("send errors", s.SendErrors)
+	b.WriteString("\n[::b]Rejected packets[::-]\n")
+	row("failed authentication", s.AuthFailures)
+	row("replays", s.ReplayDrops)
+	row("clock skew", s.SkewDrops)
+	row("malformed", s.MalformedDrops)
+	b.WriteString("\n[::b]Replication[::-]\n")
+	row("local writes", s.KVLocalWrites)
+	row("remote applied", s.KVApplied)
+	row("stale rejected", s.KVRejectedStale)
+	row("guarded writes refused", s.KVCASFailures)
+	row("expired", s.KVExpired)
+	row("tombstones reclaimed", s.KVGCed)
+	b.WriteString("\n[::b]Anti-entropy[::-]\n")
+	row("digests sent", s.AERounds)
+	row("entries pushed", s.AEPushed)
+	row("entries pulled", s.AEPulled)
+	row("snapshots served", s.StateSyncOut)
+	row("snapshots received", s.StateSyncIn)
+	row("stream errors", s.StreamErrors)
+	if len(s.Kinds) > 0 {
+		b.WriteString("\n[::b]Messages by kind (sent/received)[::-]\n")
+		for _, k := range s.Kinds {
+			fmt.Fprintf(&b, "  [white]%-24s[-] [cyan]%d[-]/[cyan]%d[-]\n", k.Kind, k.Sent, k.Recv)
+		}
+	}
+	tv := c.view.NewTextModal("Metrics", b.String())
+	c.showModal(tv, 70, 26, tv)
+	return nil
+}
+
+func (c *Controller) help() *tcell.EventKey {
+	body := `[::b]Keys pane[::-]
+  [yellow]c[-]        create a key
+  [yellow]e[-] / [yellow]Enter[-]  edit the selected key
+  [yellow]d[-]        delete the selected key
+  [yellow]h[-]        version history of the selected key
+  [yellow]/[-]        filter keys and values
+  [yellow]x[-] / [yellow]i[-]    export / import the store
+  [yellow]m[-]        replication metrics
+  [yellow]a[-]        switch the feed between chat and activity
+  [yellow]?[-]        this help
+  [yellow]Tab[-]      cycle panes
+  [yellow]Ctrl+Q[-]   quit (announces departure to peers)
+
+[::b]Chat commands[::-]
+  [yellow]/nick[-] <name>              rename this node
+  [yellow]/me[-] <text>                emote
+  [yellow]/msg[-] <peer> <text>        direct message
+  [yellow]/peers[-]                    list peers
+  [yellow]/keys[-]                     list keys
+  [yellow]/get[-] <key>                read a key
+  [yellow]/set[-] <key> <value>        write a key
+  [yellow]/setttl[-] <key> <s> <value> write a key with a TTL
+  [yellow]/del[-] <key>                delete a key
+
+[::b]Writing safely[::-]
+  Tick [white]Guard[-] in the edit form to make the save a compare-and-swap
+  against the version that was on screen. If a peer wrote the key in the
+  meantime the save is refused instead of overwriting it.`
+	tv := c.view.NewTextModal("Help", body)
+	c.showModal(tv, 76, 30, tv)
+	return nil
+}
+
+func defaultExportPath() string {
+	dir, err := os.Getwd()
+	if err != nil {
+		dir = "."
+	}
+	return filepath.Join(dir, "rezoagwe-export.json")
+}
+
+func (c *Controller) exportDialog() *tcell.EventKey {
+	f := c.view.NewPathForm("Export store", defaultExportPath(), "")
+	f.Form.AddButton("Export", func() {
+		path := strings.TrimSpace(f.Path.GetText())
+		c.closeModal()
+		if path == "" {
+			return
+		}
+		go func() {
+			data, err := c.node.Export()
+			if err != nil {
+				c.notify("export failed: %s", err)
+				return
+			}
+			if err := os.WriteFile(path, data, 0o644); err != nil {
+				c.notify("export failed: %s", err)
+				return
+			}
+			c.notify("exported %d keys to %s", c.node.Model.Store.Len(), path)
+		}()
+	})
+	f.Form.AddButton("Cancel", func() { c.closeModal() })
+	c.showModal(f.Form, 70, 9, f.Form)
+	return nil
+}
+
+func (c *Controller) importDialog() *tcell.EventKey {
+	f := c.view.NewPathForm("Import store", defaultExportPath(),
+		"Seed (re-stamp as local writes so they win)")
+	f.Form.AddButton("Import", func() {
+		path := strings.TrimSpace(f.Path.GetText())
+		seed := f.Seed != nil && f.Seed.IsChecked()
+		c.closeModal()
+		if path == "" {
+			return
+		}
+		go func() {
+			data, err := os.ReadFile(path)
+			if err != nil {
+				c.notify("import failed: %s", err)
+				return
+			}
+			n, err := c.node.Import(data, seed)
+			if err != nil {
+				c.notify("import failed: %s", err)
+				return
+			}
+			c.notify("imported %d entries from %s", n, path)
+		}()
+	})
+	f.Form.AddButton("Cancel", func() { c.closeModal() })
+	c.showModal(f.Form, 70, 11, f.Form)
+	return nil
+}
+
+func (c *Controller) toggleFeed() *tcell.EventKey {
+	c.feedMu.Lock()
+	c.showActivity = !c.showActivity
+	c.feedMu.Unlock()
+	c.fillFeed()
+	return nil
+}
+
+func (c *Controller) activityShown() bool {
+	c.feedMu.RLock()
+	defer c.feedMu.RUnlock()
+	return c.showActivity
+}
+
+func (c *Controller) fillNodes() {
+	peers := c.node.Peers()
 	c.view.App.QueueUpdateDraw(func() {
-		c.view.Chat.Clear()
-		fmt.Fprint(c.view.Chat, strings.Join(lines, "\n"))
-		c.view.Chat.ScrollToEnd()
+		c.view.NodeList.Clear()
+		c.view.NodeList.SetMainTextColor(tcell.Color31)
+		for _, p := range peers {
+			label := p.Addr
+			if p.Nick != "" {
+				label = fmt.Sprintf("%s — %s", p.Addr, p.Nick)
+			}
+			c.view.NodeList.AddItem(label, p.Addr, 0, nil)
+		}
 	})
 }
 
@@ -611,52 +579,82 @@ func colorFor(s string) string {
 	return chatPalette[h%uint32(len(chatPalette))]
 }
 
-func (c *Controller) formatChat(sender, nick, text string, ts int64) string {
-	stamp := time.Unix(ts, 0).Format("15:04:05")
-	if sender == c.model.NodeAddr {
-		// Own message: distinct cyan + a "you" tag, no addr clutter.
-		return fmt.Sprintf("[gray]%s[-] [::b][aqua]you[-][::-]: [white]%s[-]",
-			stamp, text)
+// renderChat turns a structured entry into a tview line.
+func (c *Controller) renderChat(e pb.ChatEntry) string {
+	stamp := time.Unix(e.TS, 0).Format("15:04:05")
+	text := tview.Escape(e.Text)
+	own := e.Sender == c.node.Addr()
+
+	switch e.Kind {
+	case pb.ChatSystem:
+		return fmt.Sprintf("[gray]%s[-] [darkgray]» %s[-]", stamp, text)
+	case pb.ChatAction:
+		name := c.senderName(e, own)
+		return fmt.Sprintf("[gray]%s[-] [darkgray]*[-] [::b][%s]%s[-][::-] %s",
+			stamp, colorFor(e.Sender), name, text)
+	case pb.ChatDirect:
+		if own {
+			return fmt.Sprintf("[gray]%s[-] [::b][magenta]dm → %s[-][::-]: %s",
+				stamp, c.peerLabel(e.To), text)
+		}
+		return fmt.Sprintf("[gray]%s[-] [::b][magenta]dm ← %s[-][::-]: %s",
+			stamp, c.senderName(e, false), text)
 	}
-	if nick == "" {
-		nick = c.model.NickOf(sender)
+
+	if own {
+		return fmt.Sprintf("[gray]%s[-] [::b][aqua]you[-][::-]: [white]%s[-]", stamp, text)
 	}
-	if nick == "" {
-		nick = "?"
-	}
-	color := colorFor(sender)
 	return fmt.Sprintf("[gray]%s[-] [::b][%s]%s[-][::-][gray]@%s[-]: %s",
-		stamp, color, nick, sender, text)
+		stamp, colorFor(e.Sender), c.senderName(e, false), e.Sender, text)
 }
 
-func (c *Controller) formatSystem(text string) string {
-	stamp := time.Now().Format("15:04:05")
-	return fmt.Sprintf("[gray]%s[-] [darkgray]» %s[-]", stamp, text)
-}
-
-func (c *Controller) appendChat(line string) {
-	c.model.AppendChat(line)
-	c.refreshChat()
-}
-
-func (c *Controller) announceJoin(addr, nick string) {
-	if nick == "" {
-		c.appendChat(c.formatSystem(fmt.Sprintf("%s joined", addr)))
-	} else {
-		color := colorFor(addr)
-		c.appendChat(c.formatSystem(
-			fmt.Sprintf("[%s]%s[-][darkgray] (%s) joined", color, nick, addr)))
+func (c *Controller) senderName(e pb.ChatEntry, own bool) string {
+	if own {
+		return "you"
 	}
+	if e.Nick != "" {
+		return e.Nick
+	}
+	if nick := c.node.Model.NickOf(e.Sender); nick != "" {
+		return nick
+	}
+	if e.Sender == "" {
+		return "?"
+	}
+	return e.Sender
 }
 
-func (c *Controller) announceLeave(addr, nick string) {
-	if nick == "" {
-		c.appendChat(c.formatSystem(fmt.Sprintf("%s left", addr)))
-	} else {
-		color := colorFor(addr)
-		c.appendChat(c.formatSystem(
-			fmt.Sprintf("[%s]%s[-][darkgray] (%s) left", color, nick, addr)))
+func (c *Controller) peerLabel(addr string) string {
+	if nick := c.node.Model.NickOf(addr); nick != "" {
+		return nick
 	}
+	return addr
+}
+
+func (c *Controller) fillFeed() {
+	activity := c.activityShown()
+	var lines []string
+	title := "Chat"
+	if activity {
+		title = "Activity (replication)"
+		for _, l := range c.node.Activity() {
+			lines = append(lines, "[darkgray]"+tview.Escape(l)+"[-]")
+		}
+		if len(lines) == 0 {
+			lines = append(lines, "[darkgray]nothing replicated yet[-]")
+		}
+	} else {
+		for _, e := range c.node.Chat() {
+			lines = append(lines, c.renderChat(e))
+		}
+	}
+	body := strings.Join(lines, "\n")
+	c.view.App.QueueUpdateDraw(func() {
+		c.view.SetFeedTitle(title)
+		c.view.Feed.Clear()
+		fmt.Fprint(c.view.Feed, body)
+		c.view.Feed.ScrollToEnd()
+	})
 }
 
 // formatUptime renders an uptime as "1h02m03s" / "42s" etc.
@@ -676,26 +674,26 @@ func formatUptime(d time.Duration) string {
 }
 
 func (c *Controller) refreshStatus() {
-	peers := c.model.GetNodes()
-	peerCount := len(peers)
-	kvCount := len(c.model.Store.Snapshot())
-	uptime := formatUptime(time.Since(c.startedAt))
+	st := c.node.Status()
 
-	var stateTag string
-	if peerCount == 0 {
-		stateTag = "[red]DEGRADED[-]"
-	} else {
+	stateTag := "[red]DEGRADED[-]"
+	if st.Connected {
 		stateTag = "[green]CONNECTED[-]"
+	}
+	tombs := ""
+	if st.Tombstones > 0 {
+		tombs = fmt.Sprintf("  [white]tombs:[-][gray]%d[-]", st.Tombstones)
 	}
 
 	line := fmt.Sprintf(
-		" %s  [white]%s[-] [gray]([-][yellow]%s[-][gray])[-]  [white]peers:[-][cyan]%d[-]  [white]keys:[-][cyan]%d[-]  [white]up:[-][cyan]%s[-]",
+		" %s  [white]%s[-] [gray]([-][yellow]%s[-][gray])[-]  [white]peers:[-][cyan]%d[-]  [white]keys:[-][cyan]%d[-]%s  [white]up:[-][cyan]%s[-]",
 		stateTag,
-		c.model.NodeAddr,
-		c.model.NodeNick,
-		peerCount,
-		kvCount,
-		uptime,
+		st.Addr,
+		st.Nick,
+		st.Peers,
+		st.Keys,
+		tombs,
+		formatUptime(time.Duration(st.UptimeSec)*time.Second),
 	)
 
 	c.view.App.QueueUpdateDraw(func() {
@@ -704,35 +702,21 @@ func (c *Controller) refreshStatus() {
 	})
 }
 
-func (c *Controller) statusLoop() {
-	// First paint runs from a goroutine on purpose: refreshStatus uses
-	// QueueUpdateDraw, which is synchronous and would deadlock if it ran
-	// on the main goroutine before App.Run() starts the event loop.
-	c.refreshStatus()
-	t := time.NewTicker(1 * time.Second)
-	defer t.Stop()
-	for range t.C {
-		c.refreshStatus()
-	}
-}
-
 func (c *Controller) fillDetails() {
+	st := c.node.Status()
 	c.view.Details.Clear()
-	fmt.Fprintf(c.view.Details, "[blue]Nick         ->[gray] %s\n", c.model.NodeNick)
-	fmt.Fprintf(c.view.Details, "[blue]Node UUID    ->[gray] %s\n", c.model.NodeUUID)
-	fmt.Fprintf(c.view.Details, "[blue]Node Address ->[gray] %s\n", c.model.NodeAddr)
-	fmt.Fprintf(c.view.Details, "[green]Bootstrap    ->[white] %s\n", c.model.BootstrapAddr)
-	if c.model.DataPath != "" {
-		fmt.Fprintf(c.view.Details, "[green]Data         ->[white] %s\n", c.model.DataPath)
+	fmt.Fprintf(c.view.Details, "[blue]Nick         ->[gray] %s\n", st.Nick)
+	fmt.Fprintf(c.view.Details, "[blue]Node ID      ->[gray] %s\n", st.NodeID)
+	fmt.Fprintf(c.view.Details, "[blue]Node Address ->[gray] %s\n", st.Addr)
+	fmt.Fprintf(c.view.Details, "[blue]Cluster      ->[gray] %s\n", st.Cluster)
+	seeds := strings.Join(c.node.Model.BootstrapAddrs, ", ")
+	fmt.Fprintf(c.view.Details, "[green]Bootstrap    ->[white] %s\n", seeds)
+	if c.node.Model.DataPath != "" {
+		fmt.Fprintf(c.view.Details, "[green]Data         ->[white] %s\n", c.node.Model.DataPath)
 	}
-}
-
-// lastN returns the final n elements of s (or all of s if shorter).
-func lastN(s []string, n int) []string {
-	if len(s) <= n {
-		return s
+	if c.httpAdr != "" {
+		fmt.Fprintf(c.view.Details, "[green]HTTP         ->[white] http://%s\n", c.httpAdr)
 	}
-	return s[len(s)-n:]
 }
 
 // previewValue returns a one-line, length-capped preview of value for the
@@ -756,8 +740,12 @@ func (c *Controller) currentSelectedKey() string {
 		return ""
 	}
 	main, _ := c.view.List.GetItemText(c.view.List.GetCurrentItem())
-	return main
+	return strings.TrimSuffix(main, ttlMarker)
 }
+
+// ttlMarker flags a key that expires, so the list shows at a glance which
+// values are temporary.
+const ttlMarker = " ⏳"
 
 func (c *Controller) getFilter() string {
 	c.filterMu.RLock()
@@ -769,22 +757,37 @@ func (c *Controller) setFilter(s string) {
 	c.filterMu.Lock()
 	c.filter = s
 	c.filterMu.Unlock()
-	c.fillStoreQ()
+	c.fillStore()
 }
 
-func (c *Controller) fillStoreQ() {
-	snap := c.model.Store.Snapshot()
+func (c *Controller) fillStore() {
+	entries := c.node.Entries()
 	filter := strings.ToLower(c.getFilter())
 
-	// Stable order so cursor restoration is meaningful.
-	keys := make([]string, 0, len(snap))
-	for k := range snap {
-		if filter == "" || strings.Contains(strings.ToLower(k), filter) ||
-			strings.Contains(strings.ToLower(snap[k]), filter) {
-			keys = append(keys, k)
-		}
+	type row struct {
+		label     string
+		secondary string
 	}
-	sort.Strings(keys)
+	rows := make([]row, 0, len(entries))
+	for _, e := range entries {
+		if filter != "" &&
+			!strings.Contains(strings.ToLower(e.Key), filter) &&
+			!strings.Contains(strings.ToLower(e.Value), filter) {
+			continue
+		}
+		label := e.Key
+		secondary := previewValue(e.Value)
+		if e.ExpiresAt > 0 {
+			label += ttlMarker
+			remaining := time.Until(time.Unix(e.ExpiresAt, 0)).Round(time.Second)
+			if remaining < 0 {
+				remaining = 0
+			}
+			secondary = fmt.Sprintf("%s  [expires in %s]", secondary, remaining)
+		}
+		rows = append(rows, row{label: label, secondary: secondary})
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].label < rows[j].label })
 
 	c.view.App.QueueUpdateDraw(func() {
 		prev := ""
@@ -793,10 +796,9 @@ func (c *Controller) fillStoreQ() {
 		}
 		c.view.List.Clear()
 		newIdx := -1
-		for i, key := range keys {
-			k := key
-			c.view.List.AddItem(k, previewValue(snap[k]), 0, nil)
-			if k == prev {
+		for i, r := range rows {
+			c.view.List.AddItem(r.label, r.secondary, 0, nil)
+			if r.label == prev {
 				newIdx = i
 			}
 		}
@@ -804,34 +806,4 @@ func (c *Controller) fillStoreQ() {
 			c.view.List.SetCurrentItem(newIdx)
 		}
 	})
-}
-
-func (c *Controller) store(key, value string) {
-	c.broadcastJSON(pb.KindKV, c.model.Store.Set(key, value))
-	c.fillStoreQ()
-}
-
-func (c *Controller) del(key string) {
-	c.broadcastJSON(pb.KindKV, c.model.Store.Delete(key))
-	c.fillStoreQ()
-}
-
-func (c *Controller) delete() *tcell.EventKey {
-	key := c.currentSelectedKey()
-	if key == "" {
-		return nil
-	}
-	if _, ok := c.model.Store.Get(key); ok {
-		delQ := c.view.NewDeleteQ(key)
-		delQ.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
-			c.view.Pages.RemovePage("modal")
-			c.setFocus(c.view.List)
-			if buttonLabel == "ok" {
-				go c.del(key)
-			}
-		})
-		c.view.Pages.AddPage("modal", c.view.ModalEdit(delQ, 20, 7), true, true)
-		c.view.App.SetFocus(delQ)
-	}
-	return nil
 }

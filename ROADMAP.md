@@ -1,115 +1,123 @@
 # Rezoagwe — Roadmap
 
-Prioritized backlog for hardening the PoC. Items are numbered by **global
-priority** (1 = do next) and grouped into thematic tiers. Effort is a rough
-T-shirt size: **S** ≈ a few hours, **M** ≈ about a day, **L** ≈ multi-day.
+Prioritized backlog. Items are numbered by **global priority** (1 = do next)
+and grouped into thematic tiers. Effort is a rough T-shirt size: **S** ≈ a few
+hours, **M** ≈ about a day, **L** ≈ multi-day.
 
 This complements the *Known limitations & next steps* table in
-[DESIGN.md](DESIGN.md#6-known-limitations--next-steps); each open item notes
+[DESIGN.md](DESIGN.md#10-known-limitations--next-steps); each open item notes
 the code it touches.
 
 ## Shipped
 
-Recent milestones, newest first — context for what the backlog builds on:
+Everything the previous backlog listed is done. Newest first:
 
-- ✅ **Versioned last-write-wins** — per-key `Version` (Lamport counter + node
-  tiebreak); `KindKV` carries JSON `KVUpdate`; tombstoned deletes; state-sync
-  merges by version; versions + clock persisted.
-- ✅ **Robust bootstrap join** — bounded `DiscoverNodes` read + background
-  rejoin; no more startup hang when bootstrap is down/lossy.
-- ✅ **Chat-history sync on join** — a joiner prepends the peer's recent chat.
-- ✅ **Local persistence** — atomic, generation-guarded JSON store (`-data`).
-- ✅ **Graceful leave** — `Goodbye` on `Ctrl+Q` for instant peer eviction.
+- ✅ **Android app** — Kotlin port of both roles (node + rendezvous service)
+  with a Compose UI, a foreground service, and parity tests against the Go
+  codec. Verified live against a running Go cluster.
+- ✅ **Wire v2** — one authenticated framing for every packet, node-to-node
+  and node-to-bootstrap; protobuf removed entirely.
+- ✅ **Pre-shared key + HMAC + replay guard** — every packet carries a MAC
+  over a cluster-derived key, with a nonce and timestamp; foreign packets
+  are dropped before any handler sees them.
+- ✅ **Anti-entropy reconciliation** — range-bounded per-key digests on the
+  gossip tick, with push and pull repair. A dropped write is now re-sent.
+- ✅ **Chunked state sync over TCP** — streams carry length-prefixed frames,
+  so a store or roster larger than a datagram syncs instead of failing.
+- ✅ **Compare-and-swap** — guarded writes and deletes, exposed in the TUI,
+  the HTTP gateway (`If-Match`) and the Android app.
+- ✅ **Key TTL / expiry** — deterministic, version-preserving expiry that
+  needs no replication of its own.
+- ✅ **Tombstone GC** — age-based, opt-in via `-tombstone-ttl`.
+- ✅ **HTTP/REST gateway** — `-http` with CRUD, CAS, TTL, history, peers,
+  chat, export/import, health and Prometheus metrics.
+- ✅ **Metrics** — counters for traffic, rejected packets, replication and
+  anti-entropy, in the TUI and as Prometheus exposition.
+- ✅ **KV activity feed** — remote applies, stale rejections and repair
+  traffic are visible instead of silent.
+- ✅ **Key history** — per-key version ring showing who wrote what.
+- ✅ **Import / export** — versioned interchange, merge or seed.
+- ✅ **Transport abstraction + lossy in-memory network** — multi-node
+  convergence is asserted under packet loss, not hoped for.
+- ✅ **Persistent node identity** — a node keeps its version tiebreak across
+  restarts and address changes.
+- ✅ **Chat enhancements** — `/nick`, `/me`, direct messages, and a command
+  vocabulary shared by every front end; chat persisted to disk.
+- ✅ **Multiple bootstrap seeds** — `-bootstrap a,b,c`.
+- ✅ **Bootstrap hardening** — persisted roster, stream + datagram service,
+  authenticated registration, nicknames in the roster, first tests.
+- ✅ **Real diagnostics** — `-debug` with `-logfile`, never scribbling on the
+  TUI.
+- ✅ **Headless mode** — `-headless` on both binaries.
+- ✅ **Version via ldflags** — the binary reports what the Makefile built.
+- ✅ **Socket reuse and peer-address validation** — one socket per node;
+  malformed gossip is refused at the door.
+
+Earlier milestones: versioned last-write-wins, robust bootstrap join,
+chat-history sync on join, local persistence, graceful leave.
 
 ---
 
-## Tier 1 — Correctness: finish "eventually consistent"
+## Tier 1 — Correctness
 
-### 1. Anti-entropy reconciliation — **M**
-Periodically exchange a per-key version digest on the gossip tick and pull
-whatever is missing or stale. **Why:** the last correctness gap — a dropped
-UDP `KVUpdate` is currently never re-sent, so two stores stay divergent until
-the next overlapping write. Versioning already did the hard part (deterministic
-newer-wins merge via `KVStore.Apply`), so this is now safe and mechanical.
-**Notes:** builds on `Version`/`Apply`; a related enhancement is pulling
-state-sync from a *quorum* of peers rather than one random peer. Maps to the
-Replication + State-sync rows in DESIGN §6.
+### 1. Merkle-tree digests — **M**
+Replace the flat per-key digest with a tree over key ranges, so
+reconciliation costs `O(log n)` rounds instead of walking the keyspace.
+**Why:** the current cursor covers a large store batch by batch; a cluster
+with a million keys converges slowly after a long partition. **Notes:**
+`KVStore.Digest`/`Reconcile` already isolate the comparison, so this swaps
+the summary type without touching the engine.
 
-### 2. Chunked / TCP state sync — **M**
-Stop shipping the whole snapshot (KV entries + chat) in one UDP datagram.
-**Why:** a store/chat larger than ~64 KB silently fails to sync — the joiner
-gets nothing. **Notes:** either length-prefix and chunk over UDP with acks, or
-open a short-lived TCP stream for `StateRequest`/`StateResponse`. Also fixes
-the bootstrap-roster ceiling (still a single datagram). Maps to the Transport /
-State-sync-size / Bootstrap-roster rows in DESIGN §6.
+### 2. Quorum state sync — **S–M**
+Pull from several peers on join and merge all responses.
+**Why:** a joiner currently trusts one random peer, so it inherits that
+peer's gaps until anti-entropy fills them in.
 
-## Tier 2 — Security & networking
+### 3. Acked membership — **M**
+Ping/ack with a suspicion phase (SWIM-style) instead of pure last-seen
+eviction. **Why:** a busy-but-silent peer looks dead, and a dead peer's
+eviction is only as timely as the eviction tick.
 
-### 3. Pre-shared key + HMAC auth — **S–M**
-Tag every packet with an HMAC over a pre-shared key; drop unauthenticated
-packets. **Why:** today anyone on the network can inject KV writes, chat, and
-bogus peers. Far cheaper than DTLS and closes the Security row in DESIGN §6.
-**Notes:** wrap `sendTo` / `HandleConnection`; reject on bad tag before
-dispatch.
+## Tier 2 — Security
 
-### 4. Multiple bootstrap seeds (and/or mDNS) — **S**
-Accept a comma-separated `-bootstrap a,b,c` and try each; optionally discover
-peers via mDNS on a LAN. **Why:** bootstrap is a single point of failure for
-new joiners. **Notes:** loop over seeds in `DiscoverNodes`; the rejoin loop
-already retries.
+### 4. Encrypted payloads — **M**
+The frame is authenticated but the body is plaintext. Add AEAD (the nonce
+is already there) so a KV value is not readable on the wire.
 
-## Tier 3 — Operability & hygiene
+### 5. Per-node keys — **L**
+One shared psk means any member can impersonate any other. Per-node
+keypairs with signed Hellos would close that.
 
-### 5. Real diagnostics — **S**
-Add a `-debug` flag that raises the logrus level **and** redirects logs to a
-file. **Why:** `log.Debugf` is currently inert (level never raised), and
-logging to stderr would scribble over the tview screen — so there is no usable
-way to get logs today. Maps to the Diagnostics row in DESIGN §6.
+## Tier 3 — Reach
 
-### 6. Single-source the version — **S**
-Inject the version via `-ldflags "-X main.version=$(VERSION)"` instead of the
-hardcoded `v0.0.3` in both controllers. **Why:** `make VERSION=x` renames the
-output files but the running binary still reports the old version.
+### 6. mDNS / DNS-SD discovery — **S–M**
+Find peers on a LAN with no seed configured at all — the setup step most
+likely to defeat a new user, and the one the Android app feels most.
 
-### 7. Tombstone GC — **M**
-Reclaim deleted-key tombstones once their deletion is cluster-wide certain
-(e.g. age + observed by all live peers). **Why:** tombstones currently
-accumulate forever in memory and on disk. **Notes:** needs care not to reopen
-the resurrection hole anti-entropy (#1) closes; do this after #1.
+### 7. Android on hardware — **S**
+The app is verified against a live Go cluster from the JVM; run it on a
+phone, confirm the foreground service survives Doze, and check battery cost
+of the 10 s gossip tick.
 
-## Tier 4 — Capabilities & reach
+### 8. Watch / subscribe — **M**
+Long-poll or SSE on `/kv?watch=`, plus a callback in the engine.
+**Why:** every consumer currently polls; the engine already knows exactly
+when a key changed.
 
-### 8. HTTP/REST gateway — **M**
-Optional `-http :8080` exposing `GET/PUT/DELETE /kv/{key}`. **Why:** makes the
-store scriptable and embeddable — and end-to-end testable without driving the
-TUI. High leverage for a KV store.
+### 9. Range and prefix queries on the wire — **S**
+`/kv?prefix=` filters locally after listing everything. A prefix-scoped
+state request would make a large store usable from a small client.
 
-### 9. Key TTL / expiry — **S–M**
-Optional per-key TTL plus a sweeper (Redis-style `EX`). **Notes:** pairs
-naturally with the version stamp; expiry is just a tombstone with a future
-effective time.
+## Tier 4 — Operability
 
-### 10. Chat enhancements — **S each**
-Runtime `/nick` rename (nickname is flag-only at startup today), `/me`, and
-direct messages over the existing per-peer send path.
+### 10. CI — **S**
+Nothing runs the tests automatically. `go test -race ./...` plus the
+Android unit tests on push.
 
-### 11. Persist the chat ring — **S**
-Persist chat to disk alongside the KV store. **Why:** chat is currently synced
-from peers on join but lost on restart if the node is alone. Maps to the
-Chat-history row in DESIGN §6.
+### 11. Structured logging — **S**
+`-logfile` writes logrus text. JSON lines with the node id would make a
+multi-node run greppable.
 
-## Tier 5 — Minor cleanups
-
-### 12. Reuse one send socket — **S**
-`sendTo` opens and closes a fresh UDP socket per packet; reuse the listener or
-a cached dialer, and fix the misleading "shared sender + receiver" comment on
-the `listen` field.
-
-### 13. Validate learned peer addresses — **S**
-Reject malformed addresses from gossip so garbage entries don't linger in the
-node list until eviction.
-
-### 14. Prune vestigial protobuf — **S**
-`Payload` / `DiscoveryAction` in `rezoagwe.proto` are unused now that KV moved
-to JSON; remove them (and regenerate) so the proto reflects reality — protobuf
-is only the bootstrap handshake now.
+### 12. Backpressure on repair traffic — **S**
+`maxPush`/`maxPull` bound one round, but nothing rate-limits successive
+rounds; a node that falls far behind gets a burst per gossip tick.

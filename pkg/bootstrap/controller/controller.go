@@ -1,76 +1,60 @@
 package controller
 
 import (
-	"errors"
 	"fmt"
-	"net"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/gdamore/tcell/v2"
-	"github.com/golang/protobuf/proto"
 	"github.com/rivo/tview"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/nexusriot/rezoagwe/pkg/bootstrap/model"
+	"github.com/nexusriot/rezoagwe/pkg/bootstrap/server"
 	"github.com/nexusriot/rezoagwe/pkg/bootstrap/view"
-	pb "github.com/nexusriot/rezoagwe/pkg/proto"
 )
 
+// Controller drives the bootstrap TUI over a running server.
 type Controller struct {
-	debug bool
-	view  *view.View
-	model *model.Model
+	view    *view.View
+	server  *server.Server
+	cluster string
+	port    int
+
+	// Roster changes arrive on the server's packet goroutines and are coalesced
+	// through a capacity-1 channel, because repainting blocks: QueueUpdateDraw
+	// waits for the tview event loop, and Ctrl+Q runs the server shutdown *on*
+	// that loop. A direct repaint from a packet handler could therefore land
+	// exactly while shutdown waits for that handler to finish, and the two would
+	// wait on each other forever.
+	changed chan struct{}
+	done    chan struct{}
+
+	// screen is set only by tests, which drive the TUI against a simulation
+	// screen and read the drawn cells back.
+	screen tcell.SimulationScreen
+
+	stopOnce sync.Once
 }
 
-func NewController(
-	debug bool,
-	broadcastPort int,
-	nodeTimeout time.Duration,
-
-) *Controller {
-	m := model.NewModel(broadcastPort, nodeTimeout)
+func NewController(cfg server.Config, version string) (*Controller, error) {
+	srv, err := server.New(cfg)
+	if err != nil {
+		return nil, err
+	}
 	v := view.NewView()
-	v.Frame.AddText("Rezoagwe Bootstrap Node v0.0.3", true, tview.AlignCenter, tcell.ColorGreen)
-	controller := Controller{
-		debug: debug,
-		view:  v,
-		model: m,
+	v.Frame.AddText("Rezoagwe Bootstrap Node "+version, true, tview.AlignCenter, tcell.ColorGreen)
+	c := &Controller{
+		view:    v,
+		server:  srv,
+		cluster: cfg.Cluster,
+		port:    cfg.Port,
+		changed: make(chan struct{}, 1),
+		done:    make(chan struct{}),
 	}
-	return &controller
-}
-
-func (c *Controller) HandleBootstrap(conn *net.UDPConn, wg *sync.WaitGroup, uch chan<- struct{}) {
-	buf := make([]byte, 1024)
-	for {
-		n, addr, err := conn.ReadFromUDP(buf)
-		if err != nil {
-			if errors.Is(err, net.ErrClosed) {
-				return
-			}
-			log.Errorf("Error reading from UDP: %s", err)
-			continue
-		}
-		loaded := new(pb.BootstrapMessage)
-		err = proto.Unmarshal(buf[:n], loaded)
-		if err != nil {
-			// TODO: -> log
-			continue
-		}
-
-		if loaded.Action == pb.BootstrapAction_DISCOVER {
-			nodes := c.model.GetNodes()
-			response := strings.Join(nodes, ",")
-			conn.WriteToUDP([]byte(response), addr)
-
-		} else if loaded.Action == pb.BootstrapAction_REGISTER {
-			nodeAddress := loaded.Host.GetHost()
-			c.model.RegisterNode(nodeAddress)
-			log.Debugf("Nodes: %s\n", c.model.GetNodes())
-			uch <- struct{}{}
-		}
-	}
+	// Repaint as soon as the roster changes, so a new node shows up at once
+	// instead of waiting for the next status tick.
+	srv.OnChange(c.signalChange)
+	return c, nil
 }
 
 // formatAge renders a duration as "1h02m03s" / "2m05s" / "9s".
@@ -92,33 +76,63 @@ func formatAge(d time.Duration) string {
 // fill repaints the nodes list, showing each node's last-seen age as
 // secondary text. Nodes close to the stale timeout are shown in red.
 func (c *Controller) fill() {
-	infos := c.model.GetNodeInfos()
-	timeout := c.model.NodeTimeout
+	infos := c.server.Model.GetNodeInfos()
+	timeout := c.server.Model.NodeTimeout
 	c.view.App.QueueUpdateDraw(func() {
 		c.view.List.Clear()
 		c.view.List.SetMainTextColor(tcell.Color31)
 		for _, n := range infos {
 			age := time.Since(n.LastSeen)
+			label := n.Addr
+			if n.Nick != "" {
+				label = fmt.Sprintf("%s — %s", n.Addr, n.Nick)
+			}
 			secondary := fmt.Sprintf("last seen %s ago", formatAge(age))
 			if age > timeout*2/3 {
 				secondary += " (stale soon)"
 			}
-			c.view.List.AddItem(n.Addr, secondary, 0, nil)
+			c.view.List.AddItem(label, secondary, 0, nil)
 		}
 	})
 }
 
-func (c *Controller) refreshStatus() {
-	infos := c.model.GetNodeInfos()
-	uptime := formatAge(time.Since(c.model.StartedAt))
+func (c *Controller) signalChange() {
+	select {
+	case c.changed <- struct{}{}:
+	default:
+	}
+}
 
-	stateTag := "[green]LISTENING[-]"
+func (c *Controller) refresh() {
+	c.fill()
+	c.refreshStatus()
+}
+
+// refreshLoop paints the first frame and repaints whenever the roster changes.
+// It runs on its own goroutine so blocking until App.Run() starts draining the
+// update queue is harmless.
+func (c *Controller) refreshLoop() {
+	c.refresh()
+	for {
+		select {
+		case <-c.done:
+			return
+		case <-c.changed:
+			c.refresh()
+		}
+	}
+}
+
+func (c *Controller) refreshStatus() {
+	infos := c.server.Model.GetNodeInfos()
+	uptime := formatAge(time.Since(c.server.Model.StartedAt))
+
 	line := fmt.Sprintf(
-		" %s  [white]udp/:%d[-]  [white]nodes:[-][cyan]%d[-]  [white]timeout:[-][cyan]%s[-]  [white]up:[-][cyan]%s[-]",
-		stateTag,
-		c.model.BroadcastPort,
+		" [green]LISTENING[-]  [white]udp+tcp/:%d[-]  [white]cluster:[-][yellow]%s[-]  [white]nodes:[-][cyan]%d[-]  [white]timeout:[-][cyan]%s[-]  [white]up:[-][cyan]%s[-]",
+		c.port,
+		c.cluster,
 		len(infos),
-		c.model.NodeTimeout,
+		c.server.Model.NodeTimeout,
 		uptime,
 	)
 
@@ -130,18 +144,16 @@ func (c *Controller) refreshStatus() {
 
 // statusLoop repaints the status bar and the nodes list once per second
 // so last-seen ages and stale-node evictions stay current.
-//
-// The first paint runs from this goroutine on purpose: refreshStatus and
-// fill go through QueueUpdateDraw, which is synchronous and would deadlock
-// if called on the main goroutine before App.Run() starts the event loop.
 func (c *Controller) statusLoop() {
-	c.refreshStatus()
-	c.fill()
 	t := time.NewTicker(1 * time.Second)
 	defer t.Stop()
-	for range t.C {
-		c.refreshStatus()
-		c.fill()
+	for {
+		select {
+		case <-c.done:
+			return
+		case <-t.C:
+			c.refresh()
+		}
 	}
 }
 
@@ -157,44 +169,21 @@ func (c *Controller) setInput() {
 }
 
 func (c *Controller) Stop() {
-	log.Debugf("exit...")
-	c.view.App.Stop()
+	c.stopOnce.Do(func() {
+		log.Debugf("exit...")
+		close(c.done)
+		c.server.Stop()
+		c.view.App.Stop()
+	})
 }
 
 func (c *Controller) Start() error {
-
-	addr := net.UDPAddr{
-		Port: c.model.BroadcastPort,
-		// Todo: run on 127.0.0.1
-		IP: net.ParseIP("0.0.0.0"),
-	}
-	var wg sync.WaitGroup
-	updateCh := make(chan struct{})
-	conn, err := net.ListenUDP("udp", &addr)
-	if err != nil {
-		log.Errorf("Error starting UDP server: %s", err)
-		return err
-	}
-	defer conn.Close()
-	go func() {
-		for {
-			c.model.RemoveStaleNodes()
-			time.Sleep(c.model.NodeTimeout / 2)
-		}
-	}()
-	log.Debugf("Bootstrap node is listening on port %d\n", c.model.BroadcastPort)
-	wg.Add(1)
-	go c.HandleBootstrap(conn, &wg, updateCh)
+	c.server.Start()
 	c.setInput()
-
-	// Repaint immediately on every REGISTER so a new node shows up at once
-	// instead of waiting for the next 1 s status tick.
-	go func() {
-		for range updateCh {
-			c.fill()
-		}
-	}()
-	// Periodic refresh: status bar + last-seen ages + stale evictions.
+	// The first paint has to come from a goroutine: it goes through
+	// QueueUpdateDraw, which is synchronous and would deadlock if called on the
+	// main goroutine before App.Run() starts the event loop.
+	go c.refreshLoop()
 	go c.statusLoop()
 	return c.view.App.Run()
 }

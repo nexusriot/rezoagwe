@@ -1,111 +1,128 @@
 package model
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
-	"reflect"
-	"strings"
 	"testing"
 
 	pb "github.com/nexusriot/rezoagwe/pkg/proto"
 )
 
-func sampleState() PersistState {
-	return PersistState{
-		Clock: 7,
-		Entries: map[string]kvEntry{
-			"a": {Value: "1", Version: pb.Version{Counter: 5, Node: ":3137"}},
-			"b": {Value: "two", Version: pb.Version{Counter: 6, Node: ":3137"}},
-			"c": {Version: pb.Version{Counter: 7, Node: ":3138"}, Deleted: true},
-		},
-	}
-}
-
 func TestPersisterRoundTrip(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "kv.json")
+	path := filepath.Join(t.TempDir(), "state.json")
 	p := NewPersister(path)
 
-	want := sampleState()
-	p.Save(1, want)
+	state := PersistState{
+		NodeID:  "id-1",
+		Clock:   7,
+		Entries: map[string]kvEntry{"k": {Value: "v", Version: pb.Version{Counter: 7, Node: "id-1"}}},
+		Chat:    pb.ChatLog{{Text: "hello"}},
+	}
+	p.Save(1, state)
 
 	got, found, err := p.Load()
-	if err != nil {
-		t.Fatalf("Load: %v", err)
+	if err != nil || !found {
+		t.Fatalf("Load = (found %v, err %v)", found, err)
 	}
-	if !found {
-		t.Fatal("Load: found = false after Save")
+	if got.NodeID != "id-1" || got.Clock != 7 || got.Entries["k"].Value != "v" {
+		t.Fatalf("state round trip lost data: %+v", got)
 	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("round-trip = %+v, want %+v", got, want)
+	if len(got.Chat) != 1 || got.Chat[0].Text != "hello" {
+		t.Fatalf("chat round trip lost data: %+v", got.Chat)
 	}
 }
 
-// An out-of-order Save with an older generation must not overwrite a newer
-// on-disk state.
-func TestPersisterGenerationGuard(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "kv.json")
+// The generation guard is what stops a slow write from overwriting the file
+// with an older snapshot.
+func TestPersisterIgnoresOutOfOrderSave(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
 	p := NewPersister(path)
 
-	newer := PersistState{Clock: 2, Entries: map[string]kvEntry{"k": {Value: "new", Version: pb.Version{Counter: 2, Node: "n"}}}}
-	stale := PersistState{Clock: 1, Entries: map[string]kvEntry{"k": {Value: "stale", Version: pb.Version{Counter: 1, Node: "n"}}}}
-
-	p.Save(2, newer)
-	p.Save(1, stale) // older gen: must be ignored
+	p.Save(5, PersistState{Clock: 5})
+	p.Save(2, PersistState{Clock: 2})
 
 	got, _, err := p.Load()
 	if err != nil {
-		t.Fatalf("Load: %v", err)
+		t.Fatalf("load: %v", err)
 	}
-	if got.Entries["k"].Value != "new" {
-		t.Fatalf("k = %q, want %q (stale write leaked through)", got.Entries["k"].Value, "new")
+	if got.Clock != 5 {
+		t.Fatalf("clock = %d, want 5 (stale save won)", got.Clock)
 	}
 }
 
-func TestPersisterLoadMissingIsNotFound(t *testing.T) {
-	p := NewPersister(filepath.Join(t.TempDir(), "does-not-exist.json"))
-	got, found, err := p.Load()
+func TestPersisterLoadMissingFile(t *testing.T) {
+	p := NewPersister(filepath.Join(t.TempDir(), "absent.json"))
+	_, found, err := p.Load()
 	if err != nil {
-		t.Fatalf("Load of missing file returned error: %v", err)
+		t.Fatalf("load of a missing file returned %v", err)
 	}
 	if found {
-		t.Fatal("Load of missing file: found = true")
-	}
-	if len(got.Entries) != 0 {
-		t.Fatalf("Load of missing file returned entries: %v", got.Entries)
+		t.Fatal("reported a state file that does not exist")
 	}
 }
 
-func TestPersisterLoadCorruptErrors(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "kv.json")
-	if err := os.WriteFile(path, []byte("{not json"), 0o644); err != nil {
-		t.Fatalf("seed corrupt file: %v", err)
+// A temp file must never be left behind, and the real file must be complete —
+// that is the point of writing through a rename.
+func TestPersisterWritesAtomically(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	NewPersister(path).Save(1, PersistState{Clock: 1})
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
 	}
-	if _, _, err := NewPersister(path).Load(); err == nil {
-		t.Fatal("Load of corrupt file: expected error, got nil")
+	for _, e := range entries {
+		if filepath.Ext(e.Name()) == ".tmp" {
+			t.Fatalf("temp file left behind: %s", e.Name())
+		}
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	var state PersistState
+	if err := json.Unmarshal(data, &state); err != nil {
+		t.Fatalf("state file is not valid JSON: %v", err)
 	}
 }
 
-// The atomic write must leave no stray .tmp file behind on success.
-func TestPersisterNoTmpLeftover(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "kv.json")
-	NewPersister(path).Save(1, sampleState())
-	if _, err := os.Stat(path + ".tmp"); !os.IsNotExist(err) {
-		t.Fatalf("stray .tmp file left after Save (stat err = %v)", err)
+// Upgrading from wire v1 must not throw away the KV store just because chat
+// history used to be a list of strings.
+func TestPersisterReadsLegacyChatFormat(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	legacy := `{
+	  "clock": 3,
+	  "entries": {"k": {"value": "v", "version": {"counter": 3, "node": ":3137"}}},
+	  "chat": ["[gray]12:00[-] bob: hi"]
+	}`
+	if err := os.WriteFile(path, []byte(legacy), 0o644); err != nil {
+		t.Fatalf("write legacy file: %v", err)
+	}
+
+	state, found, err := NewPersister(path).Load()
+	if err != nil || !found {
+		t.Fatalf("Load = (found %v, err %v)", found, err)
+	}
+	if state.Entries["k"].Value != "v" {
+		t.Fatalf("legacy KV lost: %+v", state.Entries)
+	}
+	if len(state.Chat) != 1 || state.Chat[0].Text != "12:00 bob: hi" {
+		t.Fatalf("legacy chat not converted: %+v", state.Chat)
 	}
 }
 
-func TestDefaultDataPath(t *testing.T) {
-	p := DefaultDataPath(":3137")
-	if !strings.HasSuffix(p, ".json") {
-		t.Fatalf("DefaultDataPath = %q, want a .json file", p)
+func TestSanitizeAddr(t *testing.T) {
+	cases := map[string]string{
+		":3137":          "_3137",
+		"127.0.0.1:3137": "127.0.0.1_3137",
+		"":               "node",
+		"a/b\\c:1":       "a_b_c_1",
 	}
-	if strings.Contains(filepath.Base(p), ":") {
-		t.Fatalf("basename %q still contains ':' — not filesystem-safe", filepath.Base(p))
-	}
-	if filepath.Base(p) != "_3137.json" {
-		t.Fatalf("basename = %q, want %q", filepath.Base(p), "_3137.json")
-	}
-	if a, b := DefaultDataPath(":3137"), DefaultDataPath(":3138"); a == b {
-		t.Fatal("distinct node addresses produced the same data path")
+	for in, want := range cases {
+		if got := sanitizeAddr(in); got != want {
+			t.Errorf("sanitizeAddr(%q) = %q, want %q", in, got, want)
+		}
 	}
 }

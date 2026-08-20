@@ -32,8 +32,11 @@ BIN_DISC   := rezoagwe-discovery
 PKG_BOOT   := ./cmd/bootstrap
 PKG_DISC   := ./cmd/discovery
 GO         ?= go
-VERSION    ?= 0.0.3
-LDFLAGS    ?= -s -w
+VERSION    ?= 0.1.0
+# The version is injected into both binaries: renaming the output file is not
+# the same as building a binary that knows what it is, and the two used to
+# drift apart the moment anyone passed VERSION=.
+LDFLAGS    ?= -s -w -X main.version=$(VERSION)
 BUILD_DIR  := build
 DIST_DIR   := dist
 
@@ -82,7 +85,24 @@ help:
 	@echo "  make licheerv           - linux/riscv64 (LicheeRV Nano (W))"
 	@echo "  make darwin windows     - macOS / Windows"
 	@echo "  make debs               - deb-amd64 + deb-i386 + deb-arm64 + deb-armhf + deb-riscv64"
+	@echo "  make android            - debug APK into $(DIST_DIR)/"
+	@echo "  make android-test       - Android unit tests"
 	@echo "  make test | test-race | vet | fmt | tidy | clean"
+
+# Gradle needs a JDK. Android Studio ships one, so fall back to it rather than
+# failing on a machine that has no system-wide java.
+JAVA_HOME ?= $(firstword $(wildcard /opt/android-studio/jbr /usr/lib/jvm/default-java))
+
+.PHONY: android
+android:
+	cd android && JAVA_HOME="$(JAVA_HOME)" ./gradlew :app:assembleDebug
+	@mkdir -p $(DIST_DIR)
+	@cp android/app/build/outputs/apk/debug/app-debug.apk $(DIST_DIR)/rezoagwe-$(VERSION)-android-debug.apk
+	@echo ">> $(DIST_DIR)/rezoagwe-$(VERSION)-android-debug.apk"
+
+.PHONY: android-test
+android-test:
+	cd android && JAVA_HOME="$(JAVA_HOME)" ./gradlew :app:testDebugUnitTest
 
 .PHONY: tidy
 tidy:

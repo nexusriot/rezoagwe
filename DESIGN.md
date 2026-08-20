@@ -1,7 +1,7 @@
 # Rezoagwe — Design & Architecture
 
 This document describes how `rezoagwe` is put together: what each package
-does, how the two binaries cooperate at runtime, and the rationale behind
+does, how the binaries cooperate at runtime, and the rationale behind
 the main design choices. It is aimed at contributors and at users who
 want to understand the tool deeply enough to extend it.
 
@@ -11,52 +11,37 @@ For end-user documentation see [README.md](README.md).
 
 ## 1. High-level overview
 
-`rezoagwe` is a PoC-grade **distributed key-value store with an embedded
-chat**. It consists of two cooperating binaries:
+`rezoagwe` is a **distributed key-value store with an embedded chat**. It
+consists of two binaries plus an Android app:
 
-* **bootstrap** — a single rendezvous service that helps new nodes find
-  the existing cluster. It only knows about the *set of node addresses*;
-  it never sees the KV data or the chat.
+* **bootstrap** — a rendezvous service that helps new nodes find the
+  existing cluster. It only knows about the *set of node addresses*; it
+  never sees the KV data or the chat.
 * **discovery** — a full peer node. It owns a local copy of the KV store,
-  participates in chat, gossips peer membership and replicates writes to
-  every other node it knows about. Each discovery node also runs a
-  `tview`-based TUI.
+  participates in chat, gossips peer membership, reconciles divergence
+  with anti-entropy, and replicates writes to every peer it knows about.
+* **android/** — a Kotlin port of both roles with a Compose UI (§9).
 
 ```
-                  ┌──────────────┐
-   keyboard ──►   │  Controller  │   ◄── tview events
-                  └──────┬───────┘
-                         │
-            ┌────────────┴────────────┐
-            ▼                         ▼
-       ┌──────────┐              ┌─────────┐
-       │  Model   │ ── UDP ─►    │  View   │ ── tview/tcell ─► terminal
-       └────┬─────┘              └─────────┘
-            │
-            ▼
-       other discovery nodes  +  bootstrap (once, at startup)
+        ┌───────────┐   node.Events    ┌──────────────┐
+        │ Controller│ ◄─────────────── │  node.Node   │ ── transport ─► peers
+        │   (TUI)   │ ───────────────► │   (engine)   │                 bootstrap
+        └───────────┘   Set/Delete/…   └──────┬───────┘
+        ┌───────────┐                         │
+        │  httpapi  │ ────────────────────────┘
+        └───────────┘
 ```
 
-Each discovery node follows a classic **MVC** decomposition:
+The engine (`pkg/discovery/node`) owns the protocol: membership,
+replication, chat, anti-entropy and state sync. It knows nothing about
+tview. The TUI, the HTTP gateway and the multi-node tests are three front
+ends onto the same engine — which is what makes convergence testable
+without driving a terminal.
 
-* **Model** — owns the KV store (with a mutex), the peer set
-  (`sync.Map`), per-peer last-seen timestamps and reported nicknames
-  (both `sync.Map`s), the chat log, and the node's own identity (UUID,
-  address, nickname).
-* **View** — owns the `tview` widgets: keys list with a filter field,
-  details pane, nodes list (each row labelled `addr — nick`), chat
-  pane, chat input, and a one-line status bar at the bottom. Pure UI;
-  it does not know anything about the network.
-* **Controller** — wires keyboard events to model mutations, opens the
-  UDP listener, dispatches incoming packets to handlers, and pushes
-  state changes back into the view via `App.QueueUpdateDraw`.
-
-The bootstrap binary uses the same MVC split, but its model is trivial:
-just a `map[address]lastSeen` with a mutex and a stale-eviction loop.
-Its TUI shows the nodes list (each row carries a "last seen N ago"
-sub-line, flagged when a node is about to be evicted) plus a status
-bar with the listening port, node count, stale timeout and uptime,
-refreshed once per second.
+Inside the engine, the **model** owns the KV store, the peer set, the chat
+ring and the node's identity; the **view** owns the tview widgets and knows
+nothing about the network; the **controller** wires keyboard events to
+engine calls and repaints on engine events.
 
 ---
 
@@ -65,238 +50,328 @@ refreshed once per second.
 ```
 rezoagwe/
 ├── cmd/
-│   ├── bootstrap/bootstrap.go       entry point: -port flag → Controller
-│   └── discovery/discovery.go       entry point: -bootstrap/-node/-nick → Controller
+│   ├── bootstrap/bootstrap.go       -port/-psk/-cluster/-headless → Controller
+│   └── discovery/discovery.go       -bootstrap/-node/-http/-headless → Controller
 │
 ├── pkg/
 │   ├── proto/
-│   │   ├── rezoagwe.proto           protobuf source (BootstrapMessage, Payload)
-│   │   ├── rezoagwe.pb.go           generated; only edited via protoc
-│   │   └── wire.go                  1-byte-kind envelope + JSON message types
+│   │   ├── wire.go                  message kinds and bodies (all JSON)
+│   │   └── codec.go                 framing, HMAC authentication, replay guard
+│   │
+│   ├── transport/
+│   │   ├── transport.go             Transport interface + stream framing
+│   │   ├── udp.go                   one shared socket for datagrams + TCP streams
+│   │   └── mem.go                   in-process network with loss/dup/delay/partitions
+│   │
+│   ├── metrics/metrics.go           counters + Prometheus exposition
 │   │
 │   ├── bootstrap/
-│   │   ├── model/model.go           known-nodes table + stale eviction
+│   │   ├── model/model.go           roster + persistence + stale eviction
+│   │   ├── server/server.go         REGISTER/DISCOVER over datagrams and streams
 │   │   ├── view/view.go             nodes list + status bar
-│   │   └── controller/controller.go UDP listener for DISCOVER/REGISTER
+│   │   └── controller/controller.go TUI over the server
 │   │
 │   └── discovery/
-│       ├── model/model.go           KV store, peer set, chat log, identity
-│       ├── view/view.go             keys / details / nodes / chat / input
-│       └── controller/controller.go UDP listener, handlers, gossip, UI glue
+│       ├── model/kvstore.go         versioned store: LWW, CAS, TTL, digest, GC
+│       ├── model/model.go           peers, nicks, ids, chat ring, identity
+│       ├── model/persist.go         atomic, generation-guarded state file
+│       ├── node/node.go             engine lifecycle and loops
+│       ├── node/handlers.go         packet dispatch
+│       ├── node/antientropy.go      digest exchange and repair
+│       ├── node/statesync.go        stream state sync + bootstrap handshake
+│       ├── node/chat.go             chat, direct messages, slash commands
+│       ├── node/api.go              public operations (Set/CAS/Import/…)
+│       ├── httpapi/httpapi.go       REST gateway
+│       ├── view/view.go             keys / details / nodes / feed / input
+│       └── controller/controller.go TUI glue implementing node.Events
 │
+├── android/                         Kotlin port: node + bootstrap + Compose UI
 ├── DEBIAN/                          Debian packaging metadata
-├── build-deb.sh                     builds a .deb (amd64 by default)
-├── build-deb-arm64.sh               builds an arm64 .deb (wrapper)
-├── Makefile                         cross-build + deb targets
-├── go.mod / go.sum
+├── Makefile                         cross-build + deb + android targets
 ├── README.md
 └── DESIGN.md                        this document
 ```
 
 ---
 
-## 3. Wire protocol
+## 3. Wire protocol (v2)
 
-Two protocols coexist:
+One protocol, one framing, for every packet — node-to-node *and*
+node-to-bootstrap. Wire v1 had bootstrap speaking raw protobuf on its own
+unauthenticated path, which meant two codecs, two framings, and no way to
+authenticate a REGISTER. Protobuf is gone; every body is JSON.
 
-### 3.1 Bootstrap protocol (node ↔ bootstrap)
-
-Plain protobuf, no envelope. Defined in
-[pkg/proto/rezoagwe.proto](pkg/proto/rezoagwe.proto):
-
-```proto
-message BootstrapMessage {
-  BootstrapAction action = 1;   // DISCOVER | REGISTER
-  Host host = 2;                // sender's UDP address
-}
-```
-
-* **REGISTER**: discovery node tells bootstrap "I exist at `addr`".
-  Bootstrap stamps `lastSeen = now()`. No response.
-* **DISCOVER**: discovery node asks for the current node roster.
-  Bootstrap replies with a comma-separated list of addresses (plain
-  bytes, not protobuf — kept that way for simplicity).
-
-Stale nodes (no REGISTER within `NodeTimeout`) are evicted by a
-background goroutine on the bootstrap side.
-
-A discovery node only talks to the bootstrap **at startup**: one
-REGISTER + one DISCOVER. From then on, all peer-membership maintenance
-happens between discovery nodes themselves.
-
-### 3.2 Node-to-node protocol (discovery ↔ discovery)
-
-To avoid regenerating `rezoagwe.pb.go` whenever a new control message
-is added, every node-to-node UDP packet uses a tiny envelope defined in
-[pkg/proto/wire.go](pkg/proto/wire.go):
+### 3.1 Frame
 
 ```
-byte[0]    = MessageKind
-byte[1..]  = body
+byte[0]      MessageKind
+byte[1..8]   nonce
+byte[9..16]  unix timestamp, big endian
+byte[17..48] HMAC-SHA256 tag
+byte[49..]   body (JSON)
+
+tag = HMAC-SHA256(key, kind || nonce || timestamp || body)
+key = HMAC-SHA256(psk, "rezoagwe/wire/v2" || 0x00 || cluster)
 ```
 
-| Kind | Name           | Body encoding | Purpose                               |
-|------|----------------|---------------|---------------------------------------|
-| 0    | `KV`           | JSON `KVUpdate` | versioned KV set / delete (LWW)     |
-| 1    | `Chat`         | JSON `ChatMessage` | chat broadcast                   |
-| 2    | `StateRequest` | JSON `StateRequest` | "send me your full KV"          |
-| 3    | `StateResponse`| JSON `StateResponse` | versioned KV entries + recent chat |
-| 4    | `PeerGossip`   | JSON `PeerGossip` | "here are the peers I know"       |
-| 5    | `Hello`        | JSON `Hello`     | "hi, I am `addr`" (peer learning)  |
-| 6    | `Goodbye`      | JSON `Goodbye`   | "I am shutting down" (clean leave) |
+Every packet is authenticated: there is no unauthenticated path to keep
+tested. With no `-psk` the key is derived from the cluster name alone,
+which still keeps two clusters on one LAN apart but — the name being
+public — provides no secrecy.
 
-Every discovery message is a plain Go struct with JSON tags; protobuf is now
-used only for the bootstrap handshake. New features ship as new kinds without
-regenerating any code, and the envelope costs exactly 1 byte per packet.
+A frame is rejected, and counted, when the tag does not verify, when the
+timestamp sits outside ±30 s, or when the nonce has been seen before. The
+replay cache is pruned past twice the skew, since such a nonce can never
+be accepted again on timestamp grounds anyway.
+
+Streams (TCP) carry exactly the same frames with a 4-byte length prefix,
+so a payload larger than a datagram needs no separate chunking protocol.
+
+### 3.2 Message kinds
+
+| Kind | Name                 | Purpose                                          |
+|------|----------------------|--------------------------------------------------|
+| 0    | `KV`                 | versioned set / delete (LWW)                     |
+| 1    | `Chat`               | chat broadcast                                   |
+| 2    | `StateRequest`       | "send me your store"                             |
+| 3    | `StateResponse`      | versioned entries + recent chat                  |
+| 4    | `PeerGossip`         | "here are the peers I know"                      |
+| 5    | `Hello`              | "hi, I am `addr`, id `uuid`"                     |
+| 6    | `Goodbye`            | "I am shutting down" (clean leave)               |
+| 7    | `Digest`             | anti-entropy: what I hold for a key range        |
+| 8    | `PullRequest`        | anti-entropy: "(re)send me these keys"           |
+| 9    | `KVBatch`            | several updates in one packet (repair traffic)   |
+| 10   | `DirectMessage`      | chat to one peer only                            |
+| 20   | `BootstrapRegister`  | "I exist at `addr`"                              |
+| 21   | `BootstrapDiscover`  | "who is in the cluster?"                         |
+| 22   | `BootstrapRoster`    | the roster, with nicknames                       |
 
 ---
 
 ## 4. Cluster lifecycle
 
-### 4.1 Bootstrap startup
-
-`./rezoagwe-bootstrap -port 9999` opens a UDP listener and starts the
-stale-node sweeper. Nothing else happens until someone REGISTERs.
-
-### 4.2 Discovery node startup
+### 4.1 Discovery node startup
 
 `./rezoagwe-discovery -bootstrap :9999 -node :3137 -nick alice`:
 
-1. **Register** with bootstrap (UDP REGISTER).
-2. **Discover** initial roster: ask bootstrap for the comma-separated
-   list of known addresses; learn each one as a peer.
-3. **Listen** on `-node` UDP address for envelope-prefixed packets.
-4. **Hello-storm**: send a `Hello` to every peer learned from
-   bootstrap. This causes existing nodes to learn the new node back
-   (without requiring bootstrap to push updates).
-5. **State sync**: pick one random peer and send `StateRequest`. That
-   peer replies with `StateResponse` carrying its full KV store as
-   versioned entries (tombstones included) — which the new node
-   *merges* under last-write-wins rather than overwriting, so a local
-   edit made before the reply arrives isn't clobbered — plus its recent
-   chat history, which the new node prepends to its (usually empty)
-   chat log so the pane has context on join.
-6. **Start gossip loop**: every 10 s, send `PeerGossip` (containing the
-   full known-peer list) to one random peer. The receiver learns any
-   unknown addresses and `Hello`s back so the relationship is
-   symmetric.
-7. **Run the TUI** until the user hits `Ctrl+Q`.
+1. **Start serving**: bind the datagram socket and the stream listener,
+   start the gossip, heartbeat, eviction and sweep loops.
+2. **Join** (on its own goroutine, since it dials hosts that may be down):
+   REGISTER with every seed, then DISCOVER the roster — over a stream when
+   possible, falling back to datagrams whose reply arrives asynchronously.
+3. **Hello-storm**: greet every peer learned, so existing nodes learn the
+   new node back without bootstrap having to push anything.
+4. **State sync**: ask one random peer for its store. Over a stream this is
+   the whole store; the datagram fallback is bounded to what fits. The
+   joiner *merges* by version rather than overwriting, so a local edit made
+   before the reply arrives is not clobbered. Recent chat history rides
+   along — minus direct messages, which are never handed to a joiner.
+5. **Run** until `Ctrl+Q` (or a signal, under `-headless`).
 
-### 4.3 Steady state
+Splitting "start serving" from "join" is deliberate: it is what lets a test
+wire a cluster by hand, and it means an unreachable bootstrap can never
+stall startup.
 
-* **KV writes**: a user creates/deletes a key in the TUI. The local
-  store stamps the mutation with a per-key version (a Lamport counter
-  plus this node's address as tiebreak) and broadcasts a versioned
-  `KVUpdate` as a `KindKV` envelope to every known peer. Each peer
-  applies it only if the version is newer than what it holds, so
-  concurrent writes to the same key converge to the same value on every
-  node; a delete is a versioned tombstone, so a stale set can't
-  resurrect the key. *No anti-entropy is performed* — if a packet is
-  lost outright, the two stores stay divergent until the next
-  overlapping write or a state resync on rejoin. This remains a known
-  PoC limitation.
-* **Chat**: typed text becomes a `ChatMessage` (sender addr, nick,
-  text, unix timestamp), broadcast to every known peer. The receiver
-  appends it to its chat log, colored per sender, and if the sender
-  was unknown, learns them as a peer and emits a system "joined"
-  line into the chat. Peer evictions emit a matching "left" line.
-* **Peer membership**: PeerGossip every 10 s; Hello on any newly
-  learned address. Both `Hello` and `PeerGossip` carry the sender's
-  nickname, so every node can render peers as `addr — nick` without a
-  separate lookup round-trip.
-* **Status bar**: a 1 s ticker refreshes the bottom line with
-  CONNECTED/DEGRADED state, local address/nick, peer count, key count
-  and uptime.
+### 4.2 Steady state
 
-### 4.4 Failure model
+* **KV writes** stamp a per-key version (Lamport counter + this node's
+  persistent id) and broadcast a `KVUpdate`. Peers apply it only if the
+  version is newer, so concurrent writes converge everywhere; a delete is a
+  versioned tombstone, so a stale set cannot resurrect the key.
+* **Anti-entropy** rides the gossip tick. The node advertises a `Digest` of
+  a contiguous slice of its sorted keyspace to one random peer: versions,
+  not values, so a round is cheap. The receiver answers with a `KVBatch`
+  of anything it holds newer (or that the sender is missing entirely) and a
+  `PullRequest` for anything it lacks. A cursor walks the keyspace so a
+  store larger than one digest is still covered completely.
+* **Chat** is a `ChatMessage` broadcast; entries are stored structurally
+  (sender, nick, text, kind) rather than pre-rendered, so the TUI, the HTTP
+  gateway and the Android app each format them their own way.
+* **Peer membership**: PeerGossip every 10 s; Hello on any newly learned
+  address; a peer with no traffic for 15 s is evicted locally. `Hello` and
+  `PeerGossip` carry the sender's nickname *and* node id, which is what lets
+  a version be attributed to a name rather than a UUID.
+* **TTL sweep** turns expired entries into tombstones, keeping each entry's
+  existing version (§5.2), and — when `-tombstone-ttl` is set — reclaims
+  tombstones older than that.
 
-* **Bootstrap dies after startup**: the cluster keeps working —
-  bootstrap is only used at join. Discovery nodes also send a REGISTER
-  heartbeat to bootstrap every 5 s so that bootstrap forgets dead
-  clients within its 15 s timeout.
-* **Bootstrap unreachable at join**: a joining node no longer hangs.
-  `DiscoverNodes` reads the roster with a bounded deadline
-  (`DiscoverTimeout`, 2 s by default), so a down bootstrap — or a lost
-  DISCOVER / reply, which UDP permits — degrades to "no peers learned":
-  the node still opens its TUI and serves its persisted store. While it
-  knows no peers, the 5 s heartbeat loop keeps re-registering *and*
-  re-DISCOVERing, so it joins automatically once bootstrap is reachable.
-* **A discovery node dies**: every discovery node tracks a last-seen
-  timestamp per peer (updated on any incoming packet). A peer with no
-  traffic for 15 s is evicted locally. Heartbeats are kept fresh by
-  the 5 s Hello-fan-out and the 10 s PeerGossip.
-* **A discovery node exits cleanly** (`Ctrl+Q`): before quitting it
-  broadcasts a `Goodbye` to every known peer, so peers drop it and emit
-  the "left" chat line immediately instead of waiting out the 15 s
-  eviction. Goodbye is best-effort UDP like everything else — if it is
-  lost, the peer simply falls back to timeout eviction.
-* **Packet loss**: a lost KV write leaves that key divergent until the
-  next overlapping write or a state resync — versioning makes the
-  eventual reconcile deterministic, but nothing actively re-sends. Lost
-  gossip is resent on the next tick. A lost state-sync reply leaves the
-  joiner on its persisted store until it retries the join.
+### 4.3 Failure model
 
-These trade-offs are intentional for a PoC; see §6 for the next-step
-items.
+* **Bootstrap dies after startup**: the cluster keeps working — bootstrap
+  is only used at join. Nodes REGISTER every 5 s so bootstrap forgets dead
+  clients, and its roster is persisted, so a restart keeps serving the
+  cluster it knew instead of making everyone wait out a re-registration.
+* **Bootstrap unreachable at join**: nothing blocks. The datagram reply
+  arrives asynchronously or not at all; while a node knows no peers, the
+  heartbeat loop keeps re-DISCOVERing, so it joins once bootstrap appears.
+* **A node dies**: peers evict it after 15 s of silence.
+* **A node exits cleanly**: it broadcasts `Goodbye` first, so peers drop it
+  and post the "left" line at once.
+* **Packet loss**: a lost write is repaired by the next digest exchange
+  with any peer that has it — this is the guarantee anti-entropy adds, and
+  it is what the lossy-transport tests assert. Lost gossip is resent next
+  tick. A lost state-sync reply leaves the joiner on its persisted store
+  until anti-entropy fills it in.
+* **A hostile packet**: dropped at the codec and counted as an
+  authentication failure, before any handler sees it.
 
-### 4.5 Persistence
+### 4.4 Persistence
 
-Each discovery node persists its KV store to a JSON file (`-data`, default
-`<config dir>/rezoagwe/<node>.json`; the path is derived from the node
-address so co-located nodes don't clobber each other). The file is rewritten
-atomically (temp file + rename) after every mutation — local writes,
-replicated writes from peers, and state-sync merges alike — gated on a
-monotonically increasing generation so a slow, out-of-order write can never
-regress the on-disk copy. The file records each entry's version and the
-node's Lamport clock (tombstones included), so after a restart the node's new
-writes still sort after everything it had already seen. On startup the node
-loads this file *before* contacting bootstrap, so its keys survive a restart.
-Pass `-data -` to disable persistence entirely.
+Each node persists identity, Lamport clock, every entry (tombstones
+included) and the chat ring to a JSON file (`-data`, default
+`<config dir>/rezoagwe/<node>.json`). The file is rewritten atomically
+(temp file + rename) after every change, gated on a monotonically
+increasing generation so a slow, out-of-order write can never regress the
+on-disk copy.
 
-Chat history is deliberately **not** persisted to disk: a rejoining node
-repopulates its chat pane from a peer's `StateResponse` (§4.2 step 5)
-instead.
+Identity is persisted rather than derived from the listen address: a node
+that moves to a different port is still the same writer, and its version
+tiebreak has to stay stable or its old and new writes sort oddly against
+each other.
+
+The file also reads the wire-v1 format, where chat history was a list of
+pre-rendered strings — otherwise upgrading a node would fail to parse its
+own data file and discard the KV store along with the chat.
 
 ---
 
-## 5. Concurrency model
+## 5. Replication rules
 
-* `KVStore` is guarded by a `sync.RWMutex`. UI iteration goes through
-  `Snapshot()` which copies under `RLock`, so the UI never races with
-  network writes.
-* Peer set lives in `sync.Map` — single-writer-many-reader access from
-  goroutines.
-* Chat log has its own `sync.Mutex` and `ChatLog()` returns a copy.
-* Each incoming UDP packet is handled inline in the listener goroutine.
-  Handlers that touch the UI use `App.QueueUpdateDraw` to marshal the
-  redraw onto the tview thread.
-* A small buffered channel (`updateCh`, cap 16) coalesces KV-related UI
-  refresh signals so the listener never blocks on a slow UI tick.
+These are protocol, not implementation detail: the Go and Kotlin stores
+must agree on every one of them or two replicas silently disagree.
+
+### 5.1 Last-write-wins
+
+A version is `{counter, node}`. Higher counter wins; ties break on node id.
+Equal is *not* newer, so re-delivery is idempotent. Applying a remote
+version advances the local Lamport clock past it.
+
+### 5.2 Expiry keeps the version
+
+TTL expiry converts an entry into a tombstone **without bumping the
+Lamport clock**. Bumping it would let a sweep outrank a concurrent
+legitimate write to the same key, and every replica sweeps independently.
+Since expiry is deterministic, replicas reach the same state without
+exchanging a message.
+
+### 5.3 Compare-and-swap
+
+A write may carry an expected version; it lands only if the current
+version matches. A zero expected version means "the key must be absent",
+where missing, tombstoned and expired all count as absent. This is the
+primitive a lock or a leader election is built on. CAS is evaluated
+against *local* state — this is a PoC, not a consensus system.
+
+### 5.4 Digest ranges
+
+A digest covers `(lo, hi)`, both bounds exclusive. The range is what lets
+the receiver tell "the sender has nothing for this key" from "that key was
+outside this batch" — without it, keys the sender is missing entirely
+would never be repaired.
+
+### 5.5 Tombstone GC
+
+GC is the one operation that can resurrect a key: a peer that never saw the
+delete and still holds the value will push it back once the tombstone is
+gone. Anti-entropy makes that unlikely rather than impossible, so GC is off
+by default and its age must exceed the longest partition expected to heal.
 
 ---
 
-## 6. Known limitations & next steps
+## 6. Concurrency model
 
-| Area               | Limitation                                | Possible fix                                |
-|--------------------|-------------------------------------------|---------------------------------------------|
-| Transport          | UDP, single packet, no acks               | Switch to TCP for state sync; chunk         |
-| Replication        | Per-key Lamport-clock LWW converges concurrent writes, but a dropped packet is never re-sent | Anti-entropy / Merkle reconcile on gossip |
-| State sync         | Pulls from one random peer and merges by version (can't clobber newer local data), but a peer with gaps yields gaps | Pull from a quorum; anti-entropy |
-| Liveness           | Heartbeat is best-effort UDP; no quorum   | Acked ping + quorum membership view         |
-| Security           | Plain UDP, no auth                        | DTLS or pre-shared key + HMAC               |
-| Bootstrap          | Single point of failure for new joiners   | Multiple seed addresses; mDNS               |
-| Bootstrap roster   | DISCOVER reply is one UDP datagram (now ≤64 KB); a very large roster still won't fit | Length-prefix / chunk, or TCP |
-| Chat history       | Synced from a peer on join; not persisted | Persist the chat ring to disk too           |
-| State sync size    | KV entries + chat ride in one UDP datagram (≤64 KB) | Chunk / switch to TCP for large state |
-| Tombstones         | Deleted keys are kept forever as tombstones | GC tombstones once cluster-wide consensus is certain |
-| Diagnostics        | `log.Debugf` is inert (level never raised) and stderr logs would scribble over the TUI | Log to a file, gated by a real `-debug` flag |
-
-For a prioritized, actionable version of this list — with effort estimates and
-what's already shipped — see [ROADMAP.md](ROADMAP.md).
+* `KVStore` is guarded by a `sync.RWMutex`; every mutation notifies a
+  change callback *after* releasing the lock, so persistence I/O never
+  blocks a writer.
+* Peers, nicknames and id mappings live in `sync.Map`s.
+* Each inbound datagram is handled on the transport's read goroutine;
+  each inbound stream gets its own goroutine.
+* The TUI never blocks the engine: `node.Events` callbacks do a
+  non-blocking send on a capacity-1 channel, and a single refresh goroutine
+  drains those and calls `QueueUpdateDraw`. A direct call would deadlock —
+  `QueueUpdateDraw` waits for the tview event loop, and `Ctrl+Q` runs the
+  engine shutdown *on* that loop.
 
 ---
 
-## 7. Why "rezoagwe"?
+## 7. Testing
+
+* `pkg/transport` provides an in-process network with configurable loss,
+  duplication, delay and partitions. Convergence is asserted, not hoped
+  for: a whole cluster reconciles under 30 % packet loss, a dropped write
+  is repaired by a digest exchange, and a delete is not resurrected by the
+  peer that still holds the value.
+* The TUI is driven headlessly through a `tcell` simulation screen.
+* The Android port carries the Go implementation's own vectors: a frame
+  produced by the Go codec is decoded by the Kotlin one, and the derived
+  keys are compared against fixed values. A live interop test (opt-in via
+  `REZOAGWE_GO_BOOTSTRAP`) joins a running Go cluster and replicates
+  through it in both directions.
+
+---
+
+## 8. HTTP gateway
+
+`-http :8080` exposes the store, which is what makes it scriptable — and
+what makes a cluster testable end to end without a terminal:
+
+| Method   | Path             | Notes                                              |
+|----------|------------------|----------------------------------------------------|
+| `GET`    | `/kv`            | listing; `?prefix=` filters                        |
+| `GET`    | `/kv/{key}`      | value as text; `ETag` carries the version          |
+| `PUT`    | `/kv/{key}`      | body is the value; `If-Match` makes it a CAS, `X-Rezoagwe-TTL` sets an expiry |
+| `DELETE` | `/kv/{key}`      | `If-Match` supported                               |
+| `GET`    | `/history/{key}` | recorded versions with their writers               |
+| `GET`    | `/peers`         | known peers                                        |
+| `GET`    | `/chat`          | chat log; `POST` sends (slash commands included)   |
+| `GET`    | `/activity`      | replication activity feed                          |
+| `GET`    | `/export`        | whole store, versions included                     |
+| `POST`   | `/import`        | merge by version; `?mode=seed` re-stamps as local  |
+| `GET`    | `/health`        | status                                             |
+| `GET`    | `/metrics`       | Prometheus exposition                              |
+
+---
+
+## 9. Android app
+
+`android/` is a Kotlin port of both roles, so a phone can be a peer, the
+rendezvous service, or both at once. It shares no code with the Go
+implementation — only the protocol — so the wire rules in §3 and §5 are
+duplicated deliberately and pinned by parity tests (§7).
+
+* `proto/` — the frame codec and message bodies, field-for-field with the
+  Go structs.
+* `core/KvStore.kt` — the same versioned store: LWW, CAS, TTL, digests,
+  reconciliation, history, tombstone GC.
+* `core/NodeEngine.kt` — membership, replication, chat, anti-entropy,
+  stream state sync, exposed to Compose as `StateFlow`s.
+* `core/BootstrapServer.kt` — the rendezvous role.
+* `service/NodeService.kt` — a foreground service: a gossip node that only
+  runs while its screen is open is not participating in a cluster, since
+  peers evict it seconds after the phone sleeps.
+
+---
+
+## 10. Known limitations & next steps
+
+| Area             | Limitation                                                        | Possible fix                                  |
+|------------------|-------------------------------------------------------------------|-----------------------------------------------|
+| Consistency      | Last-write-wins by wall-order, not consensus; CAS is checked locally | Raft/Paxos for a real linearizable store    |
+| Liveness         | Heartbeat is best-effort; no quorum membership view                | Acked ping + quorum view                      |
+| Security         | HMAC authenticates and separates clusters, but payloads are plaintext and the psk is shared symmetrically | Per-node keys, encryption, key rotation |
+| Bootstrap        | Seeds are static                                                   | mDNS / DNS-SD discovery on a LAN              |
+| State sync       | Pulls from one random peer                                         | Pull from a quorum                            |
+| Anti-entropy     | Digest is per-key, so a huge store costs many rounds               | Merkle tree over key ranges                   |
+| Tombstones       | GC is age-based and off by default                                 | Track cluster-wide acknowledgement            |
+| Chat             | No history beyond the ring, no attachments                         | Paged history                                 |
+| Android          | Pairing verified against a Go cluster on a LAN, not on a phone yet  | Run it on hardware                            |
+
+For a prioritized version of this list — with effort estimates and what has
+already shipped — see [ROADMAP.md](ROADMAP.md).
+
+---
+
+## 11. Why "rezoagwe"?
 
 [Agwé](https://en.wikipedia.org/wiki/Agw%C3%A9) is the Haitian Vodou
 lwa of the sea — a fitting name for a protocol whose packets drift

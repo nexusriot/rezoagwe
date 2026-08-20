@@ -14,3 +14,10 @@ dist/
 # runtime data / persistence
 data-dir*
 *.tmp
+
+# Android
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.idea/
