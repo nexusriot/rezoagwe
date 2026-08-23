@@ -4,8 +4,14 @@ import com.nexusriot.rezoagwe.core.BootstrapConfig
 import com.nexusriot.rezoagwe.core.BootstrapServer
 import com.nexusriot.rezoagwe.core.NodeConfig
 import com.nexusriot.rezoagwe.core.NodeEngine
+import com.nexusriot.rezoagwe.core.NodeRole
+import com.nexusriot.rezoagwe.core.Severity
+import com.nexusriot.rezoagwe.core.healthChecks
 import com.nexusriot.rezoagwe.proto.ChatKind
 import com.nexusriot.rezoagwe.proto.Version
+import java.io.IOException
+import java.net.DatagramSocket
+import java.net.InetSocketAddress
 import java.net.ServerSocket
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -35,7 +41,27 @@ class NodeEngineTest {
         scope.cancel()
     }
 
-    private fun freePort(): Int = ServerSocket(0).use { it.localPort }
+    /**
+     * A port free for both sockets the engine binds. Checking only TCP left the
+     * suite able to pick a number whose UDP half was taken, which failed as a
+     * BindException in an unrelated test.
+     */
+    private fun freePort(): Int {
+        repeat(20) {
+            val candidate = ServerSocket(0).use { it.localPort }
+            val usable = try {
+                DatagramSocket(null).use { udp ->
+                    udp.reuseAddress = true
+                    udp.bind(InetSocketAddress(candidate))
+                    true
+                }
+            } catch (e: IOException) {
+                false
+            }
+            if (usable) return candidate
+        }
+        throw AssertionError("no free port for both TCP and UDP")
+    }
 
     /** Long intervals: the tests drive gossip explicitly, so a round is a step the test took. */
     private fun engine(port: Int, nick: String, seeds: List<String> = emptyList()): NodeEngine {
@@ -251,5 +277,109 @@ class NodeEngineTest {
 
         a.submit("/bogus")
         assertTrue(a.chat.value.last().text.contains("unknown command"))
+    }
+
+    /**
+     * The graph a phone can draw of a cluster it is only part of.
+     *
+     * Alice hears bob's peer list and so learns that bob talks to carol — a link
+     * neither endpoint is alice, and the only reason a partition is visible at all.
+     */
+    @Test
+    fun gossipTeachesUsLinksBetweenOtherNodes() {
+        val a = engine(freePort(), "alice")
+        val b = engine(freePort(), "bob")
+        val carol = "127.0.0.1:${freePort()}"
+        a.start()
+        b.start()
+        a.addPeer(b.addr)
+        b.addPeer(a.addr)
+        b.addPeer(carol)
+
+        b.gossipTo(a.addr)
+        waitFor("alice to learn the link between bob and carol") {
+            a.topology.value.links.any { setOf(it.a, it.b) == setOf(b.addr, carol) }
+        }
+
+        val topology = a.topology.value
+        assertEquals(NodeRole.SELF, topology.node(a.addr)!!.role)
+        assertEquals(NodeRole.DIRECT, topology.node(b.addr)!!.role)
+        assertEquals(2, topology.node(b.addr)!!.advertised)
+        // One component: carol is unreachable for us but hangs off bob, who is not.
+        assertEquals(1, topology.components().size)
+    }
+
+    @Test
+    fun aPeerListedByNobodyWeTalkToStaysIndirect() {
+        val a = engine(freePort(), "alice")
+        val b = engine(freePort(), "bob")
+        val ghost = "127.0.0.1:${freePort()}"
+        a.start()
+        b.start()
+        a.addPeer(b.addr)
+        b.addPeer(a.addr)
+        b.addPeer(ghost)
+        b.gossipTo(a.addr)
+
+        // Alice adopts every gossiped address, so the ghost becomes a peer of hers
+        // too; dropping it again is what leaves a node known but not reachable.
+        waitFor("alice to adopt the gossiped address") { a.topology.value.node(ghost) != null }
+        a.forgetPeer(ghost)
+        waitFor("the ghost to remain in the graph without being a peer") {
+            a.topology.value.node(ghost)?.role == NodeRole.INDIRECT
+        }
+    }
+
+    @Test
+    fun trafficIsAttributedToTheAddressItWentTo() {
+        val (a, b) = pair()
+        a.set("k", "v")
+        waitFor("the write to replicate") { b.store["k"] == "v" }
+
+        // Nothing acknowledges a KV update, so inbound traffic needs the peer to
+        // say something of its own.
+        b.gossipTo(a.addr)
+        waitFor("inbound traffic to be attributed") {
+            a.diagnostics().peers.singleOrNull()?.packetsIn?.let { it > 0 } == true
+        }
+
+        val diagnostics = a.diagnostics()
+        val peer = diagnostics.peers.single()
+        assertEquals(b.addr, peer.addr)
+        assertTrue("packets should be counted per peer", peer.packetsOut > 0)
+        assertTrue("bytes should be counted per peer", peer.bytesOut > 0)
+        assertTrue("bytes in should be counted per peer", peer.bytesIn > 0)
+        assertTrue(diagnostics.strangers.isEmpty())
+        assertEquals(1, diagnostics.store.keys)
+        assertTrue(diagnostics.running)
+        assertTrue(diagnostics.streamListener)
+        assertEquals(a.nodeId, diagnostics.nodeId)
+    }
+
+    /** A frame framed with another key is counted, and blamed on where it came from. */
+    @Test
+    fun packetsFromAForeignClusterAreRejectedAndAttributed() {
+        val port = freePort()
+        val victim = engine(port, "alice")
+        victim.start()
+        val stranger = NodeEngine(
+            NodeConfig(advertiseHost = "127.0.0.1", port = freePort(), nick = "intruder", psk = "wrong-key"),
+            dataFile = null,
+            scope = scope,
+        )
+        engines += stranger
+        stranger.start()
+        stranger.addPeer("127.0.0.1:$port")
+        stranger.set("hello", "there")
+
+        waitFor("the frame to be refused") { victim.metrics.authFailures.get() > 0 }
+        val diagnostics = victim.diagnostics()
+        assertTrue("nothing may be applied from a foreign cluster", diagnostics.store.keys == 0)
+        assertTrue(
+            "the sender should be listed as an unknown source",
+            diagnostics.strangers.any { it.rejected > 0 },
+        )
+        val checks = healthChecks(diagnostics, System.currentTimeMillis())
+        assertTrue(checks.any { it.severity == Severity.ERROR && it.title.contains("authentication") })
     }
 }

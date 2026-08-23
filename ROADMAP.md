@@ -14,7 +14,14 @@ Everything the previous backlog listed is done. Newest first:
 
 - ✅ **Android app** — Kotlin port of both roles (node + rendezvous service)
   with a Compose UI, a foreground service, and parity tests against the Go
-  codec. Verified live against a running Go cluster.
+  codec. Verified live against a running Go cluster. Adapts to tablets
+  (navigation rail, two panes), draws the cluster as a graph derived from
+  gossiped peer lists, and reports its own health on a diagnostics screen —
+  which is what surfaced the `null`-slice decode gap below.
+- ✅ **Go `null` slices decoded** — Go marshals a nil slice as `null` for
+  fields without `omitempty`, so an empty node's digest (`entries: null`)
+  authenticated and then failed to parse in the Kotlin app, dropping the
+  anti-entropy round it carried. The decoder now coerces those to empty.
 - ✅ **Wire v2** — one authenticated framing for every packet, node-to-node
   and node-to-bootstrap; protobuf removed entirely.
 - ✅ **Pre-shared key + HMAC + replay guard** — every packet carries a MAC
@@ -95,9 +102,11 @@ Find peers on a LAN with no seed configured at all — the setup step most
 likely to defeat a new user, and the one the Android app feels most.
 
 ### 7. Android on hardware — **S**
-The app is verified against a live Go cluster from the JVM; run it on a
-phone, confirm the foreground service survives Doze, and check battery cost
-of the 10 s gossip tick.
+The app is verified against a live Go cluster and on an emulator at phone
+and tablet window sizes; run it on a phone, confirm the foreground service
+survives Doze, and check battery cost of the 10 s gossip tick. The app's
+**Diag** screen now reports whether the app is exempt from battery
+optimisation, which is the first thing to check there.
 
 ### 8. Watch / subscribe — **M**
 Long-poll or SSE on `/kv?watch=`, plus a callback in the engine.

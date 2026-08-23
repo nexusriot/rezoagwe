@@ -1,6 +1,7 @@
 package com.nexusriot.rezoagwe.core
 
 import com.nexusriot.rezoagwe.proto.Kind
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 
 /**
@@ -37,6 +38,19 @@ class Metrics {
     private val sentByKind = HashMap<Byte, AtomicLong>()
     private val recvByKind = HashMap<Byte, AtomicLong>()
 
+    // Traffic per address rather than per cluster: "the node sends and receives"
+    // hides the case that matters, which is one peer that only ever receives.
+    private val perAddr = ConcurrentHashMap<String, AddrCounters>()
+
+    private val rateLock = Any()
+    private var lastSampleMs = 0L
+    private var lastSent = 0L
+    private var lastReceived = 0L
+    private var lastBytesSent = 0L
+    private var lastBytesReceived = 0L
+    @Volatile
+    private var rates = Rates()
+
     fun sent(kind: Byte, bytes: Int) {
         packetsSent.incrementAndGet()
         bytesSent.addAndGet(bytes.toLong())
@@ -47,6 +61,66 @@ class Metrics {
         packetsReceived.incrementAndGet()
         bytesReceived.addAndGet(bytes.toLong())
         counter(recvByKind, kind).incrementAndGet()
+    }
+
+    fun sentTo(addr: String, bytes: Int) {
+        val c = counters(addr)
+        c.packetsOut.incrementAndGet()
+        c.bytesOut.addAndGet(bytes.toLong())
+    }
+
+    fun receivedFrom(addr: String, bytes: Int) {
+        val c = counters(addr)
+        c.packetsIn.incrementAndGet()
+        c.bytesIn.addAndGet(bytes.toLong())
+    }
+
+    fun sendFailedTo(addr: String) {
+        counters(addr).sendErrors.incrementAndGet()
+    }
+
+    /** A frame from [addr] that did not authenticate, parse, or pass the replay guard. */
+    fun rejectedFrom(addr: String) {
+        counters(addr).rejected.incrementAndGet()
+    }
+
+    fun forAddr(addr: String): AddrTraffic = counters(addr).snapshot(addr)
+
+    fun addrs(): List<AddrTraffic> =
+        perAddr.entries.map { (addr, c) -> c.snapshot(addr) }.sortedBy { it.addr }
+
+    private fun counters(addr: String): AddrCounters = perAddr.getOrPut(addr) { AddrCounters() }
+
+    /**
+     * Folds the counters since the previous call into per-second rates.
+     *
+     * Rates are computed here rather than in the UI so they keep updating while
+     * the screen is closed — which is exactly when a node is expected to keep
+     * gossiping.
+     */
+    fun sample(nowMs: Long) {
+        synchronized(rateLock) {
+            val sent = packetsSent.get()
+            val received = packetsReceived.get()
+            val outBytes = bytesSent.get()
+            val inBytes = bytesReceived.get()
+            val elapsed = nowMs - lastSampleMs
+            if (lastSampleMs > 0 && elapsed > 0) {
+                val perSec = 1000.0 / elapsed
+                rates = Rates(
+                    windowMs = elapsed,
+                    packetsSent = (sent - lastSent) * perSec,
+                    packetsReceived = (received - lastReceived) * perSec,
+                    bytesSent = (outBytes - lastBytesSent) * perSec,
+                    bytesReceived = (inBytes - lastBytesReceived) * perSec,
+                )
+            }
+            lastSampleMs = nowMs
+            lastSent = sent
+            lastReceived = received
+            lastBytesSent = outBytes
+            lastBytesReceived = inBytes
+        }
     }
 
     private fun counter(map: HashMap<Byte, AtomicLong>, kind: Byte): AtomicLong =
@@ -88,9 +162,49 @@ class Metrics {
             stateSyncIn = stateSyncIn.get(),
             streamErrors = streamErrors.get(),
             kinds = kinds.values.toList(),
+            rates = rates,
         )
     }
 }
+
+/** Per-address counters. One instance per address the node has ever talked to. */
+class AddrCounters {
+    val packetsOut = AtomicLong()
+    val packetsIn = AtomicLong()
+    val bytesOut = AtomicLong()
+    val bytesIn = AtomicLong()
+    val sendErrors = AtomicLong()
+    val rejected = AtomicLong()
+
+    fun snapshot(addr: String) = AddrTraffic(
+        addr = addr,
+        packetsOut = packetsOut.get(),
+        packetsIn = packetsIn.get(),
+        bytesOut = bytesOut.get(),
+        bytesIn = bytesIn.get(),
+        sendErrors = sendErrors.get(),
+        rejected = rejected.get(),
+    )
+}
+
+data class AddrTraffic(
+    val addr: String,
+    val packetsOut: Long = 0,
+    val packetsIn: Long = 0,
+    val bytesOut: Long = 0,
+    val bytesIn: Long = 0,
+    val sendErrors: Long = 0,
+    val rejected: Long = 0,
+)
+
+/** Throughput over the last sampling window. */
+data class Rates(
+    val windowMs: Long = 0,
+    val packetsSent: Double = 0.0,
+    val packetsReceived: Double = 0.0,
+    val bytesSent: Double = 0.0,
+    val bytesReceived: Double = 0.0,
+)
 
 data class KindCount(val kind: String, val sent: Long, val received: Long)
 
@@ -117,4 +231,5 @@ data class MetricsSnapshot(
     val stateSyncIn: Long = 0,
     val streamErrors: Long = 0,
     val kinds: List<KindCount> = emptyList(),
+    val rates: Rates = Rates(),
 )

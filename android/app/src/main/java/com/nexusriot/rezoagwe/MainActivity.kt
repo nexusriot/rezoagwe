@@ -6,6 +6,7 @@ import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
 import com.nexusriot.rezoagwe.core.Runtime
@@ -18,6 +19,9 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Android 15 draws apps edge to edge whether they ask or not; opting in
+        // here means every API level gets the same insets, which the UI pads for.
+        enableEdgeToEdge()
         Runtime.init(this)
         askForNotifications()
         setContent {

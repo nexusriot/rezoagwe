@@ -75,6 +75,7 @@ data class Peer(
     val addr: String,
     val nick: String = "",
     val lastSeenMs: Long = 0,
+    val firstSeenMs: Long = 0,
 )
 
 data class NodeStatus(
@@ -126,6 +127,10 @@ class NodeEngine(
 
     private val peers = LinkedHashMap<String, Peer>()
     private val idToAddr = HashMap<String, String>()
+    // What each peer last told us its own peer list was. This is the only source
+    // of links between two nodes that are not us, and so the only way the app can
+    // draw the cluster rather than just our corner of it.
+    private val gossipViews = LinkedHashMap<String, GossipView>()
     private val chatLog = mutableListOf<ChatEntry>()
     private val activityLog = mutableListOf<String>()
     private var persistGen = 0L
@@ -150,6 +155,9 @@ class NodeEngine(
 
     private val _metricsFlow = MutableStateFlow(MetricsSnapshot())
     val metricsFlow: StateFlow<MetricsSnapshot> = _metricsFlow.asStateFlow()
+
+    private val _topology = MutableStateFlow(Topology())
+    val topology: StateFlow<Topology> = _topology.asStateFlow()
 
     val addr: String get() = "${config.advertiseHost.ifEmpty { localIpv4() }}:${config.port}"
 
@@ -209,8 +217,10 @@ class NodeEngine(
             val pkt = codec.encode(kind, value)
             tr.send(addr, pkt)
             metrics.sent(kind, pkt.size)
+            metrics.sentTo(normalizeAddr(addr), pkt.size)
         } catch (e: Exception) {
             metrics.sendErrors.incrementAndGet()
+            metrics.sendFailedTo(normalizeAddr(addr))
         }
     }
 
@@ -230,10 +240,11 @@ class NodeEngine(
     fun addPeer(peerAddr: String): Boolean {
         if (peerAddr.isEmpty() || isSelf(peerAddr) || !validPeerAddr(peerAddr)) return false
         val added: Boolean
+        val now = System.currentTimeMillis()
         synchronized(lock) {
             val existing = peers[peerAddr]
             added = existing == null
-            peers[peerAddr] = (existing ?: Peer(peerAddr)).copy(lastSeenMs = System.currentTimeMillis())
+            peers[peerAddr] = (existing ?: Peer(peerAddr, firstSeenMs = now)).copy(lastSeenMs = now)
         }
         if (added) publishPeers()
         return added
@@ -260,6 +271,20 @@ class NodeEngine(
             idToAddr.entries.removeAll { it.value == peerAddr }
         }
         publishPeers()
+    }
+
+    /**
+     * Drops a peer now instead of waiting out the eviction window.
+     *
+     * Gossip will usually teach it back, which is the point: it is how a link can
+     * be cut on purpose to see whether the cluster heals.
+     */
+    fun forgetPeer(peerAddr: String) {
+        val known = synchronized(lock) { peers.containsKey(peerAddr) }
+        if (!known) return
+        val peerNick = nickOf(peerAddr)
+        removePeer(peerAddr)
+        announceLeave(peerAddr, peerNick)
     }
 
     fun nickOf(peerAddr: String): String = synchronized(lock) { peers[peerAddr]?.nick.orEmpty() }
@@ -394,6 +419,7 @@ class NodeEngine(
         system("$previous is now known as $newNick")
         helloAllPeers()
         publishStatus()
+        publishTopology()
     }
 
     /** Handles one line of input, slash commands included — the same vocabulary as the terminal client. */
@@ -489,6 +515,7 @@ class NodeEngine(
     // ---- inbound --------------------------------------------------------
 
     private fun handlePacket(packet: Packet) {
+        val source = normalizeAddr(packet.from)
         val frame = try {
             codec.decode(packet.data)
         } catch (e: DecodeException) {
@@ -498,9 +525,13 @@ class NodeEngine(
                 DecodeError.CLOCK_SKEW -> metrics.skewDrops
                 else -> metrics.malformedDrops
             }.incrementAndGet()
+            // Attributed to the socket source: a rejected frame is exactly the case
+            // where the sender's claim about who it is cannot be trusted.
+            metrics.rejectedFrom(source)
             return
         }
         metrics.received(frame.kind, packet.data.size)
+        metrics.receivedFrom(source, packet.data.size)
         dispatch(frame.kind, String(frame.body))
     }
 
@@ -613,6 +644,7 @@ class NodeEngine(
         touchPeer(g.from)
         if (g.nick.isNotEmpty()) setNick(g.from, g.nick)
         if (g.id.isNotEmpty()) synchronized(lock) { idToAddr[g.id] = g.from }
+        recordView(g.from, g.peers)
         if (addPeer(g.from)) {
             announceJoin(g.from, g.nick)
             send(g.from, Kind.HELLO, helloMessage())
@@ -630,6 +662,20 @@ class NodeEngine(
         if (h.nick.isNotEmpty()) setNick(h.from, h.nick)
         if (h.id.isNotEmpty()) synchronized(lock) { idToAddr[h.id] = h.from }
         if (addPeer(h.from)) announceJoin(h.from, h.nick)
+    }
+
+    /** Keeps the sender's advertised peer list, which is what makes a cluster-wide graph possible. */
+    private fun recordView(from: String, advertised: List<String>) {
+        if (from.isEmpty()) return
+        val owner = normalizeAddr(from)
+        if (owner == normalizeAddr(addr)) return
+        synchronized(lock) {
+            gossipViews[owner] = GossipView(
+                peers = advertised.map { normalizeAddr(it) }.filter { it.isNotEmpty() }.distinct(),
+                atMs = System.currentTimeMillis(),
+            )
+        }
+        publishTopology()
     }
 
     private fun handleGoodbye(g: Goodbye) {
@@ -810,13 +856,21 @@ class NodeEngine(
             delay(config.gossipIntervalMs)
             val known = peerAddrs()
             if (known.isEmpty()) continue
-            val target = known.random()
-            send(target, Kind.PEER_GOSSIP, PeerGossip(from = addr, nick = nick, id = nodeId, peers = known))
-            // Piggyback reconciliation on the same tick: gossip already picked a
-            // random peer, and the digest is what makes convergence a mechanism
-            // rather than a hope.
-            antiEntropyRound(target)
+            gossipTo(known.random())
         }
+    }
+
+    /**
+     * One gossip round to a single peer: our membership view, then a digest.
+     *
+     * Reconciliation is piggybacked on the same tick — gossip already picked a
+     * random peer, and the digest is what makes convergence a mechanism rather
+     * than a hope.
+     */
+    fun gossipTo(target: String) {
+        if (target.isEmpty()) return
+        send(target, Kind.PEER_GOSSIP, PeerGossip(from = addr, nick = nick, id = nodeId, peers = peerAddrs()))
+        antiEntropyRound(target)
     }
 
     private suspend fun heartbeatLoop() {
@@ -840,7 +894,18 @@ class NodeEngine(
                 removePeer(peer.addr)
                 announceLeave(peer.addr, peer.nick)
             }
+            pruneViews(now)
         }
+    }
+
+    private fun pruneViews(nowMs: Long) {
+        val ttl = maxOf(60_000L, config.gossipIntervalMs * 6)
+        val dropped = synchronized(lock) {
+            val old = gossipViews.filterValues { nowMs - it.atMs > ttl }.keys
+            old.forEach { gossipViews.remove(it) }
+            old.isNotEmpty()
+        }
+        if (dropped) publishTopology()
     }
 
     private suspend fun sweepLoop() {
@@ -859,6 +924,7 @@ class NodeEngine(
                     logActivity("$gced tombstone(s) reclaimed")
                 }
             }
+            metrics.sample(System.currentTimeMillis())
             publishMetrics()
         }
     }
@@ -894,6 +960,18 @@ class NodeEngine(
     private fun publishPeers() {
         _peerList.value = synchronized(lock) { peers.values.sortedBy { it.addr } }
         publishStatus()
+        publishTopology()
+    }
+
+    private fun publishTopology() {
+        val (self, view) = synchronized(lock) { peers.values.toList() to HashMap(gossipViews) }
+        _topology.value = TopologyBuilder.build(
+            selfAddr = addr,
+            selfNick = nick,
+            peers = self,
+            views = view,
+            nowMs = System.currentTimeMillis(),
+        )
     }
 
     private fun publishChat() {
@@ -919,6 +997,92 @@ class NodeEngine(
     }
 
     fun history(key: String): List<HistoryEntry> = store.history(key)
+
+    /**
+     * Everything this node knows about itself, in one snapshot.
+     *
+     * Collected here rather than read field by field from the UI so a report is
+     * internally consistent — peers, counters and topology all describe the same
+     * instant.
+     */
+    fun diagnostics(): NodeDiagnostics {
+        val tr = synchronized(lock) { transport }
+        val snapshot = metrics.snapshot()
+        val traffic = metrics.addrs().associateBy { it.addr }
+        val selfAddr = normalizeAddr(addr)
+        val peerRows: List<PeerDiagnostics>
+        val known: Set<String>
+        synchronized(lock) {
+            peerRows = peers.values.sortedBy { it.addr }.map { peer ->
+                val key = normalizeAddr(peer.addr)
+                val t = traffic[key]
+                val view = gossipViews[key]
+                PeerDiagnostics(
+                    addr = peer.addr,
+                    nick = peer.nick,
+                    firstSeenMs = peer.firstSeenMs,
+                    lastSeenMs = peer.lastSeenMs,
+                    packetsOut = t?.packetsOut ?: 0,
+                    packetsIn = t?.packetsIn ?: 0,
+                    bytesOut = t?.bytesOut ?: 0,
+                    bytesIn = t?.bytesIn ?: 0,
+                    rejected = t?.rejected ?: 0,
+                    sendErrors = t?.sendErrors ?: 0,
+                    advertisedPeers = view?.peers?.size ?: -1,
+                    lastGossipMs = view?.atMs ?: 0,
+                )
+            }
+            known = peers.keys.map { normalizeAddr(it) }.toSet()
+        }
+        // An address that sends us packets while being no peer of ours is worth
+        // showing: it is what a NAT, a stale peer or a wrong advertise host looks
+        // like from this side.
+        val strangers = traffic.values
+            .filter { it.addr != selfAddr && it.addr !in known && (it.packetsIn > 0 || it.rejected > 0) }
+            .map {
+                PeerDiagnostics(
+                    addr = it.addr,
+                    known = false,
+                    packetsIn = it.packetsIn,
+                    packetsOut = it.packetsOut,
+                    bytesIn = it.bytesIn,
+                    bytesOut = it.bytesOut,
+                    rejected = it.rejected,
+                    sendErrors = it.sendErrors,
+                )
+            }
+            .sortedBy { it.addr }
+
+        return NodeDiagnostics(
+            addr = addr,
+            nick = nick,
+            nodeId = nodeId,
+            cluster = config.cluster,
+            keyFingerprint = Codec.keyFingerprint(config.psk, config.cluster),
+            pskSet = config.psk.isNotEmpty(),
+            configuredPort = config.port,
+            boundPort = tr?.port ?: 0,
+            streamListener = tr?.streamsAvailable ?: false,
+            advertiseHost = config.advertiseHost,
+            localIpv4 = localIpv4(),
+            running = tr != null,
+            startedAtMs = startedAtMs,
+            uptimeSec = if (startedAtMs == 0L) 0 else (System.currentTimeMillis() - startedAtMs) / 1000,
+            gossipIntervalMs = config.gossipIntervalMs,
+            heartbeatIntervalMs = config.heartbeatIntervalMs,
+            evictThresholdMs = config.evictThresholdMs,
+            sweepIntervalMs = config.sweepIntervalMs,
+            tombstoneTtlSec = config.tombstoneTtlSec,
+            seeds = config.seeds,
+            peers = peerRows,
+            strangers = strangers,
+            store = store.stats().copy(digestCursor = synchronized(lock) { aeCursor }),
+            metrics = snapshot,
+            topology = _topology.value,
+            chatLines = synchronized(lock) { chatLog.size },
+            activityLines = synchronized(lock) { activityLog.size },
+        )
+    }
 
     companion object {
         fun validPeerAddr(addr: String): Boolean {

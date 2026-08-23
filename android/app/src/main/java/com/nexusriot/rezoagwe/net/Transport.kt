@@ -64,6 +64,9 @@ class UdpTransport(
 
     val port: Int get() = socket.localPort
 
+    /** False when the TCP port was taken, which drops state sync back to datagrams. */
+    val streamsAvailable: Boolean get() = server != null
+
     init {
         thread(name = "rezoagwe-udp", isDaemon = true) { readLoop() }
         server?.let { thread(name = "rezoagwe-tcp", isDaemon = true) { acceptLoop(it) } }

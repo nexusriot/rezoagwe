@@ -179,6 +179,31 @@ class KvStore(
 
     fun tombstones(): Int = synchronized(lock) { store.count { it.value.deleted } }
 
+    /** The shape of the store, for the diagnostics view: what it holds and how big it is. */
+    fun stats(): StoreDiagnostics = synchronized(lock) {
+        val now = nowSec()
+        var valueBytes = 0L
+        var largestKey = ""
+        var largestValueBytes = 0
+        for ((k, e) in store) {
+            val size = e.value.toByteArray().size
+            valueBytes += size
+            if (size > largestValueBytes) {
+                largestValueBytes = size
+                largestKey = k
+            }
+        }
+        StoreDiagnostics(
+            keys = store.count { it.value.visible(now) },
+            tombstones = store.count { it.value.deleted },
+            valueBytes = valueBytes,
+            clock = clock,
+            historyKeys = history.size,
+            largestKey = largestKey,
+            largestValueBytes = largestValueBytes,
+        )
+    }
+
     /** Every entry, tombstones included — the snapshot a joining peer merges. */
     fun updates(): List<KVUpdate> = synchronized(lock) {
         store.map { (k, e) -> entryUpdate(k, e) }.sortedBy { it.key }

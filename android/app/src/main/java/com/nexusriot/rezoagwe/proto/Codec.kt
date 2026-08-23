@@ -130,6 +130,16 @@ class Codec(
             return mac.doFinal()
         }
 
+        /**
+         * A short, shareable identity for the framing key.
+         *
+         * Two devices that cannot talk compare fingerprints to tell "the key
+         * differs" from "the network drops packets", without either revealing
+         * the key itself.
+         */
+        fun keyFingerprint(psk: String, cluster: String): String =
+            deriveKey(psk, cluster).take(4).joinToString("") { "%02x".format(it) }
+
         private fun constantTimeEquals(a: ByteArray, b: ByteArray): Boolean {
             if (a.size != b.size) return false
             var diff = 0

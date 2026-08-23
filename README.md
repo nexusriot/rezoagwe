@@ -71,7 +71,8 @@ For internals, wire protocol, and the failure model, see
   replication activity, modals for history, metrics, help and
   import/export, and a status bar
 - **Android app** (`android/`): the same node *and* the rendezvous service
-  on a phone, with a Compose UI and a foreground service
+  on a phone or tablet, with a Compose UI, a cluster graph, a diagnostics
+  screen, and a foreground service
 - Cross-build to Linux (amd64/i386/arm64/armv7/riscv64), FreeBSD, macOS,
   Windows; Debian packages
 
@@ -171,9 +172,11 @@ See [DESIGN.md §8](DESIGN.md#8-http-gateway) for the whole surface.
 ### Android
 
 `android/` builds an app that runs the node, the rendezvous service, or
-both — with the KV store, peers, chat, activity feed and metrics on screen,
-and a foreground service so the node keeps gossiping when the screen is
-off.
+both — with the KV store, peers, chat, activity feed, metrics, a cluster
+graph and a diagnostics screen on screen, and a foreground service so the
+node keeps gossiping when the screen is off. The layout adapts to the
+window: tabs on a phone, a navigation rail on a tablet, and two screens
+side by side when there is room for them.
 
 ```
 cd android && ./gradlew :app:assembleDebug

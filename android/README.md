@@ -13,14 +13,43 @@ same wire protocol as the Go implementation.
   commands the terminal client has (`/help` lists them).
 * **Peers** — who is in the cluster, with nicknames and last-seen ages, plus
   the start/stop control for the node itself.
+* **Graph** — the cluster drawn as a graph: this node in the middle, its
+  peers on the first ring, and nodes it only knows from gossip further out.
+  Links both ends confirm are solid, links only one end claims are dashed.
+  A peer list cannot show that two of your peers do not talk to each other,
+  or that the cluster has split in two; both are visible here. Pinch to
+  zoom, drag to pan, tap a node for its details — and, for a peer, to pull
+  its state or drop the link on purpose and watch the cluster heal.
 * **Activity** — replication as it happens: what was applied, what was
   rejected as stale, what anti-entropy pushed or pulled — alongside the
   counters. All of this is otherwise invisible, which is when a replication
   bug hides.
+* **Diag** — the whole node in one screen, starting with what is wrong.
+  Health checks turn counters into causes ("packets failed authentication"
+  → the key or cluster name differs, with the key fingerprint to compare);
+  then identity, sockets, the device's own networking, per-peer traffic,
+  addresses that send packets without being peers, store shape and the
+  topology. *Copy report* puts all of it on the clipboard for a bug report.
 * **Bootstrap** — run the rendezvous service here, so the phone is the
   meeting point a LAN cluster forms around. It never sees KV data or chat.
 * **Settings** — nickname, port, advertised host, bootstrap seeds, cluster
   name, pre-shared key, and the tombstone GC age.
+
+## Phones and tablets
+
+The layout follows the window, not the device:
+
+* under 600dp wide — tabs across the top, one screen at a time
+* 600dp and up, or a short landscape window — a navigation rail beside the
+  content, which buys back the height the tab strip costs
+* 880dp and up (and tall enough) — two screens side by side, each captioned,
+  with the pairing chosen so the second answers what the first raises: peers
+  next to the graph, chat next to peers, settings next to diagnostics. The
+  split can be collapsed from the header.
+
+Every screen pads for the status bar, the navigation bar, a display cutout
+and the keyboard, so nothing renders under the clock and the chat input rises
+with the keyboard instead of hiding behind it.
 
 A foreground service keeps whichever roles are running alive: a gossip node
 that only runs while its screen is open is not participating in a cluster,
@@ -65,7 +94,10 @@ app/src/main/java/com/nexusriot/rezoagwe/
 │   ├── KvStore.kt        versioned store: LWW, CAS, TTL, digests, GC
 │   ├── NodeEngine.kt     membership, replication, chat, anti-entropy
 │   ├── BootstrapServer.kt the rendezvous role
-│   ├── Metrics.kt        counters
+│   ├── Topology.kt       the cluster graph, derived from gossiped peer lists
+│   ├── Diagnostics.kt    one snapshot of the node, plus the health checks
+│   ├── DeviceInfo.kt     the phone's own networking and power state
+│   ├── Metrics.kt        counters, per-peer traffic and rates
 │   ├── Persistence.kt    atomic, generation-guarded state file
 │   └── Runtime.kt        process-wide holder for both roles + settings
 ├── service/        foreground service
@@ -82,6 +114,11 @@ expiry) are duplicated deliberately and pinned by tests:
   derived keys against fixed vectors from `proto.DeriveKey`.
 * `KvStoreTest` asserts the same merge, CAS, TTL and reconciliation rules the
   Go store's tests assert.
+* `WireCompatTest` decodes the bodies Go actually emits. Go marshals a nil
+  slice as `null` for any field without `omitempty`, so an empty Go node's
+  digest arrives as `{"from":"…","entries":null}` — which used to
+  authenticate and then fail to parse, silently dropping the repair it
+  carried. The decoder now coerces those nulls to empty.
 * `GoInteropTest` joins a **running** Go cluster and replicates through it in
   both directions. It skips unless pointed at one:
 
@@ -93,7 +130,8 @@ REZOAGWE_GO_PSK=demo REZOAGWE_GO_CLUSTER=e2e \
 
 ## Known gaps
 
-* Verified against a live Go cluster from the JVM, but not yet run on a
-  physical phone — Doze behaviour and the battery cost of the 10 s gossip
-  tick are unmeasured.
+* Verified against a live Go cluster, on an emulator (phone and tablet
+  window sizes) — but not yet on a physical phone. The battery cost of the
+  10 s gossip tick is unmeasured; **Diag** at least reports whether Doze
+  applies and links to the exemption setting.
 * No import/export UI yet; the engine supports both.

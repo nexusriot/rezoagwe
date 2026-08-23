@@ -189,9 +189,17 @@ data class BootstrapRoster(val peers: List<BootstrapPeer> = emptyList())
  * JSON tuned to match Go's encoding/json:
  * - defaults are not written, mirroring `omitempty`
  * - unknown keys are ignored, so a newer peer can add fields without breaking us
+ * - an explicit `null` falls back to the property's default
+ *
+ * The last one is not a nicety. Go marshals a nil slice as `null` for every field
+ * without `omitempty` — `entries` in a digest, `kv` in a state response, `peers`
+ * in gossip — so an empty Go node's anti-entropy round arrives as
+ * `{"from":"…","entries":null}`. Without coercion that frame authenticates and
+ * then fails to parse, and the repair it was carrying is silently dropped.
  */
 val WireJson: Json = Json {
     encodeDefaults = false
     ignoreUnknownKeys = true
     explicitNulls = false
+    coerceInputValues = true
 }
