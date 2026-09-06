@@ -17,6 +17,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -27,6 +28,8 @@ import com.nexusriot.rezoagwe.core.BootstrapServer
 import com.nexusriot.rezoagwe.core.NodeEngine
 import com.nexusriot.rezoagwe.core.Runtime
 import com.nexusriot.rezoagwe.service.NodeService
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 
 /**
  * The rendezvous role. Running it here makes this phone the meeting point a LAN
@@ -37,6 +40,7 @@ fun BootstrapScreen(server: BootstrapServer) {
     val roster by server.roster.collectAsState()
     val status by server.status.collectAsState()
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
 
     Column(modifier = Modifier.fillMaxSize()) {
         Card(modifier = Modifier
@@ -65,10 +69,14 @@ fun BootstrapScreen(server: BootstrapServer) {
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     if (status.running) {
-                        OutlinedButton(onClick = { Runtime.stopBootstrap(context) }) { Text("Stop") }
+                        OutlinedButton(onClick = {
+                            scope.launch(Dispatchers.IO) { Runtime.stopBootstrap(context) }
+                        }) { Text("Stop") }
                     } else {
+                        // Binding the rendezvous sockets is I/O; it does not belong
+                        // on the frame the button was pressed on.
                         Button(onClick = {
-                            Runtime.startBootstrap(context)
+                            scope.launch(Dispatchers.IO) { Runtime.startBootstrap(context) }
                             NodeService.ensureRunning(context)
                         }) { Text("Start") }
                     }
@@ -101,9 +109,11 @@ fun BootstrapScreen(server: BootstrapServer) {
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
+                    // A frozen "seen 0s ago" under a stopped service reads as a live
+                    // roster: nothing is checking in, so nothing is ageing either.
                     val age = System.currentTimeMillis() / 1000 - entry.lastSeen
                     Text(
-                        text = "seen ${formatUptime(age)} ago",
+                        text = if (status.running) "seen ${formatUptime(age)} ago" else "registered",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.outline,
                     )

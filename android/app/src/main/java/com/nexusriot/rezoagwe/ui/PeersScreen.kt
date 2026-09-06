@@ -17,6 +17,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -26,6 +27,8 @@ import androidx.compose.ui.unit.dp
 import com.nexusriot.rezoagwe.core.NodeEngine
 import com.nexusriot.rezoagwe.core.Runtime
 import com.nexusriot.rezoagwe.service.NodeService
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 
 @Composable
 fun PeersScreen(node: NodeEngine) {
@@ -33,6 +36,7 @@ fun PeersScreen(node: NodeEngine) {
     val status by node.status.collectAsState()
     val settings by Runtime.settings.collectAsState()
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
 
     Column(modifier = Modifier.fillMaxSize()) {
         Card(modifier = Modifier
@@ -56,10 +60,15 @@ fun PeersScreen(node: NodeEngine) {
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     if (status.running) {
-                        OutlinedButton(onClick = { Runtime.stopNode(context) }) { Text("Stop node") }
+                        // Stopping sends a goodbye to every peer, so it belongs off
+                        // the UI thread: Android refuses a datagram sent from there,
+                        // and the goodbye was being dropped.
+                        OutlinedButton(onClick = {
+                            scope.launch(Dispatchers.IO) { Runtime.stopNode(context) }
+                        }) { Text("Stop node") }
                     } else {
                         Button(onClick = {
-                            Runtime.startNode(context)
+                            scope.launch(Dispatchers.IO) { Runtime.startNode(context) }
                             // The service is what keeps the node gossiping once the
                             // screen goes away.
                             NodeService.ensureRunning(context)

@@ -1,5 +1,6 @@
 package com.nexusriot.rezoagwe.ui
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -31,6 +32,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -41,6 +43,9 @@ import androidx.compose.ui.unit.dp
 import com.nexusriot.rezoagwe.core.Entry
 import com.nexusriot.rezoagwe.core.NodeEngine
 import com.nexusriot.rezoagwe.proto.Version
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 @Composable
 fun KeysScreen(node: NodeEngine) {
@@ -49,6 +54,10 @@ fun KeysScreen(node: NodeEngine) {
     var creating by remember { mutableStateOf(false) }
     var historyOf by remember { mutableStateOf<String?>(null) }
     var confirmDelete by remember { mutableStateOf<String?>(null) }
+    // A refused guarded write used to leave only a line in the chat log, which is
+    // not the screen the user is looking at: the edit simply vanished.
+    var notice by remember { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
 
     Box(modifier = Modifier.fillMaxSize()) {
         if (entries.isEmpty()) {
@@ -63,6 +72,30 @@ fun KeysScreen(node: NodeEngine) {
             // Room for the button that would otherwise sit on the last row.
             contentPadding = PaddingValues(bottom = 88.dp),
         ) {
+            notice?.let { text ->
+                item {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(MaterialTheme.colorScheme.errorContainer)
+                            .clickable { notice = null }
+                            .padding(horizontal = 12.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            text = text,
+                            modifier = Modifier.weight(1f),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onErrorContainer,
+                        )
+                        Text(
+                            text = "Dismiss",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onErrorContainer,
+                        )
+                    }
+                }
+            }
             items(entries, key = { it.key }) { entry ->
                 KeyRow(
                     entry = entry,
@@ -94,12 +127,24 @@ fun KeysScreen(node: NodeEngine) {
             onDismiss = { creating = false },
             onSave = { key, value, ttl, guard ->
                 creating = false
-                if (guard) {
-                    if (node.compareAndSet(key, value, ttl, Version()) == null) {
-                        node.system("guarded write to $key refused: it already exists")
+                notice = null
+                // The write broadcasts to every peer, so it runs off the UI thread:
+                // Android refuses a datagram sent from there, and the update reached
+                // the cluster only on the next anti-entropy round.
+                scope.launch {
+                    val refused = withContext(Dispatchers.IO) {
+                        if (guard) {
+                            node.compareAndSet(key, value, ttl, Version()) == null
+                        } else {
+                            node.set(key, value, ttl)
+                            false
+                        }
                     }
-                } else {
-                    node.set(key, value, ttl)
+                    if (refused) {
+                        val why = "guarded write to $key refused: it already exists"
+                        node.system(why)
+                        notice = why
+                    }
                 }
             },
         )
@@ -120,15 +165,24 @@ fun KeysScreen(node: NodeEngine) {
             onDismiss = { editing = null },
             onSave = { key, value, ttl, guard ->
                 editing = null
-                if (guard) {
-                    // The version on screen when the dialog opened is the guard: if a
-                    // peer wrote the key in the meantime, the save is refused rather
-                    // than silently overwriting the newer value.
-                    if (node.compareAndSet(key, value, ttl, entry.version) == null) {
-                        node.system("guarded write to $key refused: it changed since the form opened")
+                notice = null
+                scope.launch {
+                    val refused = withContext(Dispatchers.IO) {
+                        if (guard) {
+                            // The version on screen when the dialog opened is the guard:
+                            // if a peer wrote the key in the meantime, the save is refused
+                            // rather than silently overwriting the newer value.
+                            node.compareAndSet(key, value, ttl, entry.version) == null
+                        } else {
+                            node.set(key, value, ttl)
+                            false
+                        }
                     }
-                } else {
-                    node.set(key, value, ttl)
+                    if (refused) {
+                        val why = "guarded write to $key refused: it changed since the form opened"
+                        node.system(why)
+                        notice = why
+                    }
                 }
             },
         )
@@ -145,7 +199,7 @@ fun KeysScreen(node: NodeEngine) {
             text = { Text("The delete replicates as a versioned tombstone, so it cannot be undone by a stale write.") },
             confirmButton = {
                 TextButton(onClick = {
-                    node.delete(key)
+                    scope.launch(Dispatchers.IO) { node.delete(key) }
                     confirmDelete = null
                 }) { Text("Delete") }
             },

@@ -17,6 +17,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -26,10 +27,13 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import com.nexusriot.rezoagwe.core.NodeEngine
 import com.nexusriot.rezoagwe.core.Runtime
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 
 @Composable
 fun SettingsScreen() {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     val saved by Runtime.settings.collectAsState()
 
     var nick by remember(saved) { mutableStateOf(saved.nick) }
@@ -69,7 +73,9 @@ fun SettingsScreen() {
         Text(
             text = "Every packet is authenticated. Without a pre-shared key the framing key comes " +
                 "from the cluster name alone, which keeps two clusters on one network apart but " +
-                "provides no secrecy. Nodes only talk to peers with the same key and cluster.",
+                "provides no secrecy. Nodes only talk to peers with the same key and cluster. " +
+                "Spaces around the key and the cluster name are trimmed, since a keyboard that " +
+                "adds one would otherwise cut this node off with nothing on screen to show it.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(vertical = 12.dp),
@@ -78,19 +84,19 @@ fun SettingsScreen() {
         Button(
             modifier = Modifier.fillMaxWidth(),
             onClick = {
-                Runtime.applySettings(
-                    context,
-                    saved.copy(
-                        nick = nick.ifBlank { "phone" },
-                        port = port.toIntOrNull() ?: saved.port,
-                        advertiseHost = advertiseHost.trim(),
-                        seeds = seeds.trim(),
-                        psk = psk,
-                        cluster = cluster.ifBlank { saved.cluster },
-                        bootstrapPort = bootstrapPort.toIntOrNull() ?: saved.bootstrapPort,
-                        tombstoneTtlSec = tombstoneTtl.toLongOrNull() ?: 0,
-                    ),
-                )
+                val updated = saved.copy(
+                    nick = nick,
+                    port = port.toIntOrNull() ?: saved.port,
+                    advertiseHost = advertiseHost,
+                    seeds = seeds,
+                    psk = psk,
+                    cluster = cluster,
+                    bootstrapPort = bootstrapPort.toIntOrNull() ?: saved.bootstrapPort,
+                    tombstoneTtlSec = tombstoneTtl.toLongOrNull() ?: 0,
+                ).sanitized(saved)
+                // Applying restarts a role, which closes and rebinds sockets: not
+                // work for the frame the button was pressed on.
+                scope.launch(Dispatchers.IO) { Runtime.applySettings(context, updated) }
             },
         ) { Text("Apply") }
 

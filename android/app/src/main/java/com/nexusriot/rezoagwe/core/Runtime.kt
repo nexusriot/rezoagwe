@@ -24,6 +24,26 @@ data class Settings(
     fun seedList(): List<String> =
         seeds.split(',').map { it.trim() }.filter { it.isNotEmpty() }
 
+    /**
+     * The values as they should be stored: surrounding whitespace off every text
+     * field, and blanks replaced from [fallback].
+     *
+     * The cluster name and the key feed the framing key, so a stray space is not
+     * cosmetic — it changes the key and the node stops talking to every peer,
+     * with nothing on screen to show why. A soft keyboard supplies exactly that:
+     * it appends a space after a word it thinks it has completed, so typing
+     * "e2e" into the cluster field stores "e2e ". Trimming here rather than at
+     * each call site is the point — the seeds and the advertised host were
+     * already trimmed, and the two fields that mattered most were not.
+     */
+    fun sanitized(fallback: Settings = Settings()): Settings = copy(
+        nick = nick.trim().ifBlank { fallback.nick },
+        advertiseHost = advertiseHost.trim(),
+        seeds = seeds.trim(),
+        psk = psk.trim(),
+        cluster = cluster.trim().ifBlank { fallback.cluster },
+    )
+
     fun toNodeConfig() = NodeConfig(
         advertiseHost = advertiseHost,
         port = port,

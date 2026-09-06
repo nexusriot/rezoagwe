@@ -203,7 +203,16 @@ class NodeEngine(
         jobs.forEach { it.cancel() }
         jobs.clear()
         tr.close()
-        synchronized(lock) { transport = null }
+        // Membership is what the socket learned, so it dies with the socket. Keeping
+        // it left the peer list and the graph claiming a live cluster, frozen at
+        // "seen 0s ago", for a node that had stopped listening.
+        synchronized(lock) {
+            transport = null
+            peers.clear()
+            idToAddr.clear()
+            gossipViews.clear()
+        }
+        publishPeers()
         publishStatus()
     }
 
@@ -219,8 +228,11 @@ class NodeEngine(
             metrics.sent(kind, pkt.size)
             metrics.sentTo(normalizeAddr(addr), pkt.size)
         } catch (e: Exception) {
-            metrics.sendErrors.incrementAndGet()
-            metrics.sendFailedTo(normalizeAddr(addr))
+            // The reason matters: "3 send errors" reads as a flaky network, but the
+            // cause can equally be this process (a datagram sent from the UI thread
+            // throws NetworkOnMainThreadException). Record the class and message so
+            // the diagnostics can tell those apart.
+            metrics.sendFailed(normalizeAddr(addr), e)
         }
     }
 
@@ -626,13 +638,23 @@ class NodeEngine(
             }
         }
         if (resp.chat.isNotEmpty()) {
-            synchronized(lock) {
-                val merged = resp.chat + chatLog
+            // A snapshot carries history this node may already hold. Appending it
+            // wholesale duplicated every line on the second sync, and a joiner that
+            // syncs from two peers saw the same conversation two or three times.
+            val grew = synchronized(lock) {
+                val before = chatLog.size
+                val merged = LinkedHashSet(chatLog)
+                merged.addAll(resp.chat)
+                if (merged.size == before) return@synchronized false
+                val ordered = merged.sortedBy { it.ts }
                 chatLog.clear()
-                chatLog.addAll(merged.takeLast(CHAT_RING))
+                chatLog.addAll(ordered.takeLast(CHAT_RING))
+                true
             }
-            persist()
-            publishChat()
+            if (grew) {
+                persist()
+                publishChat()
+            }
         }
         if (changed) {
             logActivity("state sync merged ${resp.kv.size} entries")

@@ -12,12 +12,16 @@ import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import com.nexusriot.rezoagwe.MainActivity
 import com.nexusriot.rezoagwe.R
+import com.nexusriot.rezoagwe.core.BootstrapStatus
+import com.nexusriot.rezoagwe.core.NodeStatus
 import com.nexusriot.rezoagwe.core.Runtime
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.launch
@@ -44,9 +48,13 @@ class NodeService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP_ALL -> {
-                Runtime.stopNode(this)
-                Runtime.stopBootstrap(this)
-                stopSelf()
+                // Stopping a role closes sockets and sends a goodbye, which Android
+                // will not do on the main thread. The watcher below stops the service
+                // once both roles are down, so there is nothing to wait for here.
+                scope.launch(Dispatchers.IO) {
+                    Runtime.stopNode(this@NodeService)
+                    Runtime.stopBootstrap(this@NodeService)
+                }
                 return START_NOT_STICKY
             }
         }
@@ -63,15 +71,7 @@ class NodeService : Service() {
     private fun watchState() {
         val engine = Runtime.engine(this)
         val bootstrap = Runtime.bootstrap(this)
-        watcher = combine(engine.status, bootstrap.status) { node, boot ->
-            when {
-                node.running && boot.running ->
-                    "node ${node.addr} · ${node.peers} peers · ${node.keys} keys · bootstrap :${boot.port} (${boot.nodes})"
-                node.running -> "node ${node.addr} · ${node.peers} peers · ${node.keys} keys"
-                boot.running -> "bootstrap :${boot.port} · ${boot.nodes} nodes"
-                else -> "idle"
-            }
-        }.onEach { text ->
+        watcher = notificationTextFlow(engine.status, bootstrap.status).onEach { text ->
             notificationManager().notify(NOTIFICATION_ID, buildNotification(text))
         }.launchIn(scope)
 
@@ -134,3 +134,30 @@ class NodeService : Service() {
         }
     }
 }
+
+/**
+ * What the ongoing notification says about the running roles.
+ *
+ * Deliberately free of anything that ticks — the uptime is on the screen, not
+ * here — so that [notificationTextFlow] can drop the repeats.
+ */
+internal fun notificationText(node: NodeStatus, boot: BootstrapStatus): String = when {
+    node.running && boot.running ->
+        "node ${node.addr} · ${node.peers} peers · ${node.keys} keys · bootstrap :${boot.port} (${boot.nodes})"
+    node.running -> "node ${node.addr} · ${node.peers} peers · ${node.keys} keys"
+    boot.running -> "bootstrap :${boot.port} · ${boot.nodes} nodes"
+    else -> "idle"
+}
+
+/**
+ * The notification text, emitted only when it actually changes.
+ *
+ * The status flows tick on every gossip round whether or not anything moved, and
+ * re-posting an identical notification is not free: the shade rebuilds it, every
+ * notification listener on the device wakes for it, and on an idle two-node
+ * cluster that was happening about twenty times a minute.
+ */
+internal fun notificationTextFlow(
+    node: Flow<NodeStatus>,
+    boot: Flow<BootstrapStatus>,
+): Flow<String> = combine(node, boot) { n, b -> notificationText(n, b) }.distinctUntilChanged()

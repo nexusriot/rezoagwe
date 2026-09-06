@@ -13,6 +13,7 @@ import java.io.IOException
 import java.net.DatagramSocket
 import java.net.InetSocketAddress
 import java.net.ServerSocket
+import java.net.SocketException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -29,6 +30,14 @@ import org.junit.Test
  * The engine over real loopback sockets. It touches no Android APIs, so the same
  * code the app ships can be exercised here rather than only on a device.
  */
+/**
+ * A stand-in for the platform's exception of the same name: the real one lives in
+ * android.jar, which on the unit-test classpath is a stub that throws when
+ * constructed. The classification under test reads the class name, and this
+ * class has the name that matters.
+ */
+private class NetworkOnMainThreadException : RuntimeException()
+
 class NodeEngineTest {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val engines = mutableListOf<NodeEngine>()
@@ -100,6 +109,102 @@ class NodeEngineTest {
         a.addPeer(b.addr)
         b.addPeer(a.addr)
         return a to b
+    }
+
+    /**
+     * Membership belongs to the socket. It used to outlive it, so the peer list
+     * and the graph kept drawing a live cluster — frozen at "seen 0s ago",
+     * because with nothing gossiping there was nothing left to refresh them —
+     * for a node that had stopped listening.
+     */
+    /**
+     * A send that fails has to say what failed. The counter alone cannot tell an
+     * unroutable peer apart from this process refusing to send, and those two
+     * have nothing in common but the number.
+     */
+    @Test
+    fun aFailedSendRecordsItsCause() {
+        val a = engine(freePort(), "alice")
+        a.metrics.sendFailed("10.0.0.2:3137", NetworkOnMainThreadException())
+
+        val failure = a.metrics.snapshot().lastSendError
+        assertNotNull("the failure should have been recorded", failure)
+        assertEquals("10.0.0.2:3137", failure!!.addr)
+        assertEquals("NetworkOnMainThreadException", failure.cause)
+        assertTrue("it should be recognised as our bug, not the network's", failure.onMainThread)
+        assertEquals(1, a.metrics.sendErrors.get())
+    }
+
+    @Test
+    fun anOrdinaryFailedSendIsNotBlamedOnTheUiThread() {
+        val a = engine(freePort(), "alice")
+        a.metrics.sendFailed("10.0.0.2:3137", SocketException("Network is unreachable"))
+
+        val failure = a.metrics.snapshot().lastSendError!!
+        assertFalse(failure.onMainThread)
+        assertTrue(failure.toString().contains("Network is unreachable"))
+    }
+
+    @Test
+    fun stoppingClearsMembership() {
+        val (a, b) = pair()
+        waitFor("the peers to see each other") { a.peerList.value.isNotEmpty() }
+        assertTrue("precondition: the graph should have both nodes", a.topology.value.nodes.size > 1)
+
+        a.stop()
+
+        assertTrue("the peer list should empty when the node stops", a.peerList.value.isEmpty())
+        assertEquals("the status should stop claiming peers", 0, a.status.value.peers)
+        assertTrue(
+            "the graph should collapse to this node alone",
+            a.topology.value.nodes.size <= 1,
+        )
+        assertTrue("the peer is unaffected", b.isRunning)
+    }
+
+    /**
+     * A state snapshot carries chat history the receiver may already hold. It was
+     * appended wholesale, so a second sync — which is routine, one per peer a
+     * joiner syncs from — showed the whole conversation twice.
+     */
+    @Test
+    fun repeatedStateSyncDoesNotDuplicateChatHistory() {
+        val (a, b) = pair()
+        a.sendChat("only once")
+        waitFor("the message to reach the peer") { b.chat.value.any { it.text == "only once" } }
+
+        val before = b.chat.value.size
+        repeat(3) { b.requestStateFrom(a.addr) }
+        // Give the snapshots time to arrive and be merged.
+        waitFor("the snapshots to be served") { a.metrics.stateSyncOut.get() >= 3 }
+        Thread.sleep(200)
+
+        assertEquals(
+            "the same line must not be merged twice",
+            1,
+            b.chat.value.count { it.text == "only once" },
+        )
+        assertEquals("nothing else should have been duplicated", before, b.chat.value.size)
+    }
+
+    /** Chat merged out of a snapshot has to end up in time order, not remote-then-local. */
+    @Test
+    fun mergedChatHistoryStaysInTimeOrder() {
+        val (a, b) = pair()
+        a.sendChat("first")
+        waitFor("the first message to replicate") { b.chat.value.any { it.text == "first" } }
+        b.sendChat("second")
+        waitFor("the second message to replicate") { a.chat.value.any { it.text == "second" } }
+
+        b.requestStateFrom(a.addr)
+        Thread.sleep(300)
+
+        val texts = b.chat.value.map { it.text }
+        assertTrue("both messages should be present", texts.containsAll(listOf("first", "second")))
+        assertTrue(
+            "the earlier message should still come first, got $texts",
+            texts.indexOf("first") < texts.indexOf("second"),
+        )
     }
 
     @Test

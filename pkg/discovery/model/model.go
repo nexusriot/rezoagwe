@@ -2,6 +2,7 @@ package model
 
 import (
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -339,9 +340,25 @@ func (bn *Model) PrependChat(history []pb.ChatEntry) {
 		return
 	}
 	bn.chatMu.Lock()
-	merged := make([]pb.ChatEntry, 0, len(history)+len(bn.chatLog))
-	merged = append(merged, history...)
-	merged = append(merged, bn.chatLog...)
+	// A snapshot repeats history this node may already hold — a joiner that syncs
+	// from two peers is handed the same conversation twice, and asking one peer
+	// again is enough on its own. Appending it wholesale showed every line as many
+	// times as it had been synced, so merge on the entry itself and put the result
+	// back in time order rather than remote-then-local.
+	seen := make(map[pb.ChatEntry]struct{}, len(bn.chatLog)+len(history))
+	merged := make([]pb.ChatEntry, 0, len(bn.chatLog)+len(history))
+	for _, e := range append(append([]pb.ChatEntry{}, bn.chatLog...), history...) {
+		if _, dup := seen[e]; dup {
+			continue
+		}
+		seen[e] = struct{}{}
+		merged = append(merged, e)
+	}
+	if len(merged) == len(bn.chatLog) {
+		bn.chatMu.Unlock()
+		return
+	}
+	sort.SliceStable(merged, func(i, j int) bool { return merged[i].TS < merged[j].TS })
 	if len(merged) > chatRing {
 		merged = merged[len(merged)-chatRing:]
 	}

@@ -15,6 +15,10 @@ class Metrics {
     val bytesReceived = AtomicLong()
     val sendErrors = AtomicLong()
 
+    @Volatile
+    var lastSendError: SendFailure? = null
+        private set
+
     val authFailures = AtomicLong()
     val replayDrops = AtomicLong()
     val skewDrops = AtomicLong()
@@ -77,6 +81,22 @@ class Metrics {
 
     fun sendFailedTo(addr: String) {
         counters(addr).sendErrors.incrementAndGet()
+    }
+
+    /**
+     * A datagram that never left. Counts it and keeps the reason: a bare count
+     * cannot distinguish an unroutable peer from this process refusing to send
+     * (a datagram handed to the socket on Android's main thread throws), and
+     * those two have nothing in common but the number.
+     */
+    fun sendFailed(addr: String, e: Throwable) {
+        sendErrors.incrementAndGet()
+        sendFailedTo(addr)
+        lastSendError = SendFailure(
+            addr = addr,
+            cause = e.javaClass.simpleName,
+            message = e.message.orEmpty(),
+        )
     }
 
     /** A frame from [addr] that did not authenticate, parse, or pass the replay guard. */
@@ -145,6 +165,7 @@ class Metrics {
             bytesSent = bytesSent.get(),
             bytesReceived = bytesReceived.get(),
             sendErrors = sendErrors.get(),
+            lastSendError = lastSendError,
             authFailures = authFailures.get(),
             replayDrops = replayDrops.get(),
             skewDrops = skewDrops.get(),
@@ -208,12 +229,26 @@ data class Rates(
 
 data class KindCount(val kind: String, val sent: Long, val received: Long)
 
+/** The most recent datagram that could not be sent, and why. */
+data class SendFailure(
+    val addr: String = "",
+    val cause: String = "",
+    val message: String = "",
+) {
+    /** True when the send failed because it ran on Android's main thread — an app bug, not a network one. */
+    val onMainThread: Boolean get() = cause == "NetworkOnMainThreadException"
+
+    override fun toString(): String =
+        if (message.isEmpty()) "$cause to $addr" else "$cause to $addr ($message)"
+}
+
 data class MetricsSnapshot(
     val packetsSent: Long = 0,
     val packetsReceived: Long = 0,
     val bytesSent: Long = 0,
     val bytesReceived: Long = 0,
     val sendErrors: Long = 0,
+    val lastSendError: SendFailure? = null,
     val authFailures: Long = 0,
     val replayDrops: Long = 0,
     val skewDrops: Long = 0,

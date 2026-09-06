@@ -180,13 +180,50 @@ func TestRemovePeerForgetsID(t *testing.T) {
 
 func TestPrependChatKeepsLocalLinesLast(t *testing.T) {
 	m := newModel(t, "")
-	m.AppendChat(pb.ChatEntry{Text: "local", Kind: pb.ChatSystem})
-	m.PrependChat([]pb.ChatEntry{{Text: "peer-1"}, {Text: "peer-2"}})
+	m.AppendChat(pb.ChatEntry{Text: "local", TS: 3, Kind: pb.ChatSystem})
+	m.PrependChat([]pb.ChatEntry{{Text: "peer-1", TS: 1}, {Text: "peer-2", TS: 2}})
 
 	log := m.ChatLog()
 	want := []string{"peer-1", "peer-2", "local"}
 	if len(log) != len(want) {
 		t.Fatalf("chat = %d lines, want %d", len(log), len(want))
+	}
+	for i, w := range want {
+		if log[i].Text != w {
+			t.Fatalf("chat[%d] = %q, want %q", i, log[i].Text, w)
+		}
+	}
+}
+
+// A snapshot repeats history the node already holds: a joiner that syncs from
+// two peers, or asks one peer twice, was shown the same conversation over and
+// over.
+func TestPrependChatDoesNotDuplicateHistory(t *testing.T) {
+	m := newModel(t, "")
+	history := []pb.ChatEntry{
+		{Text: "one", TS: 1, Sender: "10.0.0.2:3137"},
+		{Text: "two", TS: 2, Sender: "10.0.0.2:3137"},
+	}
+	m.PrependChat(history)
+	m.PrependChat(history)
+	m.PrependChat(history)
+
+	if got := len(m.ChatLog()); got != 2 {
+		t.Fatalf("chat = %d lines after three identical snapshots, want 2: %v", got, m.ChatLog())
+	}
+}
+
+// Merged history has to end up in time order: a snapshot pulled after a local
+// line was written must not push that line to the end of the log.
+func TestPrependChatOrdersByTime(t *testing.T) {
+	m := newModel(t, "")
+	m.AppendChat(pb.ChatEntry{Text: "local-early", TS: 5})
+	m.PrependChat([]pb.ChatEntry{{Text: "peer-later", TS: 9}, {Text: "peer-earlier", TS: 1}})
+
+	want := []string{"peer-earlier", "local-early", "peer-later"}
+	log := m.ChatLog()
+	if len(log) != len(want) {
+		t.Fatalf("chat = %d lines, want %d: %v", len(log), len(want), log)
 	}
 	for i, w := range want {
 		if log[i].Text != w {

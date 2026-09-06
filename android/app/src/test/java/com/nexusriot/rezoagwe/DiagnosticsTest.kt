@@ -5,6 +5,7 @@ import com.nexusriot.rezoagwe.core.MetricsSnapshot
 import com.nexusriot.rezoagwe.core.NodeDiagnostics
 import com.nexusriot.rezoagwe.core.Peer
 import com.nexusriot.rezoagwe.core.PeerDiagnostics
+import com.nexusriot.rezoagwe.core.SendFailure
 import com.nexusriot.rezoagwe.core.Severity
 import com.nexusriot.rezoagwe.core.StoreDiagnostics
 import com.nexusriot.rezoagwe.core.TopologyBuilder
@@ -172,6 +173,60 @@ class DiagnosticsTest {
         )
         val check = healthChecks(d, now).first { it.title.contains("without being a peer") }
         assertTrue(check.detail.contains("10.0.0.7:5000"))
+    }
+
+    /**
+     * "3 send error(s)" sent me looking at Wi-Fi for an hour. The datagrams were
+     * never handed to the network at all — they were sent from the thread that
+     * runs the UI, which Android refuses — so the check has to say that rather
+     * than offer the network as the likely cause.
+     */
+    @Test
+    fun aSendRefusedByTheUiThreadIsNotBlamedOnTheNetwork() {
+        val d = healthy().copy(
+            metrics = MetricsSnapshot(
+                sendErrors = 3,
+                lastSendError = SendFailure(
+                    addr = "10.0.0.2:3137",
+                    cause = "NetworkOnMainThreadException",
+                ),
+            ),
+        )
+        val check = healthChecks(d, now).first { it.title.contains("send error") }
+
+        assertEquals("an app bug is worse than a flaky link", Severity.ERROR, check.severity)
+        assertTrue(check.detail.contains("UI thread"))
+        assertTrue("it should name the peer it could not reach", check.detail.contains("10.0.0.2:3137"))
+        assertFalse("nothing here points at Wi-Fi", check.detail.contains("Wi-Fi"))
+    }
+
+    @Test
+    fun anOrdinarySendFailureStillNamesWhatItWas() {
+        val d = healthy().copy(
+            metrics = MetricsSnapshot(
+                sendErrors = 1,
+                lastSendError = SendFailure(
+                    addr = "10.0.0.9:3137",
+                    cause = "SocketException",
+                    message = "Network is unreachable",
+                ),
+            ),
+        )
+        val check = healthChecks(d, now).first { it.title.contains("send error") }
+
+        assertEquals(Severity.WARN, check.severity)
+        assertTrue(check.detail.contains("SocketException"))
+        assertTrue(check.detail.contains("Network is unreachable"))
+    }
+
+    /** Older snapshots have no recorded cause; the check must still read sensibly. */
+    @Test
+    fun sendErrorsWithNoRecordedCauseFallBackToTheOldWording() {
+        val d = healthy().copy(metrics = MetricsSnapshot(sendErrors = 2))
+        val check = healthChecks(d, now).first { it.title.contains("send error") }
+
+        assertEquals(Severity.WARN, check.severity)
+        assertTrue(check.detail.contains("Wi-Fi"))
     }
 
     @Test

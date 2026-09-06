@@ -133,11 +133,24 @@ fun healthChecks(d: NodeDiagnostics, nowMs: Long): List<HealthCheck> {
     }
 
     if (m.sendErrors > 0) {
+        val last = m.lastSendError
         checks += HealthCheck(
-            Severity.WARN,
+            if (last?.onMainThread == true) Severity.ERROR else Severity.WARN,
             "${m.sendErrors} send error(s)",
-            "Datagrams could not leave the device — usually a peer address that no longer routes, or " +
-                "Wi-Fi dropping while the node stays up.",
+            when {
+                last == null ->
+                    "Datagrams could not leave the device — usually a peer address that no longer " +
+                        "routes, or Wi-Fi dropping while the node stays up."
+                // Worth its own wording: the packets are not lost on the network, they
+                // were never handed to it, and no amount of looking at Wi-Fi will show that.
+                last.onMainThread ->
+                    "Datagrams were sent from the UI thread, which Android refuses — this is a bug " +
+                        "in the app, not the network. The writes survive locally and reach peers " +
+                        "only on the next anti-entropy round. Last: $last."
+                else ->
+                    "Datagrams could not leave the device — usually a peer address that no longer " +
+                        "routes, or Wi-Fi dropping while the node stays up. Last: $last."
+            },
         )
     }
 
