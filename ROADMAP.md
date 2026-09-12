@@ -5,12 +5,36 @@ and grouped into thematic tiers. Effort is a rough T-shirt size: **S** ≈ a few
 hours, **M** ≈ about a day, **L** ≈ multi-day.
 
 This complements the *Known limitations & next steps* table in
-[DESIGN.md](DESIGN.md#10-known-limitations--next-steps); each open item notes
+[DESIGN.md](DESIGN.md#11-known-limitations--next-steps); each open item notes
 the code it touches.
 
 ## Shipped
 
+The repository is at **0.2.0** — the version the Makefile stamps into the Go
+binaries and their `.deb`, the desktop client's `package.json`, and the Android
+app's `versionName`; a test keeps the four in step. 0.2.0 adds the desktop
+client and its packaging to the 0.1.0 release.
+
 Everything the previous backlog listed is done. Newest first:
+
+- ✅ **Android on hardware** — run on a PRITOM M10 tablet against a Go cluster
+  on a real LAN. It closed the item and found the bug behind it: every UDP send
+  made from a Compose callback was silently dropped, so a UI write reached peers
+  only on the next anti-entropy round and *Stop node* never sent its `Goodbye`.
+  Dispatching to `Dispatchers.IO` took that write from ~10 s to 234 ms, and
+  `UiThreadingTest` now fails the build if the pattern comes back. Battery cost
+  of the 10 s tick is still unmeasured.
+- ✅ **Hermetic end-to-end suite** (`make e2e`) — a rendezvous, three peers, a
+  late joiner, a leaver, a restarting node and two strangers in containers on a
+  private network, driven through the HTTP gateway. It tests what only exists
+  between processes: real sockets, real framing, real timing.
+
+- ✅ **Desktop app** — a JavaScript port of both roles (node + rendezvous
+  service) in Electron, with the cluster drawn as a graph, a diagnostics screen
+  that turns counters into causes, and a split view. Verified against a live Go
+  cluster; its own suite runs a whole cluster in one process over an in-memory
+  network, so convergence under packet loss and a partition are asserted rather
+  than hoped for.
 
 - ✅ **Android app** — Kotlin port of both roles (node + rendezvous service)
   with a Compose UI, a foreground service, and parity tests against the Go
@@ -101,27 +125,30 @@ keypairs with signed Hellos would close that.
 Find peers on a LAN with no seed configured at all — the setup step most
 likely to defeat a new user, and the one the Android app feels most.
 
-### 7. Android on hardware — **S**
-The app is verified against a live Go cluster and on an emulator at phone
-and tablet window sizes; run it on a phone, confirm the foreground service
-survives Doze, and check battery cost of the 10 s gossip tick. The app's
-**Diag** screen now reports whether the app is exempt from battery
-optimisation, which is the first thing to check there.
-
-### 8. Watch / subscribe — **M**
+### 7. Watch / subscribe — **M**
 Long-poll or SSE on `/kv?watch=`, plus a callback in the engine.
 **Why:** every consumer currently polls; the engine already knows exactly
 when a key changed.
 
-### 9. Range and prefix queries on the wire — **S**
+### 8. Range and prefix queries on the wire — **S**
 `/kv?prefix=` filters locally after listing everything. A prefix-scoped
 state request would make a large store usable from a small client.
+
+### 9. Desktop background mode — **S**
+Closing the window stops the node on Linux and Windows, because there is no tray
+icon to keep the app alive. **Why:** the same objection the Android foreground
+service answers — a node that only runs while its window is open is evicted by
+its peers seconds after it is minimised away. **Notes:** `electron/src/main.js`
+already routes quitting through a `Goodbye`, so this is a tray icon and a
+"close to tray" setting, not a lifecycle change.
 
 ## Tier 4 — Operability
 
 ### 10. CI — **S**
-Nothing runs the tests automatically. `go test -race ./...` plus the
-Android unit tests on push.
+Nothing runs the tests automatically, and there are now four suites to run:
+`go test -race ./...`, the Android unit tests, the desktop client's
+(`make electron-test`, which needs no display) and `make e2e`. The first three
+belong on every push; the containerised one is slow enough to earn its own job.
 
 ### 11. Structured logging — **S**
 `-logfile` writes logrus text. JSON lines with the node id would make a

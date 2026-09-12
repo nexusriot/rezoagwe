@@ -1,15 +1,24 @@
 # editor / OS
 .idea/
+.vscode/
 .DS_Store
 
 # build output
 build/
 dist/
 *.deb
+# `make clean` names these, so a build can leave them in the repository root
+/rezoagwe-bootstrap
+/rezoagwe-discovery
+# what `go build ./cmd/...` drops here when it is run without -o
+/bootstrap
+/discovery
 
 # Go test artifacts
 *.test
 *.out
+# -logfile writes wherever it is pointed, and that is usually here
+*.log
 
 # runtime data / persistence
 data-dir*
@@ -21,3 +30,16 @@ android/build/
 android/app/build/
 android/local.properties
 android/.idea/
+# Kotlin 2.x keeps its build session here
+android/.kotlin/
+
+# Electron
+electron/node_modules/
+electron/dist/
+electron/shots/
+# The repository-wide `build/` rule above also swallows electron/build, which is
+# where packaging resources belong — so re-include the directory and ignore only
+# what scripts/make-icon.mjs generates into it.
+!electron/build/
+electron/build/icon.png
+electron/build/icons/

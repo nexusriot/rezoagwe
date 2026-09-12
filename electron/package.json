@@ -1,0 +1,91 @@
+{
+  "name": "rezoagwe-desktop",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Desktop client for rezoagwe: the discovery node and the bootstrap (rendezvous) service in one Electron app, speaking the Go wire protocol, with the cluster drawn as a graph.",
+  "author": "nexusriot",
+  "license": "MIT",
+  "homepage": "https://github.com/nexusriot/rezoagwe",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nexusriot/rezoagwe.git"
+  },
+  "main": "src/main.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev",
+    "test": "node --test test/*.test.js",
+    "test:interop": "REZOAGWE_GO_INTEROP=1 node --test test/interop.test.js",
+    "check": "node scripts/check.js",
+    "selftest": "electron . --selftest",
+    "icon": "node scripts/make-icon.mjs",
+    "pack": "npm run icon && electron-builder --dir",
+    "dist": "npm run icon && electron-builder --linux",
+    "dist:deb": "npm run icon && electron-builder --linux deb",
+    "dist:appimage": "npm run icon && electron-builder --linux AppImage",
+    "dist:tar": "npm run icon && electron-builder --linux tar.gz",
+    "clean": "rm -rf dist build/icon.png build/icons"
+  },
+  "devDependencies": {
+    "electron": "^31.0.0",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "io.github.nexusriot.rezoagwe",
+    "productName": "Rezoagwe",
+    "executableName": "rezoagwe-desktop",
+    "artifactName": "${name}_${version}_${arch}.${ext}",
+    "copyright": "Copyright © 2026 nexusriot",
+    "files": [
+      "src/**/*",
+      "renderer/**/*",
+      "package.json",
+      "!**/*.md",
+      "!test/**",
+      "!scripts/**"
+    ],
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "linux": {
+      "category": "Network",
+      "synopsis": "Distributed KV store and chat node",
+      "description": "Desktop client for the rezoagwe distributed key-value store: a full peer node and the rendezvous service in one app, with the cluster drawn as a graph, replication activity, and diagnostics that turn counters into causes.",
+      "maintainer": "Vladislav Ananev <nexus.riot@gmail.com>",
+      "icon": "build/icons",
+      "target": [
+        "deb",
+        "AppImage"
+      ],
+      "desktop": {
+        "Name": "Rezoagwe",
+        "GenericName": "Distributed KV store node",
+        "Comment": "Join a rezoagwe cluster: keys, chat, peers and the cluster graph",
+        "Categories": "Network;P2P;Utility;",
+        "Keywords": "rezoagwe;cluster;kv;gossip;p2p;chat;",
+        "StartupWMClass": "Rezoagwe"
+      }
+    },
+    "deb": {
+      "depends": [
+        "libgtk-3-0",
+        "libnotify4",
+        "libnss3",
+        "libxss1",
+        "libxtst6",
+        "xdg-utils",
+        "libatspi2.0-0",
+        "libuuid1",
+        "libsecret-1-0"
+      ],
+      "priority": "optional"
+    },
+    "appImage": {
+      "artifactName": "${name}_${version}_${arch}.${ext}"
+    }
+  }
+}

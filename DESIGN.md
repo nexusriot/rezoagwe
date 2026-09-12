@@ -12,7 +12,7 @@ For end-user documentation see [README.md](README.md).
 ## 1. High-level overview
 
 `rezoagwe` is a **distributed key-value store with an embedded chat**. It
-consists of two binaries plus an Android app:
+consists of two binaries plus two applications:
 
 * **bootstrap** — a rendezvous service that helps new nodes find the
   existing cluster. It only knows about the *set of node addresses*; it
@@ -21,6 +21,7 @@ consists of two binaries plus an Android app:
   participates in chat, gossips peer membership, reconciles divergence
   with anti-entropy, and replicates writes to every peer it knows about.
 * **android/** — a Kotlin port of both roles with a Compose UI (§9).
+* **electron/** — a JavaScript port of both roles with a desktop UI (§10).
 
 ```
         ┌───────────┐   node.Events    ┌──────────────┐
@@ -86,8 +87,11 @@ rezoagwe/
 │       └── controller/controller.go TUI glue implementing node.Events
 │
 ├── android/                         Kotlin port: node + bootstrap + Compose UI
+├── electron/                        JS port: node + bootstrap + desktop UI
+├── e2e/                             containerised cluster + the suite that drives it
+├── scripts/                         e2e.sh and its shell helpers
 ├── DEBIAN/                          Debian packaging metadata
-├── Makefile                         cross-build + deb + android targets
+├── Makefile                         cross-build + deb + android + electron targets
 ├── README.md
 └── DESIGN.md                        this document
 ```
@@ -237,8 +241,9 @@ own data file and discard the KV store along with the chat.
 
 ## 5. Replication rules
 
-These are protocol, not implementation detail: the Go and Kotlin stores
-must agree on every one of them or two replicas silently disagree.
+These are protocol, not implementation detail: the Go, Kotlin and JavaScript
+stores must agree on every one of them or two replicas silently disagree —
+and disagree quietly, since nothing on the wire reports a divergence.
 
 ### 5.1 Last-write-wins
 
@@ -302,11 +307,27 @@ by default and its age must exceed the longest partition expected to heal.
   is repaired by a digest exchange, and a delete is not resurrected by the
   peer that still holds the value.
 * The TUI is driven headlessly through a `tcell` simulation screen.
+* `make e2e` is the other half of that: the in-process tests cannot see anything
+  that goes wrong *between* processes, so a rendezvous, three peers, a late
+  joiner, a leaver, a restarting node and two strangers run as containers on a
+  private network while a Go suite drives them through the HTTP gateway. It
+  asserts what only exists between nodes — a write reaching a node it was never
+  sent to, a stale compare-and-swap refused everywhere rather than locally, a
+  departure *announced* rather than merely timed out.
 * The Android port carries the Go implementation's own vectors: a frame
   produced by the Go codec is decoded by the Kotlin one, and the derived
   keys are compared against fixed values. A live interop test (opt-in via
   `REZOAGWE_GO_BOOTSTRAP`) joins a running Go cluster and replicates
   through it in both directions.
+* The documentation is checked too: `electron/test/docs.test.js` asserts that
+  every command the docs offer exists, and that the tables a reader trusts
+  instead of the source — §3.2's message kinds, §8's routes, the README's chat
+  commands and hotkeys — still describe the code. Prose rots quietly, and this
+  repository has watched it happen.
+* The desktop port carries the same vectors, plus a multi-node suite of its own:
+  a cluster runs inside the test process over an in-memory network, so the
+  partition and packet-loss cases are deterministic there too. Its interop test
+  (opt-in via `REZOAGWE_GO_INTEROP`) builds the Go binaries itself.
 
 ---
 
@@ -346,13 +367,80 @@ duplicated deliberately and pinned by parity tests (§7).
 * `core/NodeEngine.kt` — membership, replication, chat, anti-entropy,
   stream state sync, exposed to Compose as `StateFlow`s.
 * `core/BootstrapServer.kt` — the rendezvous role.
+* `core/Topology.kt` — the cluster graph, derived from the peer lists gossip
+  already carries: self/peer/heard-of-only roles, links one end claims against
+  links both confirm, and the connected components that make a partition
+  visible.
+* `core/Diagnostics.kt` + `core/DeviceInfo.kt` — one snapshot of the node and
+  the health checks over it, plus the phone's own networking and power state,
+  since Doze is a cause of "the cluster forgot me" that no protocol counter
+  can explain.
+* `core/Metrics.kt` — counters, per-address traffic and sampled rates.
 * `service/NodeService.kt` — a foreground service: a gossip node that only
   runs while its screen is open is not participating in a cluster, since
   peers evict it seconds after the phone sleeps.
 
+The UI adapts to the window rather than the device: tabs under 600dp, a
+navigation rail above it or in a short landscape window, and two captioned
+panes at 880dp when there is also height for them.
+
+Running it on hardware is what proved the port: see `android/README.md` for
+what that verified, and for the main-thread send bug it found — every UDP
+write issued from a Compose callback was being refused by Android and counted
+rather than surfaced, so a UI write reached peers only on the next
+anti-entropy round.
+
 ---
 
-## 10. Known limitations & next steps
+## 10. Desktop app
+
+`electron/` is a JavaScript port of both roles, so a workstation can be a peer,
+the rendezvous service, or both. Like the Android app it shares no code with the
+Go implementation — only the protocol — so the wire rules in §3 and the
+replication rules in §5 are duplicated deliberately and pinned by parity tests
+(§7).
+
+* `src/proto/` — the frame codec and message bodies, field-for-field with the Go
+  structs. Go's `omitempty` and its habit of marshalling a nil slice as `null`
+  are both handled in one place each, since either one silently drops a packet
+  that has already authenticated.
+* `src/core/kvstore.js` — the same versioned store: LWW, CAS, TTL, digests,
+  reconciliation, history, tombstone GC.
+* `src/core/node-engine.js` — membership, replication, chat, anti-entropy and
+  stream state sync, exposed to the UI as events rather than polling.
+* `src/core/bootstrap-server.js` — the rendezvous role.
+* `src/core/topology.js` — the cluster graph, derived from the peer lists gossip
+  already carries, with the layout computed once so a report and a drawing
+  cannot disagree about where a node sits.
+* `src/net/mem.js` — an in-process network with loss, delay and partitions,
+  which is what lets the test suite run a whole cluster in one process and
+  assert convergence rather than hope for it.
+* `renderer/` — the UI: no build step, no framework, a strict CSP, and a
+  sandboxed renderer that reaches the engine only through an explicit preload
+  bridge.
+
+Packaging has two paths on purpose. `make -C electron deb` uses
+electron-builder, which wants `fpm` and can cross-build for arm64 and armhf;
+`make -C electron deb-manual` lays an unpacked build out by hand and packs it
+with `dpkg-deb`, which needs neither a network nor fpm. From the repository root
+`make electron-deb` reaches the first of them. Both write the same package — `rezoagwe-desktop` under
+`/opt/Rezoagwe`, separate from the `rezoagwe` package that carries the two Go
+binaries — and a test asserts the two descriptions agree, because the failure
+mode of a drift is a half-removed installation rather than a build error.
+
+The engine half depends on nothing from Electron. That is what makes the
+multi-node tests possible, and it means the same code could drive a headless
+desktop node if one were ever wanted.
+
+Two verification paths exist beyond the unit tests: `--selftest` boots the real
+window and drives every screen (catching a preload broken by a sandbox change, a
+CSP that blocks the scripts, a screen that throws before its first paint), and
+`REZOAGWE_GO_INTEROP=1 npm run test:interop` builds the real Go binaries and
+replicates through them in both directions.
+
+---
+
+## 11. Known limitations & next steps
 
 | Area             | Limitation                                                        | Possible fix                                  |
 |------------------|-------------------------------------------------------------------|-----------------------------------------------|
@@ -364,14 +452,15 @@ duplicated deliberately and pinned by parity tests (§7).
 | Anti-entropy     | Digest is per-key, so a huge store costs many rounds               | Merkle tree over key ranges                   |
 | Tombstones       | GC is age-based and off by default                                 | Track cluster-wide acknowledgement            |
 | Chat             | No history beyond the ring, no attachments                         | Paged history                                 |
-| Android          | Pairing verified against a Go cluster on a LAN, not on a phone yet  | Run it on hardware                            |
+| Android          | Runs on hardware; the battery cost of the 10 s gossip tick is unmeasured | Measure it over a night                       |
+| Desktop          | Closing the window stops the node on Linux and Windows: no tray icon | Tray icon + close-to-tray                     |
 
 For a prioritized version of this list — with effort estimates and what has
 already shipped — see [ROADMAP.md](ROADMAP.md).
 
 ---
 
-## 11. Why "rezoagwe"?
+## 12. Why "rezoagwe"?
 
 [Agwé](https://en.wikipedia.org/wiki/Agw%C3%A9) is the Haitian Vodou
 lwa of the sea — a fitting name for a protocol whose packets drift

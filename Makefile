@@ -32,7 +32,7 @@ BIN_DISC   := rezoagwe-discovery
 PKG_BOOT   := ./cmd/bootstrap
 PKG_DISC   := ./cmd/discovery
 GO         ?= go
-VERSION    ?= 0.1.0
+VERSION    ?= 0.2.0
 # The version is injected into both binaries: renaming the output file is not
 # the same as building a binary that knows what it is, and the two used to
 # drift apart the moment anyone passed VERSION=.
@@ -87,7 +87,18 @@ help:
 	@echo "  make debs               - deb-amd64 + deb-i386 + deb-arm64 + deb-armhf + deb-riscv64"
 	@echo "  make android            - debug APK into $(DIST_DIR)/"
 	@echo "  make android-test       - Android unit tests"
+	@echo "  make electron           - run the desktop client"
+	@echo "  make electron-test      - desktop client unit suite"
+	@echo "  make electron-selftest  - boot the desktop client and drive every screen"
+	@echo "  make electron-verify    - suite + window + a packaged binary's own selftest"
+	@echo "  make electron-binary    - unpacked desktop build into electron/dist/"
+	@echo "  make electron-deb       - desktop client .deb into electron/dist/"
+	@echo "  make electron-debs      - desktop .debs for amd64 + arm64 + armhf"
+	@echo "  make electron-appimage  - portable AppImage into electron/dist/"
+	@echo "  make electron-dist      - desktop deb + AppImage"
+	@echo "  make electron-clean     - remove electron/dist/ and the generated icon"
 	@echo "  make test | test-race | vet | fmt | tidy | clean"
+	@echo "  make e2e                - hermetic multi-node run in Docker"
 
 # Gradle needs a JDK. Android Studio ships one, so fall back to it rather than
 # failing on a machine that has no system-wide java.
@@ -103,6 +114,64 @@ android:
 .PHONY: android-test
 android-test:
 	cd android && JAVA_HOME="$(JAVA_HOME)" ./gradlew :app:testDebugUnitTest
+
+.PHONY: electron-install
+electron-install:
+	cd electron && npm install
+
+.PHONY: electron
+electron: electron-install
+	$(MAKE) -C electron run
+
+# The desktop client's suite runs a whole cluster in one process over an
+# in-memory network, so it needs no sockets, no Electron and no display.
+.PHONY: electron-test
+electron-test: electron-install
+	$(MAKE) -C electron test
+
+# The half the unit tests cannot reach: a real window, a real preload, every
+# screen actually painted.
+.PHONY: electron-selftest
+electron-selftest: electron-install
+	$(MAKE) -C electron selftest
+
+# Builds the Go binaries and replicates through them from the desktop client, so
+# a protocol drift fails here rather than on someone's LAN.
+.PHONY: electron-interop
+electron-interop: electron-install
+	$(MAKE) -C electron interop
+
+# Packaging lives in electron/Makefile; these are the doors into it from the
+# repository root, so the desktop client builds the same way the binaries do.
+.PHONY: electron-verify
+electron-verify: electron-install
+	$(MAKE) -C electron verify
+
+.PHONY: electron-binary
+electron-binary: electron-install
+	$(MAKE) -C electron binary VERSION=$(VERSION)
+
+.PHONY: electron-deb
+electron-deb: electron-install
+	$(MAKE) -C electron deb VERSION=$(VERSION)
+
+# Cross-building fetches the Electron binary for each architecture, so this one
+# needs the network on a machine that has only ever built for the host.
+.PHONY: electron-debs
+electron-debs: electron-install
+	$(MAKE) -C electron debs VERSION=$(VERSION)
+
+.PHONY: electron-appimage
+electron-appimage: electron-install
+	$(MAKE) -C electron appimage VERSION=$(VERSION)
+
+.PHONY: electron-dist
+electron-dist: electron-install
+	$(MAKE) -C electron dist VERSION=$(VERSION)
+
+.PHONY: electron-clean
+electron-clean:
+	$(MAKE) -C electron clean
 
 .PHONY: tidy
 tidy:
@@ -124,9 +193,19 @@ test:
 test-race:
 	$(GO) test -race -count=1 ./...
 
+# The unit tests run a cluster inside one process over an in-memory network,
+# which is the only way to test a partition deterministically — and the reason
+# they cannot catch anything that only goes wrong between real processes on a
+# real socket. This target is that half: separate binaries, real UDP and TCP, a
+# real rendezvous, all in throwaway containers.
+.PHONY: e2e
+e2e:
+	@scripts/e2e.sh
+
 .PHONY: clean
 clean:
 	rm -rf $(BUILD_DIR) $(DIST_DIR) $(BIN_BOOT) $(BIN_DISC)
+	rm -rf electron/dist electron/build/icon.png electron/build/icons
 
 .PHONY: all
 all: x86_64 x86_64-static linux-i686 freebsd-x86_64 uconsole pizero2w pizero2w-armhf licheerv darwin windows

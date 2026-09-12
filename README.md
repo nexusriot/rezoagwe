@@ -1,7 +1,7 @@
 ## R3zo Agwe
 
 _Distributed key-value store with an embedded chat, written in Go —
-with an Android app that speaks the same protocol._
+with Android and desktop apps that speak the same protocol._
 
 Two cooperating binaries:
 
@@ -73,6 +73,9 @@ For internals, wire protocol, and the failure model, see
 - **Android app** (`android/`): the same node *and* the rendezvous service
   on a phone or tablet, with a Compose UI, a cluster graph, a diagnostics
   screen, and a foreground service
+- **Desktop app** (`electron/`): the same two roles on a workstation, with the
+  cluster drawn as a graph, a diagnostics screen that turns counters into
+  causes, and a split view — a full peer, not a viewer onto someone else's node
 - Cross-build to Linux (amd64/i386/arm64/armv7/riscv64), FreeBSD, macOS,
   Windows; Debian packages
 
@@ -84,21 +87,62 @@ For internals, wire protocol, and the failure model, see
 make x86_64           # linux/amd64, dynamic
 make x86_64-static    # linux/amd64, fully static (CGO off)
 make all              # every cross-build target into dist/
-make debs             # deb-amd64 + deb-i386 + deb-arm64 + deb-armhf
+make debs             # .debs: amd64 + i386 + arm64 + armhf + riscv64
 make android          # debug APK into dist/
+make electron         # run the desktop client
+make electron-test    # its unit suite (a whole cluster in one process)
 make test-race        # the full test suite under the race detector
+make e2e              # hermetic multi-node run in Docker
 make help             # full list of targets
 ```
 
+### End-to-end tests
+
+`make e2e` builds the real binaries into an image and runs a cluster of
+containers on a private network — a rendezvous, three peers, a node that
+arrives after the store already has content, one that shuts down mid-run, one
+that restarts with its state file intact, and two strangers that share the
+network but differ in the key or the cluster name. A Go suite in a further
+container drives all of it through the HTTP gateway. Nothing is published to
+the host, no node persists anything outside its container, and the stack comes
+down whether the run passes or fails.
+
+```
+make e2e                          # the whole thing, about a minute
+KEEP_STACK=1 make e2e             # leave it up afterwards to poke at
+E2E_LATE_JOIN_SEC=10 make e2e     # move the timed events around
+```
+
+The unit tests run a whole cluster inside one process over an in-memory
+network, which is the only way to test a partition deterministically — and the
+reason they cannot see anything that goes wrong *between* processes. The
+end-to-end suite is that half: real sockets, real framing, real timing, and
+assertions on the things that only exist between nodes — that a write reaches a
+node it was not sent to, that a stale compare-and-swap is refused everywhere
+rather than just locally, that a joiner ends up with a store nobody replayed to
+it, that a node which shuts down is *announced* rather than merely timed out,
+and that a snapshot merged into history a node already had does not show the
+conversation twice.
+
+### Debian packages
+
 A single `.deb` installs both `/usr/bin/rezoagwe-bootstrap` and
-`/usr/bin/rezoagwe-discovery`. To package a single arch directly:
+`/usr/bin/rezoagwe-discovery`. `make debs` builds every architecture; to package
+one directly:
 
 ```
 ./build-deb.sh amd64
 ./build-deb.sh i386
-./build-deb.sh arm64    # or: ./build-deb-arm64.sh
+./build-deb.sh arm64      # or: ./build-deb-arm64.sh
 ./build-deb.sh armhf
+./build-deb.sh riscv64    # or: ./build-licheerv.sh deb
 ```
+
+The version comes from the Makefile, so the package and the binaries inside it
+always agree; `VERSION=0.2.0 ./build-deb.sh amd64` overrides both.
+
+The desktop client is a separate package — `rezoagwe-desktop`, built from
+`electron/` — so the two install side by side.
 
 ### Usage
 
@@ -124,6 +168,30 @@ Nodes only talk to peers with the same `-cluster` **and** `-psk`. Without a
 `-psk` the framing key comes from the cluster name alone: that separates two
 clusters sharing a network, but provides no secrecy.
 
+### Desktop app
+
+```
+make electron              # run it
+make electron-test         # unit suite, no display needed
+make electron-selftest     # boot the window and drive every screen
+make electron-verify       # suite + window + a packaged binary's own selftest
+make electron-binary       # unpacked build   -> electron/dist/linux-unpacked/
+make electron-deb          # .deb             -> electron/dist/
+make electron-debs         # .debs for amd64 + arm64 + armhf
+make electron-appimage     # portable AppImage
+make electron-dist         # deb + AppImage
+```
+
+The `.deb` installs as **`rezoagwe-desktop`** under `/opt/Rezoagwe`, with a
+launcher on the PATH and a desktop entry, so it sits alongside the `rezoagwe`
+package that carries the two Go binaries rather than colliding with it. On a
+machine with no network and no `fpm`, `make -C electron deb-manual` builds the
+same package with `dpkg-deb` alone.
+
+Point it at a rendezvous service in **Settings** (seeds, cluster name and key),
+and it joins as a peer: the store, the chat, the gossip and the anti-entropy all
+run in the app. See [electron/README.md](electron/README.md).
+
 ### Hotkeys (discovery TUI)
 
 | Key             | Action                                          |
@@ -133,6 +201,8 @@ clusters sharing a network, but provides no secrecy.
 | `d`             | Delete key under cursor                         |
 | `h`             | Version history of the key under cursor         |
 | `/`             | Focus the filter; type to filter keys/values    |
+| `Enter` (filter)| Back to the keys list, filter kept              |
+| `Esc` (filter)  | Clear the filter and go back to the keys list   |
 | `a`             | Switch the feed between chat and activity       |
 | `m`             | Replication metrics                             |
 | `x` / `i`       | Export / import the store                       |
@@ -185,7 +255,9 @@ cd android && ./gradlew :app:assembleDebug
 It shares no code with the Go implementation, only the protocol, so parity
 is pinned by tests: a frame produced by the Go codec is decoded by the
 Kotlin one, and an opt-in live test joins a running Go cluster and
-replicates through it in both directions.
+replicates through it in both directions. It has been run on a tablet against
+a Go cluster on a real LAN — see [android/README.md](android/README.md) for what
+that verified and the one bug it found.
 
 ### Status
 

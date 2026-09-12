@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'"
+    />
+    <title>Rezoagwe</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header id="topbar">
+      <span id="status-dot" class="dot"></span>
+      <span id="status-label" class="status-label">STARTING</span>
+      <span id="status-addr" class="mono addr"></span>
+      <span id="status-chips" class="chips"></span>
+      <span class="spacer"></span>
+      <button id="btn-node" type="button" class="btn">Start node</button>
+      <button id="btn-split" type="button" class="btn ghost" title="Show a second pane">Split</button>
+    </header>
+
+    <div id="body">
+      <nav id="rail" aria-label="Screens"></nav>
+      <main id="panes">
+        <section class="pane" id="pane-main" data-screen="keys">
+          <div class="pane-caption"><span class="caption-title"></span></div>
+          <div class="pane-body"></div>
+        </section>
+      </main>
+    </div>
+
+    <div id="toasts" aria-live="polite"></div>
+    <div id="modal-root"></div>
+
+    <script src="shared.js"></script>
+    <script src="graph.js"></script>
+    <script src="renderer.js"></script>
+  </body>
+</html>

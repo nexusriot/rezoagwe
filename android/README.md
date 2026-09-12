@@ -128,10 +128,28 @@ REZOAGWE_GO_PSK=demo REZOAGWE_GO_CLUSTER=e2e \
   ./gradlew :app:testDebugUnitTest --tests '*GoInteropTest'
 ```
 
+## Verified on hardware
+
+Run on a PRITOM M10 tablet (Android 16, 1280x800) against a Go cluster on the
+same Wi-Fi LAN: all three layout tiers, inset and keyboard handling, Keys CRUD
+with TTL and a refused *Guard* write, chat both ways including `/me` and `/msg`,
+the Graph's node detail / *Sync from* / *Forget* and the heal that follows,
+Diag's health checks, the phone as the rendezvous service accepting a real Go
+node, and the foreground service surviving screen-off, the loss of adb and a
+full restart of the Go cluster.
+
+That run is also what found the bug this app's tests now guard against: **every
+UDP send made from a Compose callback was silently dropped**, because Android
+refuses a socket write on the main thread and the failure was being counted
+rather than surfaced. A UI key write took ~10 s to reach a peer (it arrived only
+on the next anti-entropy round) and *Stop node* never sent its `Goodbye` at all.
+Dispatching those calls to `Dispatchers.IO` took the same write to 234 ms and the
+goodbye to 285 ms. `UiThreadingTest` scans `ui/` and `service/` and fails on any
+call in its denylist that is not inside a `Dispatchers.IO` block, so the
+regression cannot come back quietly.
+
 ## Known gaps
 
-* Verified against a live Go cluster, on an emulator (phone and tablet
-  window sizes) — but not yet on a physical phone. The battery cost of the
-  10 s gossip tick is unmeasured; **Diag** at least reports whether Doze
-  applies and links to the exemption setting.
+* The battery cost of the 10 s gossip tick is still unmeasured; **Diag**
+  reports whether Doze applies and links to the exemption setting.
 * No import/export UI yet; the engine supports both.

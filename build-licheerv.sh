@@ -5,7 +5,10 @@
 #   ./build-licheerv.sh deb       -> riscv64 .deb into build/
 set -e
 
-version=0.0.3
+# One source of truth for the version: the Makefile. Hardcoding it here is how
+# this script came to build 0.0.3 packages long after the Makefile had moved on.
+version="${VERSION:-$(sed -n 's/^VERSION[[:space:]]*?*=[[:space:]]*//p' "$(dirname "$0")/Makefile" | head -1)}"
+version="${version:-0.0.0}"
 
 if [ "${1:-}" = "deb" ]; then
   dir="$(cd "$(dirname "$0")" && pwd)"

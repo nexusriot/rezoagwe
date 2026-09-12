@@ -1,0 +1,10 @@
+# The image only needs the Go sources: everything else is weight in the build
+# context, and the Android tree alone is larger than the rest of the repository.
+.git
+android
+build
+dist
+DEBIAN
+*.png
+*.drawio
+*.deb

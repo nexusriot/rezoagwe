@@ -1,0 +1,190 @@
+# A real rezoagwe cluster on a private network, plus the suite that drives it.
+#
+# Nothing is published to the host and no state outlives the run: every node
+# runs with `-data -`, so a repeat run starts from an empty keyspace rather than
+# from whatever the last one left behind.
+#
+# The cast is deliberate. Three peers are the smallest cluster where a write has
+# to reach somewhere it was not sent; the late joiner arrives after the store
+# already has content, so it can only get it by syncing; the leaver shuts down
+# mid-run so departure is observable; and the two strangers share the network
+# and the rendezvous address while differing in the key or the cluster name,
+# which is the only thing standing between them and the data.
+name: rezoagwe-e2e
+
+x-node: &node
+  build:
+    context: ..
+    dockerfile: e2e/Dockerfile
+  # A node that cannot reach the rendezvous is a test that fails for the wrong
+  # reason, so let compose start it first.
+  depends_on: [bootstrap]
+  healthcheck:
+    test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8080/health"]
+    interval: 1s
+    timeout: 2s
+    retries: 40
+    start_period: 1s
+
+services:
+  bootstrap:
+    build:
+      context: ..
+      dockerfile: e2e/Dockerfile
+    entrypoint: ["rezoagwe-bootstrap"]
+    command:
+      - -headless
+      - -port=9999
+      - -psk=e2e-secret
+      - -cluster=e2e
+      - -data=-
+
+  node-a:
+    <<: *node
+    command: &node-flags
+      - -headless
+      - -node=node-a:3137
+      - -bootstrap=bootstrap:9999
+      - -psk=e2e-secret
+      - -cluster=e2e
+      - -nick=alice
+      - -http=:8080
+      - -data=-
+
+  node-b:
+    <<: *node
+    command:
+      - -headless
+      - -node=node-b:3137
+      - -bootstrap=bootstrap:9999
+      - -psk=e2e-secret
+      - -cluster=e2e
+      - -nick=bob
+      - -http=:8080
+      - -data=-
+
+  node-c:
+    <<: *node
+    command:
+      - -headless
+      - -node=node-c:3137
+      - -bootstrap=bootstrap:9999
+      - -psk=e2e-secret
+      - -cluster=e2e
+      - -nick=carol
+      - -http=:8080
+      - -data=-
+
+  # Joins once the cluster already holds data. Nothing is replayed to it: the
+  # only way it can end up with the store is to sync for it.
+  node-late:
+    <<: *node
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        sleep "${E2E_LATE_JOIN_SEC:-25}";
+        exec rezoagwe-discovery -headless -node=node-late:3137 -bootstrap=bootstrap:9999
+        -psk=e2e-secret -cluster=e2e -nick=dave -http=:8080 -data=-
+
+  # Leaves cleanly part way through the run. SIGTERM is the signal compose and
+  # Kubernetes both send, and the node answers it by announcing its departure
+  # rather than going quiet and making its peers wait out the eviction timer.
+  node-leaver:
+    <<: *node
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        rezoagwe-discovery -headless -node=node-leaver:3137 -bootstrap=bootstrap:9999
+        -psk=e2e-secret -cluster=e2e -nick=erin -http=:8080 -data=- &
+        pid=$$!;
+        sleep "${E2E_LEAVE_SEC:-45}";
+        kill -TERM $$pid;
+        wait $$pid
+
+  # Stops and comes back on the same address with its state file intact. A node
+  # that restarts already holds most of the history it is about to be handed
+  # again, which is the case where merging a snapshot by appending it shows the
+  # same conversation twice — and the case a cluster that never restarts will
+  # never show you.
+  node-restart:
+    <<: *node
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        rezoagwe-discovery -headless -node=node-restart:3137 -bootstrap=bootstrap:9999
+        -psk=e2e-secret -cluster=e2e -nick=frank -http=:8080 -data=/tmp/rezoagwe.json &
+        pid=$$!;
+        sleep "${E2E_RESTART_SEC:-30}";
+        kill -TERM $$pid;
+        wait $$pid;
+        sleep 2;
+        exec rezoagwe-discovery -headless -node=node-restart:3137 -bootstrap=bootstrap:9999
+        -psk=e2e-secret -cluster=e2e -nick=frank -http=:8080 -data=/tmp/rezoagwe.json
+
+  # Right cluster, wrong key. It knows the rendezvous address and shares the
+  # network, so only the key is keeping it out.
+  stranger-key:
+    <<: *node
+    depends_on: [bootstrap]
+    command:
+      - -headless
+      - -node=stranger-key:3137
+      - -bootstrap=bootstrap:9999
+      - -psk=not-the-key
+      - -cluster=e2e
+      - -nick=mallory
+      - -http=:8080
+      - -data=-
+
+  # Right key, wrong cluster name — the other half of the same claim.
+  stranger-cluster:
+    <<: *node
+    depends_on: [bootstrap]
+    command:
+      - -headless
+      - -node=stranger-cluster:3137
+      - -bootstrap=bootstrap:9999
+      - -psk=e2e-secret
+      - -cluster=somewhere-else
+      - -nick=trudy
+      - -http=:8080
+      - -data=-
+
+  tests:
+    image: golang:1.22-alpine
+    depends_on:
+      node-a: {condition: service_healthy}
+      node-b: {condition: service_healthy}
+      node-c: {condition: service_healthy}
+      # The strangers only have to be running: the suite asserts they never get
+      # anywhere, which is not something to wait on a healthcheck for.
+      stranger-key: {condition: service_started}
+      stranger-cluster: {condition: service_started}
+      node-late: {condition: service_started}
+      node-leaver: {condition: service_started}
+      node-restart: {condition: service_started}
+    environment:
+      E2E_NODE_A: "http://node-a:8080"
+      E2E_NODE_B: "http://node-b:8080"
+      E2E_NODE_C: "http://node-c:8080"
+      E2E_NODE_LATE: "http://node-late:8080"
+      E2E_NODE_LEAVER: "http://node-leaver:8080"
+      E2E_NODE_RESTART: "http://node-restart:8080"
+      E2E_STRANGER_KEY: "http://stranger-key:8080"
+      E2E_STRANGER_CLUSTER: "http://stranger-cluster:8080"
+      E2E_LATE_JOIN_SEC: "${E2E_LATE_JOIN_SEC:-25}"
+      E2E_LEAVE_SEC: "${E2E_LEAVE_SEC:-45}"
+      E2E_RESTART_SEC: "${E2E_RESTART_SEC:-30}"
+      # The suite is standard-library only, so it needs no module downloads and
+      # a failure to reach a proxy should be loud rather than slow.
+      GOFLAGS: "-mod=mod"
+      GOPROXY: "off"
+      CGO_ENABLED: "0"
+    volumes:
+      - ./:/e2e:ro
+      - go-build-cache:/root/.cache/go-build
+    working_dir: /e2e
+    command: ["go", "test", "-v", "-count=1", "-timeout", "8m", "./..."]
+
+volumes:
+  go-build-cache:
