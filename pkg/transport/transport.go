@@ -37,6 +37,11 @@ type Transport interface {
 	Streams() <-chan net.Conn
 	// LocalAddr is the address peers should use to reach this transport.
 	LocalAddr() string
+	// StreamsAvailable reports whether Dial and Streams can be used. A UDP
+	// transport whose TCP listener was refused still works, falling back to
+	// datagram state sync — but a large store then takes several gossip rounds
+	// to converge, which is a diagnosis nobody can make from a counter.
+	StreamsAvailable() bool
 	Close() error
 }
 

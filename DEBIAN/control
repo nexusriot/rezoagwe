@@ -2,5 +2,13 @@ Package: rezoagwe
 Version: _version_
 Architecture: amd64
 Maintainer: Vladislav Ananev <nexus.riot@gmail.com>
-Description: PoC distributed KV store with chat (bootstrap + discovery TUI nodes)
+Depends: adduser
+Description: Distributed KV store with chat (rendezvous + peer nodes)
+ Eventually-consistent key-value store with per-key last-write-wins,
+ anti-entropy reconciliation, compare-and-swap, key TTLs and an
+ authenticated wire, plus an embedded chat.
+ .
+ Ships two binaries: rezoagwe-bootstrap, the rendezvous service, and
+ rezoagwe-discovery, a full peer node with a TUI and an HTTP gateway.
+ Both have systemd units, neither is enabled on install.
 Installed-Size: 12000

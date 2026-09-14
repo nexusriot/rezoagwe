@@ -8,6 +8,7 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
+	"github.com/nexusriot/rezoagwe/pkg/discovery/model"
 	pb "github.com/nexusriot/rezoagwe/pkg/proto"
 	"github.com/nexusriot/rezoagwe/pkg/transport"
 )
@@ -23,14 +24,27 @@ func (n *Node) packetLoop() {
 			if !ok {
 				return
 			}
-			n.handlePacket(pkt.Data)
+			n.handlePacket(pkt.From, pkt.Data)
 		}
 	}
 }
 
-func (n *Node) handlePacket(frame []byte) {
+// handlePacket authenticates one datagram. from is the source address the
+// transport observed, which is generally *not* the address the sender
+// advertises: a peer is keyed by the host:port it tells the cluster about, and
+// its packets arrive from a resolved IP and an ephemeral-looking source.
+//
+// Received traffic is therefore attributed to the address the body claims,
+// falling back to the source when there is none. Keying it on the source
+// instead left every peer's receive count at zero on any network where the
+// advertised address is a hostname — which then read, to the diagnostics, as
+// "this peer never answered".
+func (n *Node) handlePacket(from string, frame []byte) {
+	src := model.NormalizeAddr(from)
 	kind, body, err := n.codec.Decode(frame)
 	if err != nil {
+		// An unauthenticated packet has no trustworthy body, so there is
+		// nothing to attribute it to but where it came from.
 		switch {
 		case errors.Is(err, pb.ErrBadMAC):
 			n.Metrics.AuthFailures.Add(1)
@@ -41,11 +55,37 @@ func (n *Node) handlePacket(frame []byte) {
 		default:
 			n.Metrics.MalformedDrops.Add(1)
 		}
-		log.Debugf("drop %s packet: %s", kind, err)
+		n.Metrics.RejectedFrom(src)
+		n.noteStranger(src, "")
+		log.Debugf("drop %s packet from %s: %s", kind, from, err)
 		return
 	}
-	n.Metrics.Recv(kind, len(frame))
+	claimed := senderOf(body)
+	attribution := src
+	if claimed != "" {
+		attribution = model.NormalizeAddr(claimed)
+	}
+	n.Metrics.RecvFrom(attribution, kind, len(frame))
+	n.noteStranger(src, claimed)
 	n.dispatch(kind, body)
+}
+
+// senderOf reads the address a body claims to come from. Almost every message
+// carries one — "from" on the protocol messages, "sender" on chat — and it is
+// the address the cluster knows the peer by. Protocol code trusts the body over
+// the transport for exactly this reason (see transport.Packet).
+func senderOf(body []byte) string {
+	var v struct {
+		From   string `json:"from"`
+		Sender string `json:"sender"`
+	}
+	if err := json.Unmarshal(body, &v); err != nil {
+		return ""
+	}
+	if v.From != "" {
+		return v.From
+	}
+	return v.Sender
 }
 
 func (n *Node) dispatch(kind pb.MessageKind, body []byte) {
@@ -72,6 +112,10 @@ func (n *Node) dispatch(kind pb.MessageKind, body []byte) {
 		n.handleDigest(body)
 	case pb.KindPullRequest:
 		n.handlePullRequest(body)
+	case pb.KindFingerprint:
+		n.handleFingerprint(body)
+	case pb.KindFingerprintOK:
+		n.handleFingerprintReply(body)
 	case pb.KindBootstrapRoster:
 		n.handleBootstrapRoster(body)
 	default:
@@ -179,7 +223,7 @@ func (n *Node) handleDirectMessage(body []byte) {
 		Nick:   m.Nick,
 		Text:   m.Text,
 		Kind:   pb.ChatDirect,
-		To:     n.cfg.NodeAddr,
+		To:     n.cfg.AdvertiseAddr,
 	})
 }
 
@@ -237,6 +281,7 @@ func (n *Node) handlePeerGossip(body []byte) {
 	if g.ID != "" {
 		n.Model.SetNodeID(g.ID, g.From)
 	}
+	n.Model.RecordPeerView(g.From, g.Peers)
 	changed := false
 	if n.Model.AddPeer(g.From) {
 		changed = true
@@ -289,6 +334,7 @@ func (n *Node) handleGoodbye(body []byte) {
 		nick = n.Model.NickOf(g.From)
 	}
 	n.Model.RemovePeer(g.From)
+	n.forgetPeerCursor(g.From)
 	n.announceLeave(g.From, nick)
 	n.ev.PeersChanged()
 }
@@ -356,6 +402,23 @@ func (n *Node) serveStream(conn net.Conn) {
 			return
 		}
 		n.Metrics.Sent(pb.KindStateResponse, len(resp))
+	case pb.KindFingerprint:
+		var req pb.Fingerprint
+		if !n.unmarshal(body, &req) {
+			return
+		}
+		n.Model.TouchPeer(req.From)
+		resp, err := n.codec.Encode(pb.KindFingerprintOK, n.fingerprintReply())
+		if err != nil {
+			log.Errorf("encode fingerprint: %s", err)
+			return
+		}
+		if err := transport.WriteFrame(conn, resp); err != nil {
+			n.Metrics.StreamErrors.Add(1)
+			log.Debugf("write fingerprint: %s", err)
+			return
+		}
+		n.Metrics.Sent(pb.KindFingerprintOK, len(resp))
 	default:
 		// Everything else belongs on the datagram path.
 		n.dispatch(kind, body)

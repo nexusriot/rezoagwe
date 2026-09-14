@@ -1,6 +1,6 @@
 {
   "name": "rezoagwe-desktop",
-  "version": "0.2.0",
+  "version": "0.4.0",
   "private": true,
   "description": "Desktop client for rezoagwe: the discovery node and the bootstrap (rendezvous) service in one Electron app, speaking the Go wire protocol, with the cluster drawn as a graph.",
   "author": "nexusriot",
@@ -38,7 +38,7 @@
     "productName": "Rezoagwe",
     "executableName": "rezoagwe-desktop",
     "artifactName": "${name}_${version}_${arch}.${ext}",
-    "copyright": "Copyright © 2026 nexusriot",
+    "copyright": "Copyright \u00a9 2026 nexusriot",
     "files": [
       "src/**/*",
       "renderer/**/*",

@@ -1,0 +1,9 @@
+# Arguments for rezoagwe-bootstrap. See rezoagwe-bootstrap -h.
+#
+#   -port     UDP and TCP port to listen on (default 9999)
+#   -cluster  cluster name; nodes only talk to their own cluster
+#   -psk      pre-shared key authenticating every packet
+#
+# Without a -psk the framing key comes from the cluster name alone: that keeps
+# two clusters on one network apart, but provides no secrecy.
+REZOAGWE_BOOTSTRAP_ARGS="-port 9999"

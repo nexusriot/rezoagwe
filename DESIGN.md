@@ -52,7 +52,7 @@ engine calls and repaints on engine events.
 rezoagwe/
 ├── cmd/
 │   ├── bootstrap/bootstrap.go       -port/-psk/-cluster/-headless → Controller
-│   └── discovery/discovery.go       -bootstrap/-node/-http/-headless → Controller
+│   └── discovery/discovery.go       -bootstrap/-node/-advertise/-http/-doctor → Controller
 │
 ├── pkg/
 │   ├── proto/
@@ -64,7 +64,7 @@ rezoagwe/
 │   │   ├── udp.go                   one shared socket for datagrams + TCP streams
 │   │   └── mem.go                   in-process network with loss/dup/delay/partitions
 │   │
-│   ├── metrics/metrics.go           counters + Prometheus exposition
+│   ├── metrics/metrics.go           counters, per-peer traffic, gauges, Prometheus
 │   │
 │   ├── bootstrap/
 │   │   ├── model/model.go           roster + persistence + stale eviction
@@ -81,8 +81,12 @@ rezoagwe/
 │       ├── node/antientropy.go      digest exchange and repair
 │       ├── node/statesync.go        stream state sync + bootstrap handshake
 │       ├── node/chat.go             chat, direct messages, slash commands
+│       ├── node/consistency.go      fingerprint exchange: are the replicas equal?
+│       ├── node/diagnose.go         assembles the diagnostics snapshot
 │       ├── node/api.go              public operations (Set/CAS/Import/…)
-│       ├── httpapi/httpapi.go       REST gateway
+│       ├── topology/topology.go     the cluster graph, from gossiped peer lists
+│       ├── diagnostics/diagnostics.go  counters → causes, as pure rules
+│       ├── httpapi/httpapi.go       REST gateway (token, TLS, read-only)
 │       ├── view/view.go             keys / details / nodes / feed / input
 │       └── controller/controller.go TUI glue implementing node.Events
 │
@@ -90,9 +94,12 @@ rezoagwe/
 ├── electron/                        JS port: node + bootstrap + desktop UI
 ├── e2e/                             containerised cluster + the suite that drives it
 ├── scripts/                         e2e.sh and its shell helpers
-├── DEBIAN/                          Debian packaging metadata
+├── packaging/                       systemd units, /etc/default files, layout.sh
+├── DEBIAN/                          Debian packaging metadata + maintainer scripts
+├── .github/workflows/ci.yml         Go, cross-build, desktop, Android, e2e
 ├── Makefile                         cross-build + deb + android + electron targets
 ├── README.md
+├── ROADMAP.md                       the prioritized backlog
 └── DESIGN.md                        this document
 ```
 
@@ -146,6 +153,8 @@ so a payload larger than a datagram needs no separate chunking protocol.
 | 8    | `PullRequest`        | anti-entropy: "(re)send me these keys"           |
 | 9    | `KVBatch`            | several updates in one packet (repair traffic)   |
 | 10   | `DirectMessage`      | chat to one peer only                            |
+| 11   | `Fingerprint`        | "summarise your whole store"                     |
+| 12   | `FingerprintReply`   | bucket digests over the whole keyspace           |
 | 20   | `BootstrapRegister`  | "I exist at `addr`"                              |
 | 21   | `BootstrapDiscover`  | "who is in the cluster?"                         |
 | 22   | `BootstrapRoster`    | the roster, with nicknames                       |
@@ -187,7 +196,17 @@ stall startup.
   not values, so a round is cheap. The receiver answers with a `KVBatch`
   of anything it holds newer (or that the sender is missing entirely) and a
   `PullRequest` for anything it lacks. A cursor walks the keyspace so a
-  store larger than one digest is still covered completely.
+  store larger than one digest is still covered completely — **one cursor
+  per peer**, since a shared one divided the ranges among whichever peers
+  the random target happened to pick, so covering the whole store against
+  any single peer took as many wraps as there were peers.
+
+  The digest is never wider than the repair budget (`DigestBatch` is
+  clamped to `min(MaxPush, MaxPull)`). It used to be twice it: a 256-key
+  digest, a 128-entry repair cap, and a cursor that advanced by the whole
+  digest — so the second half of every badly-diverged range was stranded
+  until the cursor wrapped the entire keyspace. On a large store that is
+  not a delay, it is a divergence that outlives the process.
 * **Chat** is a `ChatMessage` broadcast; entries are stored structurally
   (sender, nick, text, kind) rather than pre-rendered, so the TUI, the HTTP
   gateway and the Android app each format them their own way.
@@ -224,9 +243,18 @@ stall startup.
 Each node persists identity, Lamport clock, every entry (tombstones
 included) and the chat ring to a JSON file (`-data`, default
 `<config dir>/rezoagwe/<node>.json`). The file is rewritten atomically
-(temp file + rename) after every change, gated on a monotonically
-increasing generation so a slow, out-of-order write can never regress the
-on-disk copy.
+(temp file + rename), gated on a monotonically increasing generation so a
+slow, out-of-order write can never regress the on-disk copy.
+
+Writes are **coalesced**: a mutation marks the state dirty and a flush loop
+rewrites the file at most once every 250 ms, with a synchronous flush on a
+clean shutdown. It used to be synchronous on every mutation, which meant a
+single `PUT` serialised the entire store — and a 128-entry anti-entropy
+repair serialised it 128 times, once per applied entry. The trade is up to
+250 ms of unflushed work on a `kill -9`; a clean stop loses nothing, and
+anything a hard kill does lose is what anti-entropy re-fetches from a peer.
+The file is compact rather than indented for the same reason: it is read by
+the node, not by a person.
 
 Identity is persisted rather than derived from the listen address: a node
 that moves to a different port is still the same writer, and its version
@@ -323,7 +351,16 @@ by default and its age must exceed the longest partition expected to heal.
   every command the docs offer exists, and that the tables a reader trusts
   instead of the source — §3.2's message kinds, §8's routes, the README's chat
   commands and hotkeys — still describe the code. Prose rots quietly, and this
-  repository has watched it happen.
+  repository has watched it happen. It works: the three routes and two message
+  kinds added for §12–§14 all failed this suite before they were documented.
+* `.github/workflows/ci.yml` runs five jobs on every push: the Go suite under
+  the race detector with `gofmt` and `go vet`, every cross-build target and
+  every `.deb`, the desktop suite, the Android unit tests and APK, and the
+  containerised end-to-end run in a job of its own. Four implementations of one
+  protocol went a long time with nothing running any of it, and the two worst
+  bugs the project has had — a Go nil slice the Kotlin decoder refused, and a
+  UDP send Android silently dropped — were both drift between ports, found by
+  hand, months apart.
 * The desktop port carries the same vectors, plus a multi-node suite of its own:
   a cluster runs inside the test process over an in-memory network, so the
   partition and packet-loss cases are deterministic there too. Its interop test
@@ -334,7 +371,21 @@ by default and its age must exceed the longest partition expected to heal.
 ## 8. HTTP gateway
 
 `-http :8080` exposes the store, which is what makes it scriptable — and
-what makes a cluster testable end to end without a terminal:
+what makes a cluster testable end to end without a terminal.
+
+The gateway is a full read/write control surface on a cluster that
+authenticates every packet on the wire, so it has its own guards:
+`-http-token` requires a bearer token on **every** route (there is no
+exemption for `/health` or `/metrics` — an unauthenticated route is one
+somebody eventually hangs something else off), `-http-tls-cert` and
+`-http-tls-key` serve HTTPS, and `-http-readonly` refuses every mutating
+method. Without a token, anything that can reach the port can rewrite the
+whole cluster through `POST /import?mode=seed`, so the startup line says so
+out loud.
+
+`GET /kv/{key}` honours `If-None-Match` against the same version it puts in
+the `ETag`, so a poller asks "has this changed?" instead of re-fetching a
+value it holds.
 
 | Method   | Path             | Notes                                              |
 |----------|------------------|----------------------------------------------------|
@@ -349,7 +400,10 @@ what makes a cluster testable end to end without a terminal:
 | `GET`    | `/export`        | whole store, versions included                     |
 | `POST`   | `/import`        | merge by version; `?mode=seed` re-stamps as local  |
 | `GET`    | `/health`        | status                                             |
-| `GET`    | `/metrics`       | Prometheus exposition                              |
+| `GET`    | `/metrics`       | Prometheus exposition, counters and gauges         |
+| `GET`    | `/topology`      | the cluster graph (§12)                            |
+| `GET`    | `/diagnostics`   | health findings; `?format=text` for a report (§13) |
+| `GET`    | `/consistency`   | asks every peer what it holds; `409` if they differ (§14) |
 
 ---
 
@@ -363,7 +417,8 @@ duplicated deliberately and pinned by parity tests (§7).
 * `proto/` — the frame codec and message bodies, field-for-field with the
   Go structs.
 * `core/KvStore.kt` — the same versioned store: LWW, CAS, TTL, digests,
-  reconciliation, history, tombstone GC.
+  reconciliation, history, tombstone GC, store limits, and the store
+  fingerprint (§14), whose digests are pinned to Go's byte for byte.
 * `core/NodeEngine.kt` — membership, replication, chat, anti-entropy,
   stream state sync, exposed to Compose as `StateFlow`s.
 * `core/BootstrapServer.kt` — the rendezvous role.
@@ -405,7 +460,8 @@ replication rules in §5 are duplicated deliberately and pinned by parity tests
   are both handled in one place each, since either one silently drops a packet
   that has already authenticated.
 * `src/core/kvstore.js` — the same versioned store: LWW, CAS, TTL, digests,
-  reconciliation, history, tombstone GC.
+  reconciliation, history, tombstone GC, and the store fingerprint (§14), whose
+  digests are pinned to Go's byte for byte.
 * `src/core/node-engine.js` — membership, replication, chat, anti-entropy and
   stream state sync, exposed to the UI as events rather than polling.
 * `src/core/bootstrap-server.js` — the rendezvous role.
@@ -445,14 +501,20 @@ replicates through them in both directions.
 | Area             | Limitation                                                        | Possible fix                                  |
 |------------------|-------------------------------------------------------------------|-----------------------------------------------|
 | Consistency      | Last-write-wins by wall-order, not consensus; CAS is checked locally | Raft/Paxos for a real linearizable store    |
-| Liveness         | Heartbeat is best-effort; no quorum membership view                | Acked ping + quorum view                      |
-| Security         | HMAC authenticates and separates clusters, but payloads are plaintext and the psk is shared symmetrically | Per-node keys, encryption, key rotation |
+| Data model       | Every value is an LWW string, so concurrent writes lose data by design | Typed values: PN-counters, OR-sets       |
+| Liveness         | Heartbeat is best-effort; no quorum membership view                | Acked ping with a suspicion phase             |
+| Security         | The frame is authenticated but the body is plaintext, and one psk means any member can impersonate any other | AEAD payloads; per-node keys |
 | Bootstrap        | Seeds are static                                                   | mDNS / DNS-SD discovery on a LAN              |
-| State sync       | Pulls from one random peer                                         | Pull from a quorum                            |
-| Anti-entropy     | Digest is per-key, so a huge store costs many rounds               | Merkle tree over key ranges                   |
+| State sync       | Pulls from one random peer, so a joiner inherits that peer's gaps  | Pull from several and merge                   |
+| Anti-entropy     | Digest is per-key, so a huge store still costs many rounds even now that each one repairs everything it covers | Merkle tree over key ranges |
+| Persistence      | A `kill -9` can lose up to 250 ms of writes, and the whole store is rewritten per flush | Append-only log + periodic snapshot |
+| Store limits     | `-max-value-bytes` / `-max-keys` refuse a peer's update, which is a deliberate divergence nothing on the wire reports | Advertise limits so peers stop sending |
+| Consistency check | Reports *that* two replicas differ and in which bucket, not which key | A per-bucket key listing on request         |
 | Tombstones       | GC is age-based and off by default                                 | Track cluster-wide acknowledgement            |
 | Chat             | No history beyond the ring, no attachments                         | Paged history                                 |
-| Android          | Runs on hardware; the battery cost of the 10 s gossip tick is unmeasured | Measure it over a night                       |
+| Watch            | Every consumer polls, though the engine knows exactly when a key changed | SSE on `/kv?watch=`                     |
+| Android          | Runs on hardware; the battery cost of the 10 s gossip tick is still unmeasured | Measure it over a night |
+| Store limits UI  | `maxValueBytes` / `maxKeys` are constructor options in the Kotlin and JavaScript engines, but neither Settings screen exposes them; only the Go node has flags | Add the two fields to both settings screens |
 | Desktop          | Closing the window stops the node on Linux and Windows: no tray icon | Tray icon + close-to-tray                     |
 
 For a prioritized version of this list — with effort estimates and what has
@@ -460,7 +522,116 @@ already shipped — see [ROADMAP.md](ROADMAP.md).
 
 ---
 
-## 12. Why "rezoagwe"?
+## 12. Topology
+
+`pkg/discovery/topology` assembles the cluster graph from state the node
+already holds: its own peer table, and the peer lists its peers have
+gossiped (`Model.RecordPeerView`). No extra protocol — the picture is
+exactly as complete as gossip has made it, which is itself the diagnostic.
+
+Two distinctions carry all the value:
+
+* **Role** — `self`, `direct` (a peer we exchange packets with) or
+  `indirect` (a node only ever mentioned by someone else).
+* **Link kind** — `direct` (touches this node, so observed first-hand),
+  `mutual` (both ends claim it) or `observed` (one end only). A gossip
+  packet carries the sender's own peer list, so a link only one end reports
+  is a link one end cannot see. Telling that apart from an agreed one is
+  what makes a half-open cluster visible instead of looking healthy.
+
+`Components` groups nodes reachable through known links. More than one
+group is a partition: each half converges internally and diverges from the
+other, and nothing in the KV protocol reports that. Placement is
+deterministic — self in the middle, peers on the first shell, hearsay
+further out, ordered by sorted address — so the drawing does not reshuffle
+between refreshes.
+
+The Android and desktop ports have had this since they were written. The Go
+node, which is the one most likely to be running headless on a server,
+could only list its peers; a list cannot show a partition.
+
+## 13. Diagnostics
+
+`pkg/discovery/diagnostics` turns the counters into the short list of
+things actually wrong. Every rule is a claim about the protocol — "auth
+failures mean a key mismatch", "one-way traffic is a firewall, not loss" —
+and a claim like that is worth a test, which is why `Checks` is a pure
+function of a `Snapshot` rather than something the engine does to itself.
+`node.Diagnostics()` assembles the snapshot; the package never reaches into
+a live node.
+
+What it needed that the engine did not have:
+
+* **Per-peer traffic.** A global counter cannot tell a quiet peer from an
+  unreachable one. `metrics` now counts packets and bytes per address in
+  both directions, plus per-address send errors and authentication
+  rejections, and keeps the last send error whole — "12 send errors" is not
+  actionable, "no route to 10.0.0.4:3137" is.
+* **The source address.** `handlePacket` takes the address the transport
+  saw, not just the body. A node whose advertised address differs from
+  where its packets come from is a NAT or a wrong `-advertise`, and it is
+  invisible unless unknown sources are recorded (`Node.Strangers`).
+* **A key fingerprint.** Two nodes that cannot talk usually differ in the
+  psk or the cluster name, and neither is printable. `Codec.KeyFingerprint`
+  is comparable at a glance and gives nothing away.
+
+Findings are available three ways: `GET /diagnostics` (JSON, or
+`?format=text` for something pasteable), `D` in the TUI, and
+`rezoagwe-discovery -doctor`, which starts a node, waits out two heartbeats
+and prints the report. The waiting matters: a node seconds old has not
+failed to do anything yet, and flagging it turns the first moments of every
+start into a red screen.
+
+## 14. Consistency checking
+
+Anti-entropy repairs divergence but never reports it, so a cluster can sit
+split — or a peer can quietly refuse everything it is sent — for as long as
+nobody looks. `KindFingerprint` / `KindFingerprintReply` (§3.2) is the
+looking.
+
+A reply summarises the whole store as 16 bucket digests. A key's bucket
+comes from the hash of its **name alone**; what is folded into that bucket
+is the hash of the whole entry (key, version, deleted). Both halves are
+load-bearing:
+
+* Bucketing on the name keeps a key in one bucket however its value
+  changes, so a differing bucket names a stable region of the keyspace —
+  the only thing that makes "they differ in bucket 7" more useful than
+  "they differ". Bucketing on the whole entry, as the first implementation
+  did, relocates a key on every write: one stale value then lights up two
+  buckets and neither corresponds to anything you could go and inspect.
+* Folding with XOR keeps a bucket independent of the order entries arrived
+  in. Two converged replicas that took the same writes by different routes
+  must produce identical buckets or the check is worthless.
+
+Tombstones are included: two replicas that disagree about whether a key is
+deleted have diverged just as much as two that disagree about its value.
+
+The digests are byte-for-byte identical across the Go and JavaScript
+stores, pinned by fixed vectors in both suites — an implementation that
+folded differently would report two converged replicas as divergent, which
+is the loudest possible false alarm from the one feature whose entire job
+is to be believed.
+
+`Node.CheckConsistency` asks every peer in parallel and compares. It goes
+over **streams, not datagrams**: a dropped answer would read as a peer that
+disagrees, which is exactly the wrong conclusion to draw from packet loss.
+A peer that does not answer is reported as unreachable and counted
+separately — a silent peer says nothing about whether it agrees.
+
+`GET /consistency` answers `200` when every peer that replied agreed and
+`409` when any did not, so a script can branch on the status alone. `v` in
+the TUI runs the same check off the event loop, since dialling an
+unreachable peer must never freeze the terminal.
+
+All three implementations answer, over the stream path and the datagram
+one, and all three initiate: `Node.CheckConsistency` in Go,
+`checkConsistency()` in the Kotlin and JavaScript engines. Their bucket
+digests are pinned to each other by fixed vectors in all three suites, and
+the pairing was exercised on hardware — a Kotlin fold and a Go fold agreeing
+byte for byte across a Wi-Fi LAN.
+
+## 15. Why "rezoagwe"?
 
 [Agwé](https://en.wikipedia.org/wiki/Agw%C3%A9) is the Haitian Vodou
 lwa of the sea — a fitting name for a protocol whose packets drift

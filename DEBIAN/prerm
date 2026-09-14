@@ -1,0 +1,12 @@
+#!/bin/sh
+set -e
+
+if [ -d /run/systemd/system ]; then
+  for unit in rezoagwe-discovery rezoagwe-bootstrap; do
+    # SIGTERM first: a node that is stopped cleanly announces its departure, so
+    # peers drop it at once instead of waiting out the eviction timeout.
+    systemctl stop "$unit.service" >/dev/null 2>&1 || true
+  done
+fi
+
+exit 0

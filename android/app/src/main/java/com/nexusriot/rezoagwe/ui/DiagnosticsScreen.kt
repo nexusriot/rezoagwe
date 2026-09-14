@@ -29,6 +29,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -45,7 +46,11 @@ import com.nexusriot.rezoagwe.core.Severity
 import com.nexusriot.rezoagwe.core.asReport
 import com.nexusriot.rezoagwe.core.deviceReport
 import com.nexusriot.rezoagwe.core.healthChecks
+import com.nexusriot.rezoagwe.proto.FINGERPRINT_BUCKETS
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /** How often the snapshot is retaken. Long enough not to burn battery, short enough to feel live. */
 private const val REFRESH_MS = 2_000L
@@ -57,6 +62,39 @@ private const val REFRESH_MS = 2_000L
  * which mismatch drops those packets, which peer never answers, whether the
  * cluster is split, and whether Android is about to stop the timers.
  */
+/**
+ * The answer to the question anti-entropy never asks out loud: do the replicas
+ * actually hold the same store right now? A divergence that persists across
+ * several checks is the one worth chasing — one that clears is anti-entropy
+ * doing its job.
+ */
+@Composable
+private fun ConsistencyCard(report: NodeEngine.ConsistencyReport) {
+    Section(if (report.converged) "Replicas agree" else "Replicas disagree") {
+        Line("this node", "${report.keys} keys, ${report.tombstones} tombstones, clock ${report.clock}")
+        if (report.peers.isEmpty()) {
+            Line("peers", "none to compare against")
+        }
+        report.peers.forEach { p ->
+            val name = if (p.nick.isNotEmpty()) "${p.nick} (${p.addr})" else p.addr
+            val detail = when {
+                !p.reachable -> "did not answer: ${p.error}"
+                p.agrees -> "agrees — ${p.keys} keys, clock ${p.clock}"
+                else -> "differs in ${p.differingBuckets.size} of $FINGERPRINT_BUCKETS key ranges " +
+                    "(${p.keys} keys, clock ${p.clock})"
+            }
+            Line(name, detail)
+        }
+        if (report.unreachable > 0) {
+            Line(
+                "note",
+                "${report.unreachable} peer(s) did not answer; a silent peer says nothing " +
+                    "about whether it agrees.",
+            )
+        }
+    }
+}
+
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun DiagnosticsScreen(node: NodeEngine, rendezvous: BootstrapServer) {
@@ -65,6 +103,9 @@ fun DiagnosticsScreen(node: NodeEngine, rendezvous: BootstrapServer) {
     val bootstrapStatus by rendezvous.status.collectAsState()
     var generation by remember { mutableIntStateOf(0) }
     var now by remember { mutableStateOf(System.currentTimeMillis()) }
+    val scope = rememberCoroutineScope()
+    var verifying by remember { mutableStateOf(false) }
+    var verdict by remember { mutableStateOf<NodeEngine.ConsistencyReport?>(null) }
 
     LaunchedEffect(Unit) {
         while (true) {
@@ -194,7 +235,7 @@ fun DiagnosticsScreen(node: NodeEngine, rendezvous: BootstrapServer) {
             Line("lamport clock", s.clock.toString())
             Line("keys with history", s.historyKeys.toString())
             if (s.largestKey.isNotEmpty()) Line("largest value", "${s.largestKey} (${formatBytes(s.largestValueBytes.toLong())})")
-            Line("digest cursor", s.digestCursor.ifEmpty { "(start of keyspace)" })
+            Line("anti-entropy", s.digestCursor.ifEmpty { "(no sweep yet)" })
             Line("buffers", "${diagnostics.chatLines} chat lines · ${diagnostics.activityLines} activity lines")
         }
 
@@ -234,10 +275,27 @@ fun DiagnosticsScreen(node: NodeEngine, rendezvous: BootstrapServer) {
             }
         }
 
+        verdict?.let { ConsistencyCard(it) }
+
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             OutlinedButton(onClick = { copyReport(context, diagnostics.asReport(now)) }) { Text("Copy report") }
             OutlinedButton(onClick = { shareReport(context, diagnostics.asReport(now)) }) { Text("Share report") }
             OutlinedButton(onClick = { generation++ }) { Text("Refresh") }
+            OutlinedButton(
+                enabled = !verifying,
+                // Off the main thread: the check dials every peer, and a socket
+                // opened from a Compose callback is refused outright on Android.
+                onClick = {
+                    verifying = true
+                    scope.launch(Dispatchers.IO) {
+                        val r = runCatching { node.checkConsistency() }.getOrNull()
+                        withContext(Dispatchers.Main) {
+                            verdict = r
+                            verifying = false
+                        }
+                    }
+                },
+            ) { Text(if (verifying) "Verifying…" else "Verify replicas") }
         }
 
         Text(

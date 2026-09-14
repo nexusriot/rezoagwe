@@ -147,6 +147,35 @@ class CodecTest {
         }
     }
 
+    /**
+     * The kind table is protocol, and it is read from three places: this app,
+     * the Go node and the desktop client. A number that drifts here is a packet
+     * dispatched to the wrong handler on one implementation only.
+     */
+    @Test
+    fun `the kind table matches the wire protocol`() {
+        val expected = mapOf<Byte, String>(
+            0.toByte() to "kv",
+            1.toByte() to "chat",
+            2.toByte() to "state_request",
+            3.toByte() to "state_response",
+            4.toByte() to "peer_gossip",
+            5.toByte() to "hello",
+            6.toByte() to "goodbye",
+            7.toByte() to "digest",
+            8.toByte() to "pull_request",
+            9.toByte() to "kv_batch",
+            10.toByte() to "direct_message",
+            11.toByte() to "fingerprint",
+            12.toByte() to "fingerprint_reply",
+            20.toByte() to "bootstrap_register",
+            21.toByte() to "bootstrap_discover",
+            22.toByte() to "bootstrap_roster",
+        )
+        expected.forEach { (kind, name) -> assertEquals(name, Kind.name(kind)) }
+        assertEquals("unknown", Kind.name(99.toByte()))
+    }
+
     private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
 
     private fun String.fromHex(): ByteArray =

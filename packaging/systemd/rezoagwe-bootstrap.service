@@ -1,0 +1,35 @@
+[Unit]
+Description=rezoagwe rendezvous service
+Documentation=file:///usr/share/doc/rezoagwe/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rezoagwe
+Group=rezoagwe
+EnvironmentFile=-/etc/default/rezoagwe-bootstrap
+ExecStart=/usr/bin/rezoagwe-bootstrap -headless $REZOAGWE_BOOTSTRAP_ARGS
+Restart=on-failure
+RestartSec=5s
+
+# The roster is the only thing this service writes.
+StateDirectory=rezoagwe
+WorkingDirectory=/var/lib/rezoagwe
+
+# It needs one UDP and one TCP port and nothing else on the machine.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target

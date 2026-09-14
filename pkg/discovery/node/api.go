@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/nexusriot/rezoagwe/pkg/discovery/model"
+	"github.com/nexusriot/rezoagwe/pkg/discovery/topology"
 	pb "github.com/nexusriot/rezoagwe/pkg/proto"
 )
 
@@ -99,6 +100,26 @@ func (n *Node) Peers() []PeerInfo {
 	return out
 }
 
+// Topology assembles the cluster graph from this node's peer table and the
+// peer lists its peers have gossiped.
+func (n *Node) Topology() topology.Graph {
+	peers := make([]topology.Peer, 0)
+	for _, p := range n.Peers() {
+		tp := topology.Peer{Addr: p.Addr, Nick: p.Nick}
+		if p.LastSeen > 0 {
+			tp.LastSeen = time.Unix(p.LastSeen, 0)
+		}
+		peers = append(peers, tp)
+	}
+	return topology.Build(topology.Input{
+		SelfAddr: n.cfg.AdvertiseAddr,
+		SelfNick: n.Model.Nick(),
+		Peers:    peers,
+		Views:    n.Model.PeerViews(),
+		Now:      time.Now(),
+	})
+}
+
 // Chat returns the chat log, oldest first.
 func (n *Node) Chat() []pb.ChatEntry { return n.Model.ChatLog() }
 
@@ -114,7 +135,7 @@ type ExportFile struct {
 // Export serialises the whole store, tombstones included.
 func (n *Node) Export() ([]byte, error) {
 	return json.MarshalIndent(ExportFile{
-		Node:       n.cfg.NodeAddr,
+		Node:       n.cfg.AdvertiseAddr,
 		Cluster:    n.cfg.Cluster,
 		ExportedAt: time.Now().Unix(),
 		Entries:    n.Model.Store.Updates(),
@@ -179,7 +200,7 @@ type Status struct {
 func (n *Node) Status() Status {
 	peers := len(n.Model.GetNodes())
 	return Status{
-		Addr:       n.cfg.NodeAddr,
+		Addr:       n.cfg.AdvertiseAddr,
 		Nick:       n.Model.Nick(),
 		NodeID:     n.Model.NodeID,
 		Cluster:    n.cfg.Cluster,

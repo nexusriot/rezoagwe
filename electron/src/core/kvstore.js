@@ -1,6 +1,10 @@
 'use strict';
 
-const { KVAction, version, versionNewer, versionEqual, versionZero } = require('../proto/wire');
+const { createHash } = require('crypto');
+
+const {
+  KVAction, version, versionNewer, versionEqual, versionZero, FINGERPRINT_BUCKETS,
+} = require('../proto/wire');
 
 /** How many versions of a key are remembered. History is a debugging aid: neither persisted nor synced. */
 const HISTORY_PER_KEY = 20;
@@ -18,6 +22,12 @@ class KvStore {
   constructor(nodeId, opts = {}) {
     this.nodeId = nodeId;
     this.nowSec = opts.nowSec || (() => Math.floor(Date.now() / 1000));
+    // Bounds on what the store will hold, from a local writer or a peer. Off by
+    // default: a limit is a choice to stay up rather than to converge, since an
+    // update refused for size is a deliberate divergence nothing on the wire
+    // reports. Set the same values on every replica or the cluster splits along
+    // whichever node was configured tightest.
+    this.limits = { maxValueBytes: 0, maxKeys: 0, ...(opts.limits || {}) };
     this.clock = 0;
     this.store = new Map();
     this.history = new Map();
@@ -57,6 +67,22 @@ class KvStore {
     return { clock: this.clock, entries };
   }
 
+  setLimits(limits) {
+    this.limits = { maxValueBytes: 0, maxKeys: 0, ...(limits || {}) };
+  }
+
+  /** Whether a value of this size may be stored under this key. */
+  admits(key, value, nowSec) {
+    const { maxValueBytes, maxKeys } = this.limits;
+    if (maxValueBytes > 0 && Buffer.byteLength(value, 'utf8') > maxValueBytes) return false;
+    if (maxKeys <= 0) return true;
+    const existing = this.store.get(key);
+    if (existing && KvStore.visible(existing, nowSec)) return true; // an update never grows the keyspace
+    let live = 0;
+    for (const e of this.store.values()) if (KvStore.visible(e, nowSec)) live++;
+    return live < maxKeys;
+  }
+
   static expired(e, nowSec) {
     return e.expiresAt !== 0 && nowSec >= e.expiresAt;
   }
@@ -91,6 +117,7 @@ class KvStore {
 
   mutate(key, value, remove, opt) {
     const now = this.nowSec();
+    if (!remove && !this.admits(key, value, now)) return null;
     if (opt.expect) {
       const current = this.store.get(key);
       if (!current || !KvStore.visible(current, now)) {
@@ -119,6 +146,9 @@ class KvStore {
    */
   apply(u) {
     if (u.version.counter > this.clock) this.clock = u.version.counter;
+    // Enforced against a peer as well as a local writer: a limit that the node
+    // it protects is the only one unable to fill is not a limit.
+    if (u.action !== KVAction.DELETE && !this.admits(u.key, u.value, this.nowSec())) return false;
     const current = this.store.get(u.key);
     if (current && !versionNewer(u.version, current.version)) return false;
     const deleted = u.action === KVAction.DELETE;
@@ -247,6 +277,53 @@ class KvStore {
         const e = this.store.get(k);
         return { key: k, version: e.version, deleted: e.deleted };
       }),
+    };
+  }
+
+  /**
+   * Summarises the whole store as a fixed set of bucket digests, so two
+   * replicas can be compared without shipping either of them.
+   *
+   * A key's bucket comes from the hash of its **name alone**, and what is
+   * folded in is the hash of the whole entry. Bucketing on the name keeps a key
+   * in one place however its value changes, so a differing bucket names a
+   * stable region of the keyspace; folding with XOR keeps a bucket independent
+   * of the order entries were learned in. Tombstones count: two replicas that
+   * disagree about whether a key is deleted have diverged just as much as two
+   * that disagree about its value.
+   *
+   * Byte-for-byte identical to Go's KVStore.Fingerprint, and pinned there.
+   */
+  fingerprint(buckets = FINGERPRINT_BUCKETS) {
+    const n = buckets > 0 ? buckets : FINGERPRINT_BUCKETS;
+    const folds = Array.from({ length: n }, () => Buffer.alloc(32));
+    let keys = 0;
+    let tombstones = 0;
+    const now = this.nowSec();
+
+    for (const [k, e] of this.store) {
+      if (e.deleted) tombstones++;
+      else if (KvStore.visible(e, now)) keys++;
+
+      const nameHash = createHash('sha256').update(k, 'utf8').digest();
+      const idx = nameHash.readUInt32BE(0) % n;
+
+      const sum = createHash('sha256')
+        .update(k, 'utf8')
+        .update(Buffer.from([0]))
+        .update(`${e.version.counter}/${e.version.node}/${e.deleted ? 'true' : 'false'}`, 'utf8')
+        .digest();
+      const fold = folds[idx];
+      for (let i = 0; i < 32; i++) fold[i] ^= sum[i];
+    }
+
+    return {
+      from: '',
+      nick: '',
+      keys,
+      tombstones,
+      clock: this.clock,
+      buckets: folds.map((f) => f.toString('hex')),
     };
   }
 

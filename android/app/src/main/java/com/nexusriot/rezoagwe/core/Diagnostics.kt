@@ -36,6 +36,7 @@ data class StoreDiagnostics(
     val historyKeys: Int = 0,
     val largestKey: String = "",
     val largestValueBytes: Int = 0,
+    /** How far the per-peer anti-entropy sweeps have walked, as one readable line. */
     val digestCursor: String = "",
 )
 

@@ -15,17 +15,22 @@ if [ "${1:-}" = "deb" ]; then
   exec "$dir/build-deb.sh" riscv64
 fi
 
+# The same ldflags the Makefile uses. Without -X, the binaries inside a package
+# stamped with a version report "dev" instead — the same drift the
+# version-from-the-Makefile lookup above exists to prevent, one layer down.
+ldflags="-s -w -X main.version=$version"
+
 dist_dir="dist"
 mkdir -p "$dist_dir"
 
 echo "building rezoagwe $version for LicheeRV Nano (linux/riscv64)"
 
 CGO_ENABLED=0 GOOS=linux GOARCH=riscv64 \
-  go build -trimpath -ldflags "-s -w" \
+  go build -trimpath -ldflags "$ldflags" \
   -o "$dist_dir/rezoagwe-bootstrap-${version}-licheerv-linux-riscv64" ./cmd/bootstrap
 echo ">> $dist_dir/rezoagwe-bootstrap-${version}-licheerv-linux-riscv64"
 
 CGO_ENABLED=0 GOOS=linux GOARCH=riscv64 \
-  go build -trimpath -ldflags "-s -w" \
+  go build -trimpath -ldflags "$ldflags" \
   -o "$dist_dir/rezoagwe-discovery-${version}-licheerv-linux-riscv64" ./cmd/discovery
 echo ">> $dist_dir/rezoagwe-discovery-${version}-licheerv-linux-riscv64"

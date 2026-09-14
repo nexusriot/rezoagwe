@@ -24,6 +24,13 @@ object Kind {
     const val KV_BATCH: Byte = 9
     const val DIRECT_MESSAGE: Byte = 10
 
+    // Allocated by the consistency check (DESIGN §14). This app does not answer
+    // one yet — a checker reports it unreachable rather than divergent — but the
+    // numbers are protocol, so the table stays complete and a packet that does
+    // arrive is labelled rather than counted as "unknown".
+    const val FINGERPRINT: Byte = 11
+    const val FINGERPRINT_REPLY: Byte = 12
+
     const val BOOTSTRAP_REGISTER: Byte = 20
     const val BOOTSTRAP_DISCOVER: Byte = 21
     const val BOOTSTRAP_ROSTER: Byte = 22
@@ -40,6 +47,8 @@ object Kind {
         PULL_REQUEST -> "pull_request"
         KV_BATCH -> "kv_batch"
         DIRECT_MESSAGE -> "direct_message"
+        FINGERPRINT -> "fingerprint"
+        FINGERPRINT_REPLY -> "fingerprint_reply"
         BOOTSTRAP_REGISTER -> "bootstrap_register"
         BOOTSTRAP_DISCOVER -> "bootstrap_discover"
         BOOTSTRAP_ROSTER -> "bootstrap_roster"
@@ -62,6 +71,33 @@ data class Version(
 
     val isZero: Boolean get() = counter == 0L && node.isEmpty()
 }
+
+/**
+ * How finely a store is summarised for a consistency check. Protocol: it must
+ * match the Go and JavaScript stores, or two converged replicas cannot be
+ * compared bucket by bucket.
+ */
+const val FINGERPRINT_BUCKETS = 16
+
+/** Asks a peer to summarise its whole store. */
+@Serializable
+data class Fingerprint(
+    val from: String = "",
+)
+
+/**
+ * A whole-store summary. Anti-entropy repairs divergence but never reports it,
+ * so a cluster can sit split for as long as nobody looks; this is the looking.
+ */
+@Serializable
+data class FingerprintReply(
+    val from: String = "",
+    val nick: String = "",
+    val keys: Int = 0,
+    val tombstones: Int = 0,
+    val clock: Long = 0,
+    val buckets: List<String> = emptyList(),
+)
 
 object KVAction {
     const val SET = "set"

@@ -14,6 +14,8 @@ import com.nexusriot.rezoagwe.proto.Codec
 import com.nexusriot.rezoagwe.proto.DecodeError
 import com.nexusriot.rezoagwe.proto.DecodeException
 import com.nexusriot.rezoagwe.proto.Digest
+import com.nexusriot.rezoagwe.proto.Fingerprint
+import com.nexusriot.rezoagwe.proto.FingerprintReply
 import com.nexusriot.rezoagwe.proto.Goodbye
 import com.nexusriot.rezoagwe.proto.Hello
 import com.nexusriot.rezoagwe.proto.KVAction
@@ -66,10 +68,23 @@ data class NodeConfig(
     val evictThresholdMs: Long = 15_000,
     val sweepIntervalMs: Long = 5_000,
     val tombstoneTtlSec: Long = 0,
-    val digestBatch: Int = 256,
+    /**
+     * How many keys one anti-entropy digest advertises, and how much repair
+     * traffic a single round may trigger.
+     *
+     * digestBatch must not exceed either budget: the sender's cursor advances by
+     * the whole digest, so a range that identified more repairs than one round
+     * can carry has its tail stranded until the cursor wraps the entire keyspace.
+     * [effectiveDigestBatch] clamps it rather than letting that happen quietly.
+     */
+    val digestBatch: Int = 128,
     val maxPush: Int = 128,
     val maxPull: Int = 128,
-)
+    val limits: Limits = Limits(),
+) {
+    /** The digest width the engine actually uses: never wider than one round can repair. */
+    val effectiveDigestBatch: Int get() = minOf(digestBatch, maxPush, maxPull)
+}
 
 data class Peer(
     val addr: String,
@@ -134,7 +149,11 @@ class NodeEngine(
     private val chatLog = mutableListOf<ChatEntry>()
     private val activityLog = mutableListOf<String>()
     private var persistGen = 0L
-    private var aeCursor = ""
+
+    // One cursor per peer. A shared cursor divided the keyspace among whichever
+    // peers the random target happened to pick, so covering the whole store
+    // against any single peer took as many wraps as there were peers.
+    private val aeCursors = HashMap<String, String>()
     private var startedAtMs = 0L
     private var nick: String = config.nick
 
@@ -167,6 +186,7 @@ class NodeEngine(
         // networks constantly, and its writes have to keep sorting consistently.
         nodeId = saved?.nodeId?.takeIf { it.isNotEmpty() } ?: UUID.randomUUID().toString()
         store = KvStore(nodeId)
+        store.setLimits(config.limits)
         if (saved != null) {
             store.loadState(saved.clock, saved.entries)
             chatLog.addAll(saved.chat)
@@ -281,6 +301,10 @@ class NodeEngine(
         synchronized(lock) {
             peers.remove(peerAddr)
             idToAddr.entries.removeAll { it.value == peerAddr }
+            // A departed peer's cursor goes with it, or a long-running node
+            // accumulates one per address it has ever spoken to, and a peer that
+            // returns resumes a walk from before it left.
+            aeCursors.remove(peerAddr)
         }
         publishPeers()
     }
@@ -566,6 +590,11 @@ class NodeEngine(
                 Kind.GOODBYE -> handleGoodbye(WireJson.decodeFromString<Goodbye>(body))
                 Kind.DIGEST -> handleDigest(WireJson.decodeFromString<Digest>(body))
                 Kind.PULL_REQUEST -> handlePull(WireJson.decodeFromString<PullRequest>(body))
+                Kind.FINGERPRINT -> handleFingerprint(WireJson.decodeFromString<Fingerprint>(body))
+                // The checker reads its answers off the stream it asked over, so a
+                // datagram reply needs accepting but not correlating.
+                Kind.FINGERPRINT_REPLY ->
+                    touchPeer(WireJson.decodeFromString<FingerprintReply>(body).from)
                 Kind.BOOTSTRAP_ROSTER -> applyRoster(WireJson.decodeFromString<BootstrapRoster>(body))
                 else -> metrics.malformedDrops.incrementAndGet()
             }
@@ -721,11 +750,10 @@ class NodeEngine(
     fun antiEntropyRound(target: String) {
         if (target.isEmpty()) return
         val d = synchronized(lock) {
-            val digest = store.digest(aeCursor, config.digestBatch)
-            aeCursor = when {
-                digest.hi.isEmpty() -> "" // covered the tail; start over
-                digest.entries.isNotEmpty() -> digest.entries.last().key
-                else -> aeCursor
+            val digest = store.digest(aeCursors[target] ?: "", config.effectiveDigestBatch)
+            when {
+                digest.hi.isEmpty() -> aeCursors.remove(target) // covered the tail; start over
+                digest.entries.isNotEmpty() -> aeCursors[target] = digest.entries.last().key
             }
             digest
         }
@@ -801,9 +829,148 @@ class NodeEngine(
             val pkt = codec.encode(Kind.STATE_RESPONSE, stateResponse(0))
             writeFrame(conn.getOutputStream(), pkt)
             metrics.sent(Kind.STATE_RESPONSE, pkt.size)
+        } else if (frame.kind == Kind.FINGERPRINT) {
+            val req = WireJson.decodeFromString<Fingerprint>(String(frame.body))
+            touchPeer(req.from)
+            val pkt = codec.encode(Kind.FINGERPRINT_REPLY, fingerprintReply())
+            writeFrame(conn.getOutputStream(), pkt)
+            metrics.sent(Kind.FINGERPRINT_REPLY, pkt.size)
         } else {
             dispatch(frame.kind, String(frame.body))
         }
+    }
+
+    /**
+     * One peer's answer to "what do you hold?".
+     *
+     * [reachable] is false when the peer never answered; a silent peer says
+     * nothing about whether it agrees, so it must not be counted as if it did.
+     */
+    data class PeerConsistency(
+        val addr: String,
+        val nick: String = "",
+        val reachable: Boolean = false,
+        val error: String = "",
+        val keys: Int = 0,
+        val tombstones: Int = 0,
+        val clock: Long = 0,
+        val agrees: Boolean = false,
+        val differingBuckets: List<Int> = emptyList(),
+    )
+
+    /**
+     * The answer to the question anti-entropy never asks out loud: are the
+     * replicas actually the same right now?
+     */
+    data class ConsistencyReport(
+        val addr: String,
+        val keys: Int,
+        val tombstones: Int,
+        val clock: Long,
+        val checkedAtMs: Long,
+        val peers: List<PeerConsistency>,
+        val converged: Boolean,
+        val unreachable: Int,
+    )
+
+    /**
+     * Asks every peer to summarise its store and compares the answers with this
+     * node's.
+     *
+     * Over streams, not datagrams: a dropped answer would read as a peer that
+     * disagrees, which is exactly the wrong conclusion to draw from packet loss.
+     * Blocking, and it dials every peer — callers must be off the main thread.
+     */
+    fun checkConsistency(): ConsistencyReport {
+        val local = store.fingerprint()
+        val results = peerAddrs().map { peerAddr -> fingerprintPeer(peerAddr, local) }.sortedBy { it.addr }
+        return ConsistencyReport(
+            addr = addr,
+            keys = local.keys,
+            tombstones = local.tombstones,
+            clock = local.clock,
+            checkedAtMs = System.currentTimeMillis(),
+            peers = results,
+            converged = results.none { it.reachable && !it.agrees },
+            unreachable = results.count { !it.reachable },
+        )
+    }
+
+    private fun fingerprintPeer(peerAddr: String, local: FingerprintReply): PeerConsistency {
+        val reply = requestFingerprint(peerAddr)
+            ?: return PeerConsistency(addr = peerAddr, nick = nickOf(peerAddr), error = "no answer")
+        if (reply.buckets.size != local.buckets.size) {
+            // A peer summarising at a different granularity cannot be compared
+            // bucket by bucket; say so rather than reporting a false divergence.
+            return PeerConsistency(
+                addr = peerAddr,
+                nick = nickOf(peerAddr),
+                error = "peer reported ${reply.buckets.size} buckets, this node uses ${local.buckets.size}",
+            )
+        }
+        val differing = local.buckets.indices.filter { local.buckets[it] != reply.buckets[it] }
+        return PeerConsistency(
+            addr = peerAddr,
+            nick = reply.nick.ifEmpty { nickOf(peerAddr) },
+            reachable = true,
+            keys = reply.keys,
+            tombstones = reply.tombstones,
+            clock = reply.clock,
+            agrees = differing.isEmpty(),
+            differingBuckets = differing,
+        )
+    }
+
+    /**
+     * One framed round trip that hands the answer back, rather than dispatching
+     * it like [exchangeStream] does. A consistency check needs the reply, not a
+     * side effect.
+     */
+    private fun requestFingerprint(peer: String): FingerprintReply? {
+        val tr = synchronized(lock) { transport } ?: return null
+        val conn = tr.dial(peer) ?: return null
+        return try {
+            val pkt = codec.encode(Kind.FINGERPRINT, Fingerprint(from = addr))
+            writeFrame(conn.getOutputStream(), pkt)
+            metrics.sent(Kind.FINGERPRINT, pkt.size)
+            val frame = codec.decode(readFrame(conn.getInputStream()))
+            metrics.received(frame.kind, frame.body.size)
+            if (frame.kind != Kind.FINGERPRINT_REPLY) null
+            else WireJson.decodeFromString<FingerprintReply>(String(frame.body))
+        } catch (e: Exception) {
+            metrics.streamErrors.incrementAndGet()
+            null
+        } finally {
+            try {
+                conn.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    /**
+     * How far the anti-entropy sweep has walked, as one line.
+     *
+     * There is a cursor per peer now, so a single value would name whichever one
+     * happened to be read. What matters to a reader is how many peers are
+     * part-way through a sweep and where the furthest has reached.
+     */
+    private fun sweepSummary(): String = synchronized(lock) {
+        val known = peers.size
+        if (aeCursors.isEmpty()) return "all $known peer(s) at the start of the keyspace"
+        val furthest = aeCursors.values.maxOrNull() ?: ""
+        "${aeCursors.size} of $known peer(s) mid-sweep, furthest past \"$furthest\""
+    }
+
+    /** This node's store summary, labelled so a report can name who produced it. */
+    fun fingerprintReply(): FingerprintReply =
+        store.fingerprint().copy(from = addr, nick = nick)
+
+    /** Answers a summary request that arrived as a datagram. */
+    private fun handleFingerprint(req: Fingerprint) {
+        if (req.from.isEmpty()) return
+        touchPeer(req.from)
+        send(req.from, Kind.FINGERPRINT_REPLY, fingerprintReply())
     }
 
     /** One framed request/response round trip. Returns false when the stream path is unavailable. */
@@ -1098,7 +1265,7 @@ class NodeEngine(
             seeds = config.seeds,
             peers = peerRows,
             strangers = strangers,
-            store = store.stats().copy(digestCursor = synchronized(lock) { aeCursor }),
+            store = store.stats().copy(digestCursor = sweepSummary()),
             metrics = snapshot,
             topology = _topology.value,
             chatLines = synchronized(lock) { chatLog.size },

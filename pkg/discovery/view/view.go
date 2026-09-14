@@ -155,7 +155,8 @@ func NewView() *View {
 	frame := tview.NewFrame(pages)
 	frame.AddText(
 		"[::b][c][::-] Create  [::b][e/↵][::-] Edit  [::b][d][::-] Delete  [::b][h][::-] History  "+
-			"[::b][/][::-] Filter  [::b][a][::-] Feed  [::b][m][::-] Metrics  [::b][?][::-] Help  [::b][Ctrl+Q][::-] Quit",
+			"[::b][/][::-] Filter  [::b][a][::-] Feed  [::b][m][::-] Metrics  [::b][g][::-] Graph  "+
+			"[::b][D][::-] Diagnose  [::b][v][::-] Verify  [::b][?][::-] Help  [::b][Ctrl+Q][::-] Quit",
 		false, tview.AlignCenter, tcell.ColorWhite)
 
 	app.SetRoot(frame, true)

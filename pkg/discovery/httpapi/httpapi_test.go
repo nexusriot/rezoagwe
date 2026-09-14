@@ -30,12 +30,12 @@ func newGateway(t *testing.T) (*node.Node, string) {
 	n.Start()
 	t.Cleanup(n.Stop)
 
-	srv, err := Serve("127.0.0.1:0", n)
+	srv, err := Serve(Config{Addr: "127.0.0.1:0"}, n)
 	if err != nil {
 		t.Fatalf("serve: %v", err)
 	}
 	t.Cleanup(func() { srv.Close() })
-	return n, "http://" + srv.Addr()
+	return n, srv.URL()
 }
 
 func do(t *testing.T, method, url, body string, headers map[string]string) *http.Response {
@@ -280,4 +280,14 @@ func TestPeersEndpoint(t *testing.T) {
 	if len(peers) != 1 || peers[0].Nick != "bob" {
 		t.Fatalf("peers = %+v", peers)
 	}
+}
+
+// readAll drains a response body as a string.
+func readAll(t *testing.T, resp *http.Response) string {
+	t.Helper()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	return string(b)
 }

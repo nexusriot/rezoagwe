@@ -1,6 +1,11 @@
 package model
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"errors"
+	"fmt"
 	"sort"
 	"sync"
 	"time"
@@ -67,6 +72,29 @@ type HistoryEntry struct {
 	At    time.Time
 }
 
+// Limits bound what a store will hold. Both are off (0) by default.
+//
+// A limit is a choice to stay up rather than to converge: an update refused for
+// size is a deliberate divergence from the peer that sent it, and nothing on
+// the wire reports that. Set them only when an unbounded store is the worse
+// failure — and set the same values on every replica, or the cluster splits
+// along whichever node was configured tightest.
+type Limits struct {
+	// MaxValueBytes refuses any value longer than this.
+	MaxValueBytes int
+	// MaxKeys refuses a write that would introduce a new key beyond this many
+	// live keys. Updates to keys already held are always allowed, so a full
+	// store still converges on the keys it has.
+	MaxKeys int
+}
+
+// ErrTooLarge and ErrTooManyKeys say which limit refused a write; a plain
+// "false" is indistinguishable from a failed compare-and-swap.
+var (
+	ErrTooLarge    = errors.New("value exceeds the configured size limit")
+	ErrTooManyKeys = errors.New("store is at its configured key limit")
+)
+
 // WriteOptions modifies a write. The zero value is an unconditional write with
 // no expiry.
 type WriteOptions struct {
@@ -89,6 +117,7 @@ type KVStore struct {
 	store    map[string]kvEntry
 	history  map[string][]HistoryEntry
 	onChange func()
+	limits   Limits
 
 	// now is overridable so expiry and GC can be tested without sleeping.
 	now func() time.Time
@@ -101,6 +130,44 @@ func NewKVStore(node string) *KVStore {
 		history: make(map[string][]HistoryEntry),
 		now:     time.Now,
 	}
+}
+
+// SetLimits bounds what the store will accept, from a local writer or a peer.
+func (kv *KVStore) SetLimits(l Limits) {
+	kv.mu.Lock()
+	kv.limits = l
+	kv.mu.Unlock()
+}
+
+// Limits reports the configured bounds.
+func (kv *KVStore) Limits() Limits {
+	kv.mu.RLock()
+	defer kv.mu.RUnlock()
+	return kv.limits
+}
+
+// admitLocked reports why a value of this size for this key cannot be stored.
+// Callers hold the lock.
+func (kv *KVStore) admitLocked(key, value string, now int64) error {
+	if kv.limits.MaxValueBytes > 0 && len(value) > kv.limits.MaxValueBytes {
+		return ErrTooLarge
+	}
+	if kv.limits.MaxKeys <= 0 {
+		return nil
+	}
+	if e, ok := kv.store[key]; ok && e.visible(now) {
+		return nil // already counted; an update never grows the keyspace
+	}
+	live := 0
+	for _, e := range kv.store {
+		if e.visible(now) {
+			live++
+		}
+	}
+	if live >= kv.limits.MaxKeys {
+		return ErrTooManyKeys
+	}
+	return nil
 }
 
 // SetClock replaces the store's time source. Tests use it to drive TTL expiry
@@ -200,6 +267,12 @@ func (kv *KVStore) Delete(key string) pb.KVUpdate {
 func (kv *KVStore) mutate(key, value string, remove bool, opt WriteOptions) (pb.KVUpdate, bool) {
 	kv.mu.Lock()
 	now := kv.now().Unix()
+	if !remove {
+		if err := kv.admitLocked(key, value, now); err != nil {
+			kv.mu.Unlock()
+			return pb.KVUpdate{}, false
+		}
+	}
 	if opt.Expect != nil {
 		cur, ok := kv.store[key]
 		// A caller that expects "absent" is satisfied by a key that is missing,
@@ -250,6 +323,12 @@ func (kv *KVStore) Apply(u pb.KVUpdate) bool {
 	kv.mu.Lock()
 	if u.Version.Counter > kv.clock {
 		kv.clock = u.Version.Counter
+	}
+	if u.Action != pb.KVDelete {
+		if err := kv.admitLocked(u.Key, u.Value, kv.now().Unix()); err != nil {
+			kv.mu.Unlock()
+			return false
+		}
 	}
 	if cur, ok := kv.store[u.Key]; ok && !u.Version.Newer(cur.Version) {
 		kv.mu.Unlock()
@@ -457,6 +536,66 @@ func (kv *KVStore) Reconcile(d pb.Digest, maxPush, maxPull int) (push []pb.KVUpd
 	return push, pull
 }
 
+// Fingerprint summarises the whole store as a fixed set of bucket digests.
+//
+// A key's bucket comes from the hash of its **name alone**, and what is folded
+// into that bucket is the hash of the whole entry. Both halves matter:
+//
+//   - Bucketing on the name means a key stays in the same bucket however its
+//     value changes, so a bucket that differs names a stable region of the
+//     keyspace — which is the only thing that makes "they differ in bucket 7"
+//     more useful than "they differ". Bucketing on the whole entry (as this
+//     did first) relocates a key whenever it is written, so a single stale
+//     value lights up two buckets and neither corresponds to anything.
+//   - Folding with XOR means a bucket does not depend on the order entries were
+//     learned in, so two replicas that took the same writes by different routes
+//     agree.
+//
+// Tombstones are included: two replicas that disagree about whether a key is
+// deleted have diverged just as much as two that disagree about its value.
+func (kv *KVStore) Fingerprint(buckets int) pb.FingerprintReply {
+	if buckets <= 0 {
+		buckets = pb.FingerprintBuckets
+	}
+	kv.mu.RLock()
+	defer kv.mu.RUnlock()
+
+	folds := make([][sha256.Size]byte, buckets)
+	keys, tombstones := 0, 0
+	now := kv.now().Unix()
+	for k, e := range kv.store {
+		if e.Deleted {
+			tombstones++
+		} else if e.visible(now) {
+			keys++
+		}
+		nameHash := sha256.Sum256([]byte(k))
+		idx := int(binary.BigEndian.Uint32(nameHash[:4]) % uint32(buckets))
+
+		h := sha256.New()
+		h.Write([]byte(k))
+		h.Write([]byte{0})
+		fmt.Fprintf(h, "%d/%s/%t", e.Version.Counter, e.Version.Node, e.Deleted)
+		var sum [sha256.Size]byte
+		copy(sum[:], h.Sum(nil))
+
+		for i := range folds[idx] {
+			folds[idx][i] ^= sum[i]
+		}
+	}
+
+	out := make([]string, buckets)
+	for i, f := range folds {
+		out[i] = hex.EncodeToString(f[:])
+	}
+	return pb.FingerprintReply{
+		Keys:       keys,
+		Tombstones: tombstones,
+		Clock:      kv.clock,
+		Buckets:    out,
+	}
+}
+
 // History returns the recorded versions of a key, oldest first.
 func (kv *KVStore) History(key string) []HistoryEntry {
 	kv.mu.RLock()
@@ -539,6 +678,29 @@ func (kv *KVStore) Len() int {
 	for _, e := range kv.store {
 		if e.visible(now) {
 			n++
+		}
+	}
+	return n
+}
+
+// Clock reports the Lamport counter, which is the one number that says whether
+// a node is keeping up with the writes around it.
+func (kv *KVStore) Clock() uint64 {
+	kv.mu.RLock()
+	defer kv.mu.RUnlock()
+	return kv.clock
+}
+
+// ValueBytes totals the live values held, which is the store's real footprint
+// rather than its key count.
+func (kv *KVStore) ValueBytes() int {
+	kv.mu.RLock()
+	defer kv.mu.RUnlock()
+	now := kv.now().Unix()
+	n := 0
+	for _, e := range kv.store {
+		if e.visible(now) {
+			n += len(e.Value)
 		}
 	}
 	return n

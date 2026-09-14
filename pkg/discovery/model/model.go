@@ -17,26 +17,46 @@ import (
 // chatRing bounds the in-memory (and persisted) chat history.
 const chatRing = 500
 
+// flushInterval is how long a mutation waits for company before the state file
+// is rewritten.
+//
+// Persistence used to be synchronous on every mutation, which meant one PUT
+// serialised the whole store — and a 128-entry anti-entropy repair serialised
+// it 128 times. Coalescing trades up to this much unflushed work on a kill -9
+// for a write cost that no longer grows with the store: a clean shutdown
+// flushes, and anything lost to a hard kill is what anti-entropy re-fetches
+// from a peer anyway.
+const flushInterval = 250 * time.Millisecond
+
 // Config is everything a node needs to know about itself before it talks to
 // anyone.
 type Config struct {
 	BootstrapAddrs []string
 	NodeAddr       string
-	Nick           string
-	DataPath       string // "" disables persistence
+	// AdvertiseAddr is what peers are told to reach this node at, when that
+	// differs from the bind address. Empty means "advertise the bind address".
+	AdvertiseAddr string
+	Nick          string
+	DataPath      string // "" disables persistence
 }
 
 // Model owns a node's local state: its identity, its KV replica, who its peers
 // are and what has been said in chat. It knows nothing about transports — the
 // node engine does the talking.
 type Model struct {
-	Store          *KVStore
-	Nodes          *sync.Map // address -> bool
-	lastSeen       sync.Map  // address -> time.Time (last packet observed)
-	nicks          sync.Map  // address -> string (peer-reported nickname)
-	ids            sync.Map  // node id -> address (attributes a version to a peer)
+	Store    *KVStore
+	Nodes    *sync.Map // address -> bool
+	lastSeen sync.Map  // address -> time.Time (last packet observed)
+	nicks    sync.Map  // address -> string (peer-reported nickname)
+	views    sync.Map  // address -> PeerView (the peer list that peer last gossiped)
+	// normalized is the peer set keyed by NormalizeAddr, so a lookup by the
+	// address a datagram *came from* is O(1). Peers are stored under the
+	// address they advertise, which is rarely the same string.
+	normalized     sync.Map // NormalizeAddr(address) -> address
+	ids            sync.Map // node id -> address (attributes a version to a peer)
 	BootstrapAddrs []string
 	NodeAddr       string
+	AdvertiseAddr  string
 	NodeID         string
 	DataPath       string
 
@@ -49,6 +69,12 @@ type Model struct {
 	persistMu  sync.Mutex
 	persistGen uint64
 	persister  *Persister
+
+	// dirty has capacity 1: it is a "something changed" doorbell, not a queue.
+	dirty     chan struct{}
+	closeOnce sync.Once
+	stopFlush chan struct{}
+	flushDone chan struct{}
 }
 
 func NewModel(cfg Config) *Model {
@@ -56,9 +82,14 @@ func NewModel(cfg Config) *Model {
 	if nick == "" {
 		nick = "anon"
 	}
+	advertise := cfg.AdvertiseAddr
+	if advertise == "" {
+		advertise = cfg.NodeAddr
+	}
 	m := &Model{
 		BootstrapAddrs: cfg.BootstrapAddrs,
 		NodeAddr:       cfg.NodeAddr,
+		AdvertiseAddr:  advertise,
 		nodeNick:       nick,
 		DataPath:       cfg.DataPath,
 		Nodes:          &sync.Map{},
@@ -93,14 +124,70 @@ func NewModel(cfg Config) *Model {
 			len(state.Entries), state.Clock, len(state.Chat), cfg.DataPath)
 	}
 	if m.persister != nil {
+		m.dirty = make(chan struct{}, 1)
+		m.stopFlush = make(chan struct{})
+		m.flushDone = make(chan struct{})
+		go m.flushLoop()
 		m.Store.SetOnChange(m.Persist)
 		// A freshly generated identity has to reach disk even before the first
-		// write, or a restart before any write would mint another one.
+		// write, or a restart before any write would mint another one. This one
+		// is synchronous: there may be no second write to coalesce it with.
 		if !found || state.NodeID != m.NodeID {
-			m.Persist()
+			m.Flush()
 		}
 	}
 	return m
+}
+
+// flushLoop rewrites the state file at most once per flushInterval, however
+// many mutations arrived in between.
+func (bn *Model) flushLoop() {
+	defer close(bn.flushDone)
+	timer := time.NewTimer(flushInterval)
+	if !timer.Stop() {
+		<-timer.C
+	}
+	pending := false
+	for {
+		select {
+		case <-bn.stopFlush:
+			return
+		case <-bn.dirty:
+			if !pending {
+				pending = true
+				timer.Reset(flushInterval)
+			}
+
+		case <-timer.C:
+			pending = false
+			bn.writeState()
+		}
+	}
+}
+
+// Close flushes anything outstanding and stops the background writer. It is
+// safe to call more than once, and a Model with no persistence ignores it.
+func (bn *Model) Close() {
+	if bn.persister == nil {
+		return
+	}
+	bn.closeOnce.Do(func() {
+		close(bn.stopFlush)
+		<-bn.flushDone
+		// Unconditional: a doorbell sitting in `dirty` races the stop signal in
+		// the loop's select, so "was anything pending?" is not answerable here.
+		// One write on shutdown is cheaper than reasoning about that race.
+		bn.writeState()
+	})
+}
+
+// Flush writes the state file now and waits for it, which is what a clean
+// shutdown and a test that restarts a node both need.
+func (bn *Model) Flush() {
+	if bn.persister == nil {
+		return
+	}
+	bn.writeState()
 }
 
 // Nick returns this node's current nickname.
@@ -119,15 +206,25 @@ func (bn *Model) SetOwnNick(nick string) string {
 	return prev
 }
 
-// Persist writes the full node state (identity, KV, chat) to disk.
-//
-// The generation is taken while the snapshot is built, under one lock, so a
-// slow write can never land after a newer one: the persister drops any
-// generation it has already passed.
+// Persist marks the state dirty. The write itself happens on the flush loop, so
+// a burst of mutations — a repair batch, an import, a state sync — costs one
+// serialisation of the store rather than one per entry.
 func (bn *Model) Persist() {
 	if bn.persister == nil {
 		return
 	}
+	select {
+	case bn.dirty <- struct{}{}:
+	default: // already rung
+	}
+}
+
+// writeState builds the snapshot and hands it to the persister.
+//
+// The generation is taken while the snapshot is built, under one lock, so a
+// slow write can never land after a newer one: the persister drops any
+// generation it has already passed.
+func (bn *Model) writeState() {
 	bn.persistMu.Lock()
 	bn.persistGen++
 	gen := bn.persistGen
@@ -166,10 +263,11 @@ func ValidPeerAddr(addr string) bool {
 	return !strings.ContainsAny(host, " \t\r\n")
 }
 
-// normalizeAddr canonicalises an address for identity comparison, so a node
+// NormalizeAddr canonicalises an address for identity comparison, so a node
 // listening on ":3137" recognises "127.0.0.1:3137" and "localhost:3137" as
-// itself instead of gossiping itself into its own peer list.
-func normalizeAddr(addr string) string {
+// itself instead of gossiping itself into its own peer list. It is also what
+// keeps the topology graph from drawing one peer as two.
+func NormalizeAddr(addr string) string {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		return addr
@@ -181,9 +279,16 @@ func normalizeAddr(addr string) string {
 	return net.JoinHostPort(host, port)
 }
 
-// IsSelf reports whether addr refers to this node.
+// IsSelf reports whether addr refers to this node, under either the address it
+// binds or the one it advertises. Recognising only the bind address would make
+// a node with -advertise add itself as a peer the first time gossip echoed its
+// own advertised address back at it.
 func (bn *Model) IsSelf(addr string) bool {
-	return addr == bn.NodeAddr || normalizeAddr(addr) == normalizeAddr(bn.NodeAddr)
+	if addr == bn.NodeAddr || addr == bn.AdvertiseAddr {
+		return true
+	}
+	norm := NormalizeAddr(addr)
+	return norm == NormalizeAddr(bn.NodeAddr) || norm == NormalizeAddr(bn.AdvertiseAddr)
 }
 
 // AddPeer returns true if peer was newly learned.
@@ -192,8 +297,20 @@ func (bn *Model) AddPeer(addr string) bool {
 		return false
 	}
 	bn.lastSeen.Store(addr, time.Now())
+	bn.normalized.Store(NormalizeAddr(addr), addr)
 	_, loaded := bn.Nodes.LoadOrStore(addr, true)
 	return !loaded
+}
+
+// HasPeerNormalized reports whether addr — in any spelling — is a known peer.
+// It exists for the packet path, which sees the source address the transport
+// observed rather than the one the peer advertises.
+func (bn *Model) HasPeerNormalized(addr string) bool {
+	if _, ok := bn.Nodes.Load(addr); ok {
+		return true
+	}
+	_, ok := bn.normalized.Load(NormalizeAddr(addr))
+	return ok
 }
 
 func (bn *Model) HasPeer(addr string) bool {
@@ -214,12 +331,45 @@ func (bn *Model) RemovePeer(addr string) {
 	bn.Nodes.Delete(addr)
 	bn.lastSeen.Delete(addr)
 	bn.nicks.Delete(addr)
+	bn.views.Delete(addr)
+	bn.normalized.Delete(NormalizeAddr(addr))
 	bn.ids.Range(func(key, value interface{}) bool {
 		if value.(string) == addr {
 			bn.ids.Delete(key)
 		}
 		return true
 	})
+}
+
+// PeerView is the peer list one peer last gossiped, and when.
+//
+// Keeping it is what makes a cluster graph possible without a byte of extra
+// protocol: gossip already carries each node's own view, and the difference
+// between "both ends claim this link" and "only one does" is the whole
+// diagnostic.
+type PeerView struct {
+	Peers []string
+	At    time.Time
+}
+
+// RecordPeerView stores what a peer said its own peer list was.
+func (bn *Model) RecordPeerView(from string, peers []string) {
+	if from == "" {
+		return
+	}
+	cp := make([]string, len(peers))
+	copy(cp, peers)
+	bn.views.Store(from, PeerView{Peers: cp, At: time.Now()})
+}
+
+// PeerViews returns every gossiped peer list this node has heard.
+func (bn *Model) PeerViews() map[string]PeerView {
+	out := make(map[string]PeerView)
+	bn.views.Range(func(key, value interface{}) bool {
+		out[key.(string)] = value.(PeerView)
+		return true
+	})
+	return out
 }
 
 // SetNick records the nickname reported by a peer.

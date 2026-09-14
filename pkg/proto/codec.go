@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"sync"
@@ -77,6 +78,17 @@ func NewCodec(psk, cluster string) *Codec {
 		now:  time.Now,
 		seen: make(map[[nonceLen]byte]time.Time),
 	}
+}
+
+// KeyFingerprint is a short, non-secret label for the derived framing key.
+//
+// Two nodes that cannot talk usually differ in the psk or the cluster name, and
+// neither is printable — one is a secret, the other looks right until you
+// compare them character by character. A fingerprint is comparable at a glance
+// and gives nothing away.
+func (c *Codec) KeyFingerprint() string {
+	sum := sha256.Sum256(c.key)
+	return hex.EncodeToString(sum[:4])
 }
 
 // Encode marshals v as the body of a framed, authenticated packet.

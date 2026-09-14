@@ -14,7 +14,9 @@ import (
 	"github.com/rivo/tview"
 	log "github.com/sirupsen/logrus"
 
+	"github.com/nexusriot/rezoagwe/pkg/discovery/diagnostics"
 	"github.com/nexusriot/rezoagwe/pkg/discovery/node"
+	"github.com/nexusriot/rezoagwe/pkg/discovery/topology"
 	"github.com/nexusriot/rezoagwe/pkg/discovery/view"
 	pb "github.com/nexusriot/rezoagwe/pkg/proto"
 )
@@ -183,6 +185,12 @@ func (c *Controller) setInput() {
 				return c.history()
 			case 'm':
 				return c.metrics()
+			case 'g':
+				return c.topology()
+			case 'D':
+				return c.diagnostics()
+			case 'v':
+				return c.consistency()
 			case 'a':
 				return c.toggleFeed()
 			case 'x':
@@ -433,6 +441,156 @@ func (c *Controller) metrics() *tcell.EventKey {
 	return nil
 }
 
+// topology draws the cluster as this node understands it.
+//
+// The Android and desktop apps have had this since they were written; the Go
+// node, which is the one most likely to be running headless on a server, could
+// only ever list its peers. A list cannot show a partition.
+func (c *Controller) topology() *tcell.EventKey {
+	g := c.node.Topology()
+	groups := topology.Components(g)
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "[::b]%d node(s), %d link(s), %d component(s)[::-]\n\n",
+		len(g.Nodes), len(g.Links), len(groups))
+	if len(groups) > 1 {
+		sizes := make([]string, 0, len(groups))
+		for _, grp := range groups {
+			sizes = append(sizes, fmt.Sprint(len(grp)))
+		}
+		fmt.Fprintf(&b, "  [red]partitioned: %s[-]\n\n", strings.Join(sizes, " | "))
+	}
+
+	b.WriteString("[::b]Nodes[::-]\n")
+	for _, n := range g.Nodes {
+		colour := "white"
+		switch n.Role {
+		case topology.RoleSelf:
+			colour = "yellow"
+		case topology.RoleIndirect:
+			colour = "darkgray"
+		}
+		advertised := "-"
+		if n.Advertised >= 0 {
+			advertised = fmt.Sprintf("%d", n.Advertised)
+		}
+		fmt.Fprintf(&b, "  [%s]%-24s[-] [darkgray]%-8s[-] links %-3d advertises %s\n",
+			colour, truncate(n.Label, 24), n.Role, n.Degree, advertised)
+	}
+
+	if len(g.Links) > 0 {
+		b.WriteString("\n[::b]Links[::-]\n")
+		for _, l := range g.Links {
+			colour := "white"
+			if l.Kind == topology.LinkObserved {
+				colour = "darkgray"
+			}
+			fmt.Fprintf(&b, "  [%s]%s — %s[-] [darkgray](%s)[-]\n", colour, l.A, l.B, l.Kind)
+		}
+		b.WriteString("\n[darkgray]observed = claimed by one end only; " +
+			"mutual = both ends agree[-]\n")
+	}
+
+	tv := c.view.NewTextModal("Cluster", b.String())
+	c.showModal(tv, 78, 28, tv)
+	return nil
+}
+
+// diagnostics turns the counters into the short list of things actually wrong.
+func (c *Controller) diagnostics() *tcell.EventKey {
+	snap := c.node.Diagnostics()
+	checks := diagnostics.Checks(snap, time.Now())
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "[::b]%s[::-]  [darkgray]cluster %s, key %s[-]\n\n",
+		snap.Addr, snap.Cluster, snap.KeyFingerprint)
+	for _, ch := range checks {
+		fmt.Fprintf(&b, "[%s]%-5s[-] [::b]%s[::-]\n", severityColour(ch.Severity),
+			strings.ToUpper(string(ch.Severity)), ch.Title)
+		fmt.Fprintf(&b, "      [darkgray]%s[-]\n\n", ch.Detail)
+	}
+	tv := c.view.NewTextModal("Diagnostics", b.String())
+	c.showModal(tv, 80, 30, tv)
+	return nil
+}
+
+// severityColour maps a finding to a tview colour tag.
+func severityColour(s diagnostics.Severity) string {
+	switch s {
+	case diagnostics.SeverityError:
+		return "red"
+	case diagnostics.SeverityWarn:
+		return "yellow"
+	case diagnostics.SeverityOK:
+		return "green"
+	default:
+		return "blue"
+	}
+}
+
+// consistency asks every peer what it holds and reports who disagrees.
+//
+// It dials every peer, so it runs off the event loop: an unreachable peer must
+// never freeze the terminal.
+func (c *Controller) consistency() *tcell.EventKey {
+	tv := c.view.NewTextModal("Consistency", "  checking every peer…")
+	c.showModal(tv, 76, 24, tv)
+	go func() {
+		body := renderConsistency(c.node.CheckConsistency())
+		c.view.App.QueueUpdateDraw(func() { tv.SetText(body) })
+	}()
+	return nil
+}
+
+func renderConsistency(r node.ConsistencyReport) string {
+	var b strings.Builder
+	verdict := "[green]every peer agrees[-]"
+	if !r.Converged {
+		verdict = "[red]replicas disagree[-]"
+	}
+	fmt.Fprintf(&b, "[::b]%s[::-]\n\n", verdict)
+	fmt.Fprintf(&b, "  [white]this node[-]  %d keys, %d tombstones, clock %d\n\n",
+		r.Keys, r.Tombstones, r.Clock)
+
+	if len(r.Peers) == 0 {
+		b.WriteString("  [darkgray]no peers to compare against[-]\n")
+		return b.String()
+	}
+	for _, p := range r.Peers {
+		name := p.Addr
+		if p.Nick != "" {
+			name = fmt.Sprintf("%s (%s)", p.Nick, p.Addr)
+		}
+		switch {
+		case !p.Reachable:
+			fmt.Fprintf(&b, "  [yellow]?[-] %s\n      [darkgray]did not answer: %s[-]\n", name, p.Error)
+		case p.Agrees:
+			fmt.Fprintf(&b, "  [green]=[-] %s  [darkgray]%d keys, clock %d[-]\n", name, p.Keys, p.Clock)
+		default:
+			fmt.Fprintf(&b, "  [red]≠[-] %s  [darkgray]%d keys, clock %d[-]\n", name, p.Keys, p.Clock)
+			fmt.Fprintf(&b, "      [darkgray]differs in %d of %d key ranges[-]\n",
+				len(p.DifferingBuckets), pb.FingerprintBuckets)
+		}
+	}
+	if r.Unreachable > 0 {
+		fmt.Fprintf(&b, "\n[darkgray]%d peer(s) did not answer; a silent peer says nothing "+
+			"about whether it agrees.[-]\n", r.Unreachable)
+	}
+	if !r.Converged {
+		b.WriteString("\n[darkgray]Anti-entropy repairs this on its own. A disagreement that " +
+			"persists across several checks is the one worth chasing.[-]\n")
+	}
+	return b.String()
+}
+
+// truncate shortens a label to fit a fixed column.
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n-1] + "…"
+}
+
 func (c *Controller) help() *tcell.EventKey {
 	body := `[::b]Keys pane[::-]
   [yellow]c[-]        create a key
@@ -442,6 +600,9 @@ func (c *Controller) help() *tcell.EventKey {
   [yellow]/[-]        filter keys and values
   [yellow]x[-] / [yellow]i[-]    export / import the store
   [yellow]m[-]        replication metrics
+  [yellow]g[-]        cluster graph (peers, links, partitions)
+  [yellow]D[-]        diagnostics: what is actually wrong
+  [yellow]v[-]        verify every replica holds the same store
   [yellow]a[-]        switch the feed between chat and activity
   [yellow]?[-]        this help
   [yellow]Tab[-]      cycle panes

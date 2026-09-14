@@ -1,0 +1,25 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+  configure)
+    # A system user with no shell and no home: the node needs a socket and a
+    # state file, nothing else on the machine.
+    if ! getent passwd rezoagwe >/dev/null; then
+      adduser --system --group --no-create-home \
+        --home /var/lib/rezoagwe --shell /usr/sbin/nologin rezoagwe >/dev/null
+    fi
+    mkdir -p /var/lib/rezoagwe
+    chown rezoagwe:rezoagwe /var/lib/rezoagwe
+    chmod 0750 /var/lib/rezoagwe
+    ;;
+esac
+
+# Neither unit is enabled on install: which role a machine plays is a decision,
+# and starting a rendezvous service nobody asked for would put a listener on
+# 9999 the moment the package lands.
+if [ -d /run/systemd/system ]; then
+  systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+
+exit 0

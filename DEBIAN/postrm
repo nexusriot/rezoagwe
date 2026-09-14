@@ -1,0 +1,19 @@
+#!/bin/sh
+set -e
+
+if [ -d /run/systemd/system ]; then
+  systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+
+case "$1" in
+  purge)
+    # The state file carries the node's identity and its share of the store.
+    # Removing the package leaves both alone; purging is the explicit ask.
+    rm -rf /var/lib/rezoagwe
+    if getent passwd rezoagwe >/dev/null; then
+      deluser --system rezoagwe >/dev/null 2>&1 || true
+    fi
+    ;;
+esac
+
+exit 0

@@ -1,0 +1,18 @@
+# Arguments for rezoagwe-discovery. See rezoagwe-discovery -h.
+#
+#   -bootstrap  seed address, or a comma-separated list
+#   -node       address to bind
+#   -advertise  address peers should use to reach this node
+#   -nick       name shown in chat and peer lists
+#   -cluster    cluster name; nodes only talk to their own cluster
+#   -psk        pre-shared key authenticating every packet
+#   -http       HTTP gateway address
+#
+# -advertise matters on anything but one machine: a node bound to ":3137" tells
+# every peer to reach it at ":3137", which each of them resolves to its own
+# loopback. Set it to an address that routes.
+#
+# The HTTP gateway is a full read/write control surface — POST /import?mode=seed
+# rewrites the whole cluster. Bind it to loopback, or set -http-token and
+# -http-tls-cert/-http-tls-key.
+REZOAGWE_DISCOVERY_ARGS="-bootstrap 127.0.0.1:9999 -node :3137 -data /var/lib/rezoagwe/node.json"

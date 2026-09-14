@@ -11,12 +11,14 @@ import (
 
 func newModel(t *testing.T, dataPath string) *Model {
 	t.Helper()
-	return NewModel(Config{
+	m := NewModel(Config{
 		BootstrapAddrs: []string{":9999"},
 		NodeAddr:       "127.0.0.1:3137",
 		Nick:           "self",
 		DataPath:       dataPath,
 	})
+	t.Cleanup(m.Close)
+	return m
 }
 
 // The Lamport clock must be persisted: after a restart, a new local write has
@@ -27,6 +29,7 @@ func TestClockSurvivesRestart(t *testing.T) {
 	m1 := newModel(t, path)
 	m1.Store.Set("k", "v1")
 	last := m1.Store.Set("k", "v2")
+	m1.Close()
 
 	m2 := newModel(t, path)
 	u := m2.Store.Set("k", "v3")
@@ -45,6 +48,7 @@ func TestNodeIDSurvivesRestart(t *testing.T) {
 	if m1.NodeID == "" {
 		t.Fatal("node id empty")
 	}
+	m1.Close()
 	m2 := newModel(t, path)
 	if m2.NodeID != m1.NodeID {
 		t.Fatalf("node id changed across restart: %q → %q", m1.NodeID, m2.NodeID)
@@ -73,6 +77,7 @@ func TestChatSurvivesRestart(t *testing.T) {
 
 	m1 := newModel(t, path)
 	m1.AppendChat(pb.ChatEntry{TS: 1, Sender: ":3138", Nick: "bob", Text: "hello"})
+	m1.Close()
 
 	m2 := newModel(t, path)
 	log := m2.ChatLog()

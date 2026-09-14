@@ -74,6 +74,9 @@ func (t *UDPTransport) Packets() <-chan Packet { return t.packets }
 
 func (t *UDPTransport) Streams() <-chan net.Conn { return t.streams }
 
+// StreamsAvailable reports whether the TCP listener bound.
+func (t *UDPTransport) StreamsAvailable() bool { return t.listener != nil }
+
 func (t *UDPTransport) Send(addr string, data []byte) error {
 	udpAddr, err := t.resolve(addr)
 	if err != nil {

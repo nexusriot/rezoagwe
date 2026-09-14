@@ -1,0 +1,38 @@
+[Unit]
+Description=rezoagwe peer node
+Documentation=file:///usr/share/doc/rezoagwe/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rezoagwe
+Group=rezoagwe
+EnvironmentFile=-/etc/default/rezoagwe-discovery
+ExecStart=/usr/bin/rezoagwe-discovery -headless $REZOAGWE_DISCOVERY_ARGS
+Restart=on-failure
+RestartSec=5s
+
+# SIGTERM has to reach the node, or peers wait out the eviction timeout instead
+# of being told it left.
+KillSignal=SIGTERM
+TimeoutStopSec=15s
+
+StateDirectory=rezoagwe
+WorkingDirectory=/var/lib/rezoagwe
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target

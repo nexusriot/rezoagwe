@@ -9,6 +9,7 @@ package node
 import (
 	"fmt"
 	"math/rand"
+	"sort"
 	"sync"
 	"time"
 
@@ -45,10 +46,18 @@ func (NopEvents) ActivityChanged() {}
 type Config struct {
 	BootstrapAddrs []string
 	NodeAddr       string
-	Nick           string
-	DataPath       string
-	PSK            string
-	Cluster        string
+	// AdvertiseAddr is the address peers are told to reach this node at. Empty
+	// means "whatever NodeAddr says", which is right on one machine and wrong
+	// on a LAN: a node bound to ":3137" advertises ":3137", and every peer
+	// resolves that to its own loopback.
+	AdvertiseAddr string
+	Nick          string
+	DataPath      string
+	PSK           string
+	Cluster       string
+	// Version is what the binary reports, carried so a diagnostics report says
+	// which build produced it.
+	Version string
 
 	GossipInterval    time.Duration
 	HeartbeatInterval time.Duration
@@ -61,9 +70,18 @@ type Config struct {
 
 	// DigestBatch caps how many keys one anti-entropy digest advertises, and
 	// MaxPush/MaxPull cap the repair traffic a single round can trigger.
+	//
+	// DigestBatch must not exceed either budget: the sender's cursor advances
+	// by the whole digest, so a range that identified more repairs than one
+	// round can carry has its tail stranded until the cursor wraps the entire
+	// keyspace. applyDefaults clamps it rather than letting that happen
+	// quietly.
 	DigestBatch int
 	MaxPush     int
 	MaxPull     int
+
+	// Limits bound what the store will hold. The zero value is unbounded.
+	Limits model.Limits
 
 	// Transport is injectable so tests can run a whole cluster in memory over a
 	// lossy network. Nil means real UDP + TCP on NodeAddr.
@@ -87,7 +105,7 @@ func (c *Config) applyDefaults() {
 		c.SweepInterval = 5 * time.Second
 	}
 	if c.DigestBatch == 0 {
-		c.DigestBatch = 256
+		c.DigestBatch = 128
 	}
 	if c.MaxPush == 0 {
 		c.MaxPush = 128
@@ -95,8 +113,16 @@ func (c *Config) applyDefaults() {
 	if c.MaxPull == 0 {
 		c.MaxPull = 128
 	}
+	if budget := min(c.MaxPush, c.MaxPull); c.DigestBatch > budget {
+		log.Debugf("digest batch %d exceeds the repair budget %d; clamping",
+			c.DigestBatch, budget)
+		c.DigestBatch = budget
+	}
 	if c.Cluster == "" {
 		c.Cluster = pb.DefaultCluster
+	}
+	if c.AdvertiseAddr == "" {
+		c.AdvertiseAddr = c.NodeAddr
 	}
 }
 
@@ -116,8 +142,18 @@ type Node struct {
 	stop     chan struct{}
 	wg       sync.WaitGroup
 
-	aeMu     sync.Mutex
-	aeCursor string
+	// One cursor per peer. A single shared cursor divided the keyspace among
+	// whichever peers the random target picked, so each peer only ever heard
+	// about its share of the ranges and a divergence with one peer waited on
+	// rounds spent talking to the others.
+	aeMu      sync.Mutex
+	aeCursors map[string]string
+
+	// strangers are source addresses that sent packets without being a peer —
+	// the signature of a node whose advertised address is not the one its
+	// packets come from (a NAT, or a wrong -advertise).
+	strangerMu sync.Mutex
+	strangers  map[string]int64
 
 	actMu    sync.Mutex
 	activity []string
@@ -143,9 +179,11 @@ func New(cfg Config, ev Events) (*Node, error) {
 	m := model.NewModel(model.Config{
 		BootstrapAddrs: cfg.BootstrapAddrs,
 		NodeAddr:       cfg.NodeAddr,
+		AdvertiseAddr:  cfg.AdvertiseAddr,
 		Nick:           cfg.Nick,
 		DataPath:       cfg.DataPath,
 	})
+	m.Store.SetLimits(cfg.Limits)
 	n := &Node{
 		cfg:       cfg,
 		Model:     m,
@@ -156,12 +194,29 @@ func New(cfg Config, ev Events) (*Node, error) {
 		startedAt: time.Now(),
 		stop:      make(chan struct{}),
 		rnd:       rand.New(rand.NewSource(time.Now().UnixNano())),
+		aeCursors: make(map[string]string),
+		strangers: make(map[string]int64),
 	}
+	n.Metrics.SetGauges(func() metrics.Gauges {
+		return metrics.Gauges{
+			Peers:      len(n.Model.GetNodes()),
+			Keys:       n.Model.Store.Len(),
+			Tombstones: n.Model.Store.Tombstones(),
+			ValueBytes: n.Model.Store.ValueBytes(),
+			Clock:      n.Model.Store.Clock(),
+			UptimeSec:  int64(n.Uptime().Seconds()),
+		}
+	})
 	return n, nil
 }
 
-// Addr is the address this node advertises.
-func (n *Node) Addr() string { return n.cfg.NodeAddr }
+// Addr is the address this node advertises, which is what a peer needs and
+// what every message body carries. BindAddr is the socket it actually listens
+// on; the two differ whenever -advertise is set.
+func (n *Node) Addr() string { return n.cfg.AdvertiseAddr }
+
+// BindAddr is the address the transport listens on.
+func (n *Node) BindAddr() string { return n.cfg.NodeAddr }
 
 // Uptime is how long the node has been running.
 func (n *Node) Uptime() time.Duration { return time.Since(n.startedAt) }
@@ -196,10 +251,12 @@ func (n *Node) Stop() {
 		// Announce first: UDP writes only hand the datagram to the kernel, so
 		// peers learn of the departure immediately instead of waiting out the
 		// eviction timeout.
-		n.broadcast(pb.KindGoodbye, pb.Goodbye{From: n.cfg.NodeAddr, Nick: n.Model.Nick()})
+		n.broadcast(pb.KindGoodbye, pb.Goodbye{From: n.cfg.AdvertiseAddr, Nick: n.Model.Nick()})
 		close(n.stop)
 		n.tr.Close()
 		n.wg.Wait()
+		// Last, so nothing written during shutdown is lost to the debounce.
+		n.Model.Close()
 	})
 }
 
@@ -222,11 +279,11 @@ func (n *Node) send(addr string, kind pb.MessageKind, v interface{}) {
 
 func (n *Node) sendRaw(addr string, kind pb.MessageKind, pkt []byte) {
 	if err := n.tr.Send(addr, pkt); err != nil {
-		n.Metrics.SendErrors.Add(1)
+		n.Metrics.SendFailed(model.NormalizeAddr(addr), kind, err, time.Now().Unix())
 		log.Debugf("send %s to %s: %s", kind, addr, err)
 		return
 	}
-	n.Metrics.Sent(kind, len(pkt))
+	n.Metrics.SentTo(model.NormalizeAddr(addr), kind, len(pkt))
 }
 
 // broadcast sends one encoded packet to every known peer. Encoding once means
@@ -257,7 +314,7 @@ func (n *Node) randomPeer() string {
 }
 
 func (n *Node) helloMessage() pb.Hello {
-	return pb.Hello{From: n.cfg.NodeAddr, Nick: n.Model.Nick(), ID: n.Model.NodeID}
+	return pb.Hello{From: n.cfg.AdvertiseAddr, Nick: n.Model.Nick(), ID: n.Model.NodeID}
 }
 
 func (n *Node) helloAllPeers() {
@@ -278,7 +335,7 @@ func (n *Node) gossipLoop() {
 			}
 			target := n.randomPeer()
 			n.send(target, pb.KindPeerGossip, pb.PeerGossip{
-				From:  n.cfg.NodeAddr,
+				From:  n.cfg.AdvertiseAddr,
 				Nick:  n.Model.Nick(),
 				ID:    n.Model.NodeID,
 				Peers: peers,
@@ -323,6 +380,7 @@ func (n *Node) evictLoop() {
 			evicted := n.Model.EvictStalePeers(n.cfg.EvictThreshold)
 			for _, ep := range evicted {
 				log.Debugf("evicted stale peer %s", ep.Addr)
+				n.forgetPeerCursor(ep.Addr)
 				n.announceLeave(ep.Addr, ep.Nick)
 			}
 			if len(evicted) > 0 {
@@ -366,6 +424,58 @@ func (n *Node) logActivity(format string, args ...interface{}) {
 	}
 	n.actMu.Unlock()
 	n.ev.ActivityChanged()
+}
+
+// noteStranger records traffic that nothing ties to a known peer.
+//
+// from is the source address the transport saw; claimed is the address the body
+// says it came from, empty when the packet never authenticated. A packet is
+// only a stranger when *neither* identifies a peer: on any network where peers
+// advertise a hostname the source address never matches one, so keying on it
+// alone made every healthy peer a permanent anomaly.
+func (n *Node) noteStranger(from, claimed string) {
+	// This runs on every inbound packet, so both checks have to be map lookups
+	// rather than scans.
+	if claimed != "" && (n.Model.HasPeerNormalized(claimed) || n.Model.IsSelf(claimed)) {
+		return
+	}
+	if from == "" || n.Model.HasPeerNormalized(from) || n.Model.IsSelf(from) {
+		return
+	}
+	n.strangerMu.Lock()
+	if n.strangers == nil {
+		n.strangers = make(map[string]int64)
+	}
+	n.strangers[from] = time.Now().Unix()
+	n.strangerMu.Unlock()
+}
+
+// Stranger is a source address that sent packets without being a peer.
+type Stranger struct {
+	Addr      string `json:"addr"`
+	LastSeen  int64  `json:"last_seen"`
+	PacketsIn uint64 `json:"packets_in"`
+	Rejected  uint64 `json:"rejected"`
+}
+
+// Strangers lists the addresses seen sending packets that never became peers.
+func (n *Node) Strangers() []Stranger {
+	n.strangerMu.Lock()
+	out := make([]Stranger, 0, len(n.strangers))
+	for addr, at := range n.strangers {
+		if n.Model.HasPeerNormalized(addr) {
+			continue // it introduced itself since
+		}
+		s := Stranger{Addr: addr, LastSeen: at}
+		if c, ok := n.Metrics.PeerCounters(addr); ok {
+			s.PacketsIn = c.PacketsIn
+			s.Rejected = c.Rejected
+		}
+		out = append(out, s)
+	}
+	n.strangerMu.Unlock()
+	sort.Slice(out, func(i, j int) bool { return out[i].Addr < out[j].Addr })
+	return out
 }
 
 // Activity returns the replication activity feed, oldest first.

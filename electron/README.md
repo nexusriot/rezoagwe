@@ -71,7 +71,7 @@ make deb-manual            # a .deb with dpkg-deb alone: no fpm, no network
 ```
 
 The version comes from `package.json` and can be overridden for a one-off build
-— `make deb VERSION=0.2.0` stamps it into the artifact *and* into the app, so
+— `make deb VERSION=0.4.0` stamps it into the artifact *and* into the app, so
 what the file is called and what the app reports cannot drift apart.
 
 Two packaging paths exist on purpose, because they fail in different places:
@@ -165,7 +165,9 @@ duplicated deliberately and pinned by tests:
   as `{"from":"…","entries":null}` — which authenticates and would then fail to
   parse, silently dropping the repair it carried.
 * `kvstore.test.js` asserts the same merge, CAS, TTL and reconciliation rules the
-  Go store's tests assert.
+  Go store's tests assert — including the store **fingerprint** (wire kinds 11
+  and 12), whose XOR-over-buckets fold has to produce byte-identical digests to
+  the Go one or a consistency check reports two converged replicas as divergent.
 * `cluster.test.js` runs a whole cluster in one process over an in-memory network
   with configurable loss and partitions: convergence under 30 % packet loss, a
   dropped write repaired by a digest exchange, a delete that is not resurrected,

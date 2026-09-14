@@ -90,6 +90,53 @@ type chatEntry struct {
 	To     string `json:"to,omitempty"`
 }
 
+type graphNode struct {
+	Addr       string `json:"addr"`
+	Label      string `json:"label"`
+	Role       string `json:"role"`
+	Degree     int    `json:"degree"`
+	Advertised int    `json:"advertised"`
+}
+
+type graphLink struct {
+	A    string `json:"a"`
+	B    string `json:"b"`
+	Kind string `json:"kind"`
+}
+
+type graph struct {
+	Nodes []graphNode `json:"nodes"`
+	Links []graphLink `json:"links"`
+}
+
+type diagCheck struct {
+	Severity string `json:"severity"`
+	Title    string `json:"title"`
+	Detail   string `json:"detail"`
+}
+
+type diagnostics struct {
+	Worst  string      `json:"worst"`
+	Checks []diagCheck `json:"checks"`
+}
+
+type peerConsistency struct {
+	Addr             string `json:"addr"`
+	Reachable        bool   `json:"reachable"`
+	Error            string `json:"error,omitempty"`
+	Keys             int    `json:"keys"`
+	Agrees           bool   `json:"agrees"`
+	DifferingBuckets []int  `json:"differing_buckets,omitempty"`
+}
+
+type consistency struct {
+	Addr        string            `json:"addr"`
+	Keys        int               `json:"keys"`
+	Converged   bool              `json:"converged"`
+	Unreachable int               `json:"unreachable"`
+	Peers       []peerConsistency `json:"peers"`
+}
+
 type historyEntry struct {
 	Version string `json:"version"`
 	Value   string `json:"value,omitempty"`
@@ -308,6 +355,38 @@ func (n node) importState(t *testing.T, payload string) {
 
 // metric reads one counter out of the Prometheus exposition. Labelled series
 // are addressed by their full `name{labels}` form.
+func (n node) topology(t *testing.T) graph {
+	t.Helper()
+	var g graph
+	n.getJSON(t, "/topology", &g)
+	return g
+}
+
+func (n node) diagnostics(t *testing.T) diagnostics {
+	t.Helper()
+	var d diagnostics
+	n.getJSON(t, "/diagnostics", &d)
+	return d
+}
+
+// consistency accepts 409 as well as 200: a divergent cluster is a report, not
+// a failed request.
+func (n node) consistency(t *testing.T) consistency {
+	t.Helper()
+	code, _, body := n.do(t, http.MethodGet, "/consistency", "", nil)
+	if code != http.StatusOK && code != http.StatusConflict {
+		t.Fatalf("%s: GET /consistency = %d: %s", n.name, code, body)
+	}
+	var r consistency
+	if err := json.Unmarshal([]byte(body), &r); err != nil {
+		t.Fatalf("%s: /consistency returned unparseable JSON: %v\n%s", n.name, err, body)
+	}
+	if (code == http.StatusOK) != r.Converged {
+		t.Fatalf("%s: status %d disagrees with converged=%v", n.name, code, r.Converged)
+	}
+	return r
+}
+
 func (n node) metric(t *testing.T, series string) float64 {
 	t.Helper()
 	code, _, body := n.do(t, http.MethodGet, "/metrics", "", nil)

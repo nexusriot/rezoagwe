@@ -53,7 +53,7 @@ func (n *Node) SendAction(text string) {
 
 func (n *Node) sendChatMessage(text string, action bool) {
 	m := pb.ChatMessage{
-		Sender: n.cfg.NodeAddr,
+		Sender: n.cfg.AdvertiseAddr,
 		Nick:   n.Model.Nick(),
 		Text:   text,
 		TS:     time.Now().Unix(),
@@ -75,7 +75,7 @@ func (n *Node) SendDM(target, text string) error {
 		return fmt.Errorf("no such peer: %s", target)
 	}
 	m := pb.ChatMessage{
-		Sender: n.cfg.NodeAddr,
+		Sender: n.cfg.AdvertiseAddr,
 		Nick:   n.Model.Nick(),
 		Text:   text,
 		TS:     time.Now().Unix(),
@@ -84,7 +84,7 @@ func (n *Node) SendDM(target, text string) error {
 	n.send(addr, pb.KindDirectMessage, m)
 	n.appendChat(pb.ChatEntry{
 		TS:     m.TS,
-		Sender: n.cfg.NodeAddr,
+		Sender: n.cfg.AdvertiseAddr,
 		Nick:   m.Nick,
 		Text:   text,
 		Kind:   pb.ChatDirect,

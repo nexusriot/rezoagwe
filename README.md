@@ -48,16 +48,40 @@ For internals, wire protocol, and the failure model, see
   chat over a stream, so a store larger than a datagram syncs correctly;
   the datagram path remains as a fallback
 - Local persistence: identity, values, versions, Lamport clock, tombstones
-  and chat are written atomically after every change and reloaded on
-  startup (`-data`, default `<config dir>/rezoagwe/<node>.json`; `-data -`
-  disables). Node identity survives a restart, so a node keeps its place in
-  the version ordering even if it moves to another port
+  and chat are written atomically and reloaded on startup (`-data`, default
+  `<config dir>/rezoagwe/<node>.json`; `-data -` disables). Writes are
+  coalesced — a burst costs one rewrite, not one per entry — and a clean
+  shutdown flushes. Node identity survives a restart, so a node keeps its
+  place in the version ordering even if it moves to another port
 - **HTTP gateway** (`-http`): `GET/PUT/DELETE /kv/{key}` with `If-Match`
-  compare-and-swap and TTL headers, plus history, peers, chat, activity,
-  export/import, health and Prometheus metrics
+  compare-and-swap, `If-None-Match` conditional reads and TTL headers, plus
+  history, peers, chat, activity, export/import, health and Prometheus
+  metrics — behind an optional bearer token (`-http-token`), TLS
+  (`-http-tls-cert`/`-http-tls-key`) and a read-only mode
+  (`-http-readonly`)
+- **Cluster graph** (`g`, `GET /topology`): who this node can see, who its
+  peers claim to see, which links only one end reports, and whether the
+  known nodes fall into more than one component — which is what a partition
+  looks like from the inside
+- **Diagnostics** (`D`, `GET /diagnostics`, `-doctor`): the counters turned
+  into causes. A key mismatch, a clock out of skew, one-way UDP through a
+  firewall, a loopback address advertised to a LAN, peers about to be
+  evicted — each named, with what to do about it
+- **Consistency check** (`v`, `GET /consistency`, *Verify replicas* on
+  Android): asks every peer to summarise its whole store and reports who
+  disagrees, and about which region of the keyspace. Anti-entropy repairs
+  divergence but never reports it, so a cluster can sit split for as long as
+  nobody looks. All three implementations answer and all three can ask; their
+  bucket digests are pinned to each other byte for byte
+- **`-advertise`**: what peers are told, separate from what the node binds.
+  A node bound to `:3137` otherwise tells every peer to reach it at
+  `:3137`, which each of them resolves to its own loopback
+- **Store limits**: `-max-value-bytes` and `-max-keys` bound what a node
+  will hold, from a local writer or a peer
 - **Replication metrics and an activity feed**: remote applies, stale
   rejections, refused guarded writes and repair traffic are visible rather
-  than silent
+  than silent — as counters, per-peer traffic in both directions, and
+  gauges for what the store holds right now
 - **Key history**: the recorded versions of a key, and who wrote each
 - Robust join: an unreachable or lossy bootstrap can't stall startup, and
   the node keeps retrying while it knows no peers; several seeds can be
@@ -77,7 +101,10 @@ For internals, wire protocol, and the failure model, see
   cluster drawn as a graph, a diagnostics screen that turns counters into
   causes, and a split view — a full peer, not a viewer onto someone else's node
 - Cross-build to Linux (amd64/i386/arm64/armv7/riscv64), FreeBSD, macOS,
-  Windows; Debian packages
+  Windows; Debian packages with systemd units for both roles
+- CI on every push: the Go suite under the race detector, every cross-build
+  target, the desktop suite, the Android unit tests, and the containerised
+  end-to-end run
 
 ---
 
@@ -139,7 +166,21 @@ one directly:
 ```
 
 The version comes from the Makefile, so the package and the binaries inside it
-always agree; `VERSION=0.2.0 ./build-deb.sh amd64` overrides both.
+always agree; `VERSION=0.4.0 ./build-deb.sh amd64` overrides both.
+
+The package also installs systemd units for both roles, their
+`/etc/default` files, and a `rezoagwe` system user owning
+`/var/lib/rezoagwe`. **Neither unit is enabled on install** — which role a
+machine plays is a decision, and starting a rendezvous service nobody asked
+for would put a listener on 9999 the moment the package lands:
+
+```
+sudoedit /etc/default/rezoagwe-discovery     # set -advertise, seeds, psk
+sudo systemctl enable --now rezoagwe-discovery
+```
+
+Stopping a node through systemd announces its departure, so peers drop it at
+once instead of waiting out the eviction timeout.
 
 The desktop client is a separate package — `rezoagwe-desktop`, built from
 `electron/` — so the two install side by side.
@@ -153,8 +194,9 @@ The desktop client is a separate package — `rezoagwe-desktop`, built from
 default port is **9999** (UDP and TCP)
 
 ```
-./rezoagwe-discovery [-bootstrap seeds] [-node addr] [-nick name] [-data file]
-                     [-psk key] [-cluster name] [-http addr] [-headless]
+./rezoagwe-discovery [-bootstrap seeds] [-node addr] [-advertise addr] [-nick name]
+                     [-data file] [-psk key] [-cluster name] [-http addr]
+                     [-http-token tok] [-http-readonly] [-headless] [-doctor]
 ./rezoagwe-discovery -bootstrap :9999 -node :3137 -nick alice
 ./rezoagwe-discovery -bootstrap :9999 -node :3138 -nick bob
 ```
@@ -163,6 +205,25 @@ defaults: `-bootstrap :9999`, `-node :3137`, `-nick anon`,
 `-cluster rezoagwe`. The second node pulls alice's store on join, both see
 each other in the **Nodes** pane, chat flows both ways, and KV writes
 propagate.
+
+**On more than one machine, set `-advertise`.** `-node` is what the socket
+binds; `-advertise` is what peers are told. A node bound to `:3137` tells
+every peer to reach it at `:3137`, and each of them resolves that to its own
+loopback:
+
+```
+./rezoagwe-discovery -bootstrap 10.0.0.9:9999 -node :3137 -advertise 10.0.0.4:3137
+```
+
+If a cluster will not form, ask the node why:
+
+```
+./rezoagwe-discovery -bootstrap 10.0.0.9:9999 -advertise 10.0.0.4:3137 -doctor
+```
+
+It starts, waits out two heartbeats, and prints what is wrong — a key or
+cluster-name mismatch, a clock outside the skew window, one-way UDP, a
+loopback address advertised to a LAN, peers that never answered.
 
 Nodes only talk to peers with the same `-cluster` **and** `-psk`. Without a
 `-psk` the framing key comes from the cluster name alone: that separates two
@@ -205,6 +266,9 @@ run in the app. See [electron/README.md](electron/README.md).
 | `Esc` (filter)  | Clear the filter and go back to the keys list   |
 | `a`             | Switch the feed between chat and activity       |
 | `m`             | Replication metrics                             |
+| `g`             | Cluster graph: peers, links, partitions         |
+| `D`             | Diagnostics: what is actually wrong             |
+| `v`             | Verify every replica holds the same store       |
 | `x` / `i`       | Export / import the store                       |
 | `?`             | Help                                            |
 | `Tab`           | Cycle focus: Keys → Nodes → Feed → Message      |
@@ -235,7 +299,27 @@ curl -X PUT --data-binary 'v' -H 'X-Rezoagwe-TTL: 60' localhost:8080/kv/session
 curl localhost:8080/peers ; curl localhost:8080/health ; curl localhost:8080/metrics
 curl localhost:8080/export > backup.json
 curl -X POST --data-binary @backup.json 'localhost:8080/import?mode=seed'
+curl localhost:8080/topology                    # the cluster as a graph
+curl 'localhost:8080/diagnostics?format=text'   # what is wrong, in prose
+curl localhost:8080/consistency                 # 409 if replicas disagree
 ```
+
+**The gateway is a write surface.** Anything that can reach the port can
+rewrite the whole cluster through `POST /import?mode=seed`, so bind it to
+loopback or lock it down:
+
+```
+./rezoagwe-discovery -headless -http :8080 -http-token "$TOKEN" \
+    -http-tls-cert cert.pem -http-tls-key key.pem
+```
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" https://host:8080/kv/colour
+```
+
+The token is required on **every** route, `/health` and `/metrics`
+included. `-http-readonly` refuses every mutating method, which is what
+makes a gateway safe to point a dashboard or a scraper at.
 
 See [DESIGN.md §8](DESIGN.md#8-http-gateway) for the whole surface.
 

@@ -37,7 +37,11 @@ const DEFAULTS = {
   evictThresholdMs: 15_000,
   sweepIntervalMs: 5_000,
   tombstoneTtlSec: 0,
-  digestBatch: 256,
+  // digestBatch must not exceed either budget: the sender's cursor advances by
+  // the whole digest, so a range that identified more repairs than one round can
+  // carry has its tail stranded until the cursor wraps the entire keyspace.
+  // effectiveDigestBatch() clamps it rather than letting that happen quietly.
+  digestBatch: 128,
   maxPush: 128,
   maxPull: 128,
 };
@@ -98,7 +102,10 @@ class NodeEngine extends EventEmitter {
     this.chatLog = [];
     this.activityLog = [];
     this.persistGen = 0;
-    this.aeCursor = '';
+    // One cursor per peer. A shared cursor divided the keyspace among whichever
+    // peers the random target happened to pick, so covering the whole store
+    // against any single peer took as many wraps as there were peers.
+    this.aeCursors = new Map();
     this.startedAtMs = 0;
     this.nick = this.config.nick;
 
@@ -280,6 +287,10 @@ class NodeEngine extends EventEmitter {
     this.peers.delete(addr);
     for (const [id, mapped] of [...this.idToAddr]) if (mapped === addr) this.idToAddr.delete(id);
     this.publishPeers();
+    // A departed peer's cursor goes with it, or a long-running node accumulates
+    // one per address it has ever spoken to, and a peer that returns resumes a
+    // walk from before it left.
+    this.aeCursors.delete(addr);
   }
 
   /**
@@ -666,12 +677,128 @@ class NodeEngine extends EventEmitter {
         case Kind.BOOTSTRAP_ROSTER:
           await this.applyRoster(W.decodeBootstrapRoster(body));
           break;
+        case Kind.FINGERPRINT:
+          await this.handleFingerprint(W.decodeFingerprint(body));
+          break;
+        case Kind.FINGERPRINT_REPLY:
+          // The checker reads its answers off the stream it asked over, so a
+          // datagram reply needs accepting but not correlating.
+          this.touchPeer(W.decodeFingerprintReply(body).from);
+          break;
         default:
           this.metrics.malformedDrops++;
       }
     } catch (e) {
       this.metrics.malformedDrops++;
     }
+  }
+
+  /**
+   * How far the anti-entropy sweep has walked, as one line.
+   *
+   * There is a cursor per peer now, so a single value would name whichever one
+   * happened to be read. What matters is how many peers are part-way through a
+   * sweep and where the furthest has reached.
+   */
+  sweepSummary() {
+    const known = this.peers.size;
+    if (this.aeCursors.size === 0) return `all ${known} peer(s) at the start of the keyspace`;
+    const furthest = [...this.aeCursors.values()].sort().pop();
+    return `${this.aeCursors.size} of ${known} peer(s) mid-sweep, furthest past "${furthest}"`;
+  }
+
+  /**
+   * Asks every peer to summarise its store and compares the answers with this
+   * node's.
+   *
+   * Over streams, not datagrams: a dropped answer would read as a peer that
+   * disagrees, which is exactly the wrong conclusion to draw from packet loss.
+   */
+  async checkConsistency() {
+    const local = this.store.fingerprint();
+    const peers = [...this.peers.keys()];
+    const results = await Promise.all(peers.map((addr) => this.fingerprintPeer(addr, local)));
+    results.sort((a, b) => (a.addr < b.addr ? -1 : a.addr > b.addr ? 1 : 0));
+
+    return {
+      addr: this.addr,
+      keys: local.keys,
+      tombstones: local.tombstones,
+      clock: local.clock,
+      checkedAtMs: Date.now(),
+      peers: results,
+      converged: !results.some((p) => p.reachable && !p.agrees),
+      unreachable: results.filter((p) => !p.reachable).length,
+    };
+  }
+
+  async fingerprintPeer(addr, local) {
+    const base = { addr, nick: this.nickOf(addr), reachable: false, error: '', keys: 0, tombstones: 0, clock: 0, agrees: false, differingBuckets: [] };
+    const reply = await this.requestFingerprint(addr);
+    if (!reply) return { ...base, error: 'no answer' };
+    if (reply.buckets.length !== local.buckets.length) {
+      // A peer summarising at a different granularity cannot be compared bucket
+      // by bucket; say so rather than reporting a false divergence.
+      return { ...base, error: `peer reported ${reply.buckets.length} buckets, this node uses ${local.buckets.length}` };
+    }
+    const differingBuckets = local.buckets
+      .map((v, i) => (v === reply.buckets[i] ? -1 : i))
+      .filter((i) => i >= 0);
+    return {
+      ...base,
+      nick: reply.nick || base.nick,
+      reachable: true,
+      keys: reply.keys,
+      tombstones: reply.tombstones,
+      clock: reply.clock,
+      agrees: differingBuckets.length === 0,
+      differingBuckets,
+    };
+  }
+
+  /**
+   * One framed round trip that hands the answer back, rather than dispatching it
+   * like exchangeStream does. A consistency check needs the reply, not a side
+   * effect.
+   */
+  async requestFingerprint(peer) {
+    let conn;
+    try {
+      conn = await this.transport.dial(peer);
+      const pkt = this.codec.encode(Kind.FINGERPRINT, W.encodeFingerprint({ from: this.addr }));
+      writeFrame(conn, pkt);
+      this.metrics.sent(Kind.FINGERPRINT, pkt.length);
+
+      const raw = await readFrame(conn);
+      const frame = this.codec.decode(raw);
+      this.metrics.received(frame.kind, raw.length);
+      if (frame.kind !== Kind.FINGERPRINT_REPLY) return null;
+      return W.decodeFingerprintReply(JSON.parse(frame.body.toString('utf8')));
+    } catch (e) {
+      this.metrics.streamErrors++;
+      return null;
+    } finally {
+      if (conn) {
+        try {
+          conn.end();
+        } catch (e) { /* already gone */ }
+      }
+    }
+  }
+
+  /** This node's store summary, labelled so a report can name who produced it. */
+  fingerprintReply() {
+    const r = this.store.fingerprint();
+    r.from = this.addr;
+    r.nick = this.nick;
+    return r;
+  }
+
+  /** Answers a summary request that arrived as a datagram. */
+  async handleFingerprint(req) {
+    if (!req.from) return;
+    this.touchPeer(req.from);
+    await this.send(req.from, Kind.FINGERPRINT_REPLY, W.encodeFingerprintReply(this.fingerprintReply()));
   }
 
   /**
@@ -837,11 +964,18 @@ class NodeEngine extends EventEmitter {
    * covered completely, batch by batch, instead of re-comparing the first N keys
    * forever.
    */
+  /** The digest width actually used: never wider than one round can repair. */
+  effectiveDigestBatch() {
+    return Math.min(this.config.digestBatch, this.config.maxPush, this.config.maxPull);
+  }
+
   async antiEntropyRound(target) {
     if (!target) return;
-    const digest = this.store.digest(this.aeCursor, this.config.digestBatch);
-    if (digest.hi === '') this.aeCursor = ''; // covered the tail; start over
-    else if (digest.entries.length) this.aeCursor = digest.entries[digest.entries.length - 1].key;
+    const digest = this.store.digest(this.aeCursors.get(target) || '', this.effectiveDigestBatch());
+    if (digest.hi === '') this.aeCursors.delete(target); // covered the tail; start over
+    else if (digest.entries.length) {
+      this.aeCursors.set(target, digest.entries[digest.entries.length - 1].key);
+    }
     this.metrics.aeRounds++;
     await this.send(target, Kind.DIGEST, W.encodeDigest({ ...digest, from: this.addr }));
   }
@@ -918,6 +1052,12 @@ class NodeEngine extends EventEmitter {
         const pkt = this.codec.encode(Kind.STATE_RESPONSE, W.encodeStateResponse(this.stateResponse(0)));
         writeFrame(conn, pkt);
         this.metrics.sent(Kind.STATE_RESPONSE, pkt.length);
+      } else if (frame.kind === Kind.FINGERPRINT) {
+        const req = W.decodeFingerprint(JSON.parse(frame.body.toString('utf8')));
+        this.touchPeer(req.from);
+        const pkt = this.codec.encode(Kind.FINGERPRINT_REPLY, W.encodeFingerprintReply(this.fingerprintReply()));
+        writeFrame(conn, pkt);
+        this.metrics.sent(Kind.FINGERPRINT_REPLY, pkt.length);
       } else {
         await this.dispatch(frame.kind, frame.body);
       }
@@ -1261,7 +1401,7 @@ class NodeEngine extends EventEmitter {
       seeds: this.config.seeds,
       peers,
       strangers,
-      store: { ...this.store.stats(), digestCursor: this.aeCursor },
+      store: { ...this.store.stats(), digestCursor: this.sweepSummary() },
       metrics: snapshot,
       topology: this.topology(),
       chatLines: this.chatLog.length,

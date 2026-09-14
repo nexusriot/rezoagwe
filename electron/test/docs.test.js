@@ -169,6 +169,30 @@ test('the message kinds in DESIGN.md are the ones on the wire', () => {
   assert.equal(documented.size, actual.size, 'a message kind exists that DESIGN.md never documents');
 });
 
+// The JS check above only holds two of the three implementations together. The
+// Kotlin table drifted from DESIGN.md's once already — two kinds allocated by
+// the consistency check existed in Go and JS and not in Kotlin, so a packet
+// either of them sent was labelled "unknown" on a phone.
+test('the message kinds in DESIGN.md are the ones the Kotlin port defines', () => {
+  const kotlin = read('android/app/src/main/java/com/nexusriot/rezoagwe/proto/Wire.kt');
+  const block = kotlin.slice(kotlin.indexOf('object Kind {'), kotlin.indexOf('fun name('));
+  const defined = new Map();
+  for (const m of block.matchAll(/const val ([A-Z_]+): Byte = (\d+)/g)) {
+    defined.set(m[1].replace(/_/g, '').toLowerCase(), Number(m[2]));
+  }
+
+  const design = read('DESIGN.md');
+  const documented = new Map();
+  for (const m of design.matchAll(/^\|\s*(\d+)\s*\|\s*`(\w+)`\s*\|/gm)) documented.set(m[2], Number(m[1]));
+
+  for (const [name, value] of documented) {
+    const key = name.toLowerCase();
+    assert.ok(defined.has(key), `DESIGN.md documents kind "${name}" that Wire.kt does not define`);
+    assert.equal(defined.get(key), value, `Wire.kt gives ${name} the wrong number`);
+  }
+  assert.equal(defined.size, documented.size, 'Wire.kt defines a kind DESIGN.md never documents');
+});
+
 test('the HTTP gateway table in DESIGN.md matches the routes the Go server registers', () => {
   const go = read('pkg/discovery/httpapi/httpapi.go');
   const routes = new Set();
@@ -221,7 +245,7 @@ test('the TUI hotkey table matches the keys the controller binds', () => {
   for (const row of table.split('\n')) {
     if (!row.startsWith('|')) continue;
     const keys = row.slice(0, row.indexOf('|', 1) + 1);
-    for (const m of keys.matchAll(/`([a-z?/])`/g)) documented.add(m[1]);
+    for (const m of keys.matchAll(/`([A-Za-z?/])`/g)) documented.add(m[1]);
   }
 
   for (const key of bound) {

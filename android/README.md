@@ -128,6 +128,14 @@ REZOAGWE_GO_PSK=demo REZOAGWE_GO_CLUSTER=e2e \
   ./gradlew :app:testDebugUnitTest --tests '*GoInteropTest'
 ```
 
+* `ParityTest` holds this port to the correctness rules the Go node's tests
+  assert — the anti-entropy digest never wider than one repair round, a
+  keyspace cursor per peer, store limits enforced against a peer as well as a
+  local writer — and pins `KvStore.fingerprint()` to the **same fixed vectors**
+  the Go and desktop suites use. A fold that differed between ports would
+  report two converged replicas as divergent, which is the loudest possible
+  false alarm from the one feature whose job is to be believed.
+
 ## Verified on hardware
 
 Run on a PRITOM M10 tablet (Android 16, 1280x800) against a Go cluster on the
@@ -148,8 +156,48 @@ goodbye to 285 ms. `UiThreadingTest` scans `ui/` and `service/` and fails on any
 call in its denylist that is not inside a `Dispatchers.IO` block, so the
 regression cannot come back quietly.
 
+### The consistency-check round, on the same tablet
+
+A second run, after this port gained the store fingerprint and the *Verify
+replicas* action, against a three-node cluster on a real Wi-Fi LAN: a Go
+rendezvous and two Go peers on one machine (`-advertise` giving them routable
+addresses), the tablet joining as the third.
+
+What it proved that no unit test can:
+
+* **A Kotlin fold and a Go fold agree byte for byte across a network.**
+  `GET /consistency` on a Go peer reported the tablet `reachable: true,
+  agrees: true` — before this round it could only have reported it unreachable.
+* **Divergence is detected *and* localised, then heals.** Forty keys written to
+  the Go node at once left the tablet holding 14 of 45; the check named it
+  immediately — `agrees: false`, **15 of 16 buckets differing** — and eight
+  seconds later, one anti-entropy round on, the same check reported the whole
+  cluster converged. That is the feature's entire argument, observed rather
+  than asserted.
+* **The check runs in both directions.** *Verify replicas* on the Diagnostics
+  screen dialled both Go peers over TCP and reported `agrees — 45 keys` for
+  each. It dispatches to `Dispatchers.IO`, so `UiThreadingTest` covers it.
+* The per-peer sweep line renders (`all 2 peer(s) at the start of the
+  keyspace`, correct for a 45-key store against a 128-key digest), a UI key
+  write reached both Go nodes including the one it was never sent to, chat
+  flowed both ways, and *Stop node* dropped the tablet from the Go roster in
+  3.4 s via its `Goodbye` rather than the 15 s eviction timeout.
+
+Two things worth knowing for the next run. Settings edits are **discarded if you
+navigate away before pressing Apply** — the fields are `remember(saved)`, so a
+tab switch recomposes them from what is stored. And the stock IME appends a
+space after a word-like token, so `e2edev` was typed and `e2edev ` was in the
+field; `Settings.sanitized()` trimmed it on Apply, which is the 2026-09-06 fix
+still doing its job. The diagnostics also caught five transient
+`ENETUNREACH` send failures and named the peer and cause — Wi-Fi, not the app.
+
 ## Known gaps
 
 * The battery cost of the 10 s gossip tick is still unmeasured; **Diag**
   reports whether Doze applies and links to the exemption setting.
 * No import/export UI yet; the engine supports both.
+* **Settings** does not expose the store limits (`maxValueBytes`, `maxKeys`).
+  They are `NodeConfig` options and enforced by the engine against a peer as
+  well as a local writer, but only the Go node has flags for them.
+* Editing **Settings** and navigating away before *Apply* discards the edit,
+  with nothing on screen to say so.

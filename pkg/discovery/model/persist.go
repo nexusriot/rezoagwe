@@ -46,7 +46,10 @@ func (p *Persister) writeAtomic(state PersistState) error {
 			return err
 		}
 	}
-	data, err := json.MarshalIndent(state, "", "  ")
+	// Compact, not indented: this file is rewritten on every flush and is read
+	// by the node, not by a person. Indenting a large store roughly doubles the
+	// bytes written for nothing.
+	data, err := json.Marshal(state)
 	if err != nil {
 		return err
 	}

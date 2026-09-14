@@ -62,7 +62,7 @@ func (n *Node) requestStateFromRandomPeer() {
 // response is not capped by the datagram size. A store or chat history larger
 // than a datagram used to sync as nothing at all: the send simply failed.
 func (n *Node) requestStateFrom(peer string) {
-	req := pb.StateRequest{From: n.cfg.NodeAddr}
+	req := pb.StateRequest{From: n.cfg.AdvertiseAddr}
 	if n.exchangeStream(peer, pb.KindStateRequest, req) {
 		return
 	}
@@ -111,7 +111,7 @@ func (n *Node) exchangeStream(peer string, kind pb.MessageKind, v interface{}) b
 // seeds mean the rendezvous service is no longer a single point of failure for
 // joiners.
 func (n *Node) registerWithBootstrap() {
-	reg := pb.BootstrapRegister{From: n.cfg.NodeAddr, Nick: n.Model.Nick()}
+	reg := pb.BootstrapRegister{From: n.cfg.AdvertiseAddr, Nick: n.Model.Nick()}
 	for _, seed := range n.cfg.BootstrapAddrs {
 		if seed == "" {
 			continue
@@ -125,7 +125,7 @@ func (n *Node) registerWithBootstrap() {
 // reply arrives asynchronously through the normal packet loop, so a dead
 // bootstrap can never stall startup.
 func (n *Node) discoverFromBootstrap() {
-	req := pb.BootstrapDiscover{From: n.cfg.NodeAddr}
+	req := pb.BootstrapDiscover{From: n.cfg.AdvertiseAddr}
 	for _, seed := range n.cfg.BootstrapAddrs {
 		if seed == "" {
 			continue

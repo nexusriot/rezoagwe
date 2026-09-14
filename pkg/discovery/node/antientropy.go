@@ -21,24 +21,38 @@ const batchEntries = 64
 //
 // The cursor walks the sorted keyspace so a store larger than one digest is
 // still covered completely, batch by batch, instead of endlessly re-comparing
-// the first N keys.
+// the first N keys. There is one cursor per peer: a shared cursor split the
+// keyspace among whichever peers the random target happened to pick, so
+// covering the whole store against any one peer took as many wraps as there
+// were peers.
 func (n *Node) antiEntropyRound(target string) {
 	if target == "" {
 		return
 	}
 	n.aeMu.Lock()
-	cursor := n.aeCursor
-	d := n.Model.Store.Digest(cursor, n.cfg.DigestBatch)
+	if n.aeCursors == nil {
+		n.aeCursors = make(map[string]string)
+	}
+	d := n.Model.Store.Digest(n.aeCursors[target], n.cfg.DigestBatch)
 	if d.Hi == "" {
-		n.aeCursor = "" // covered the tail of the keyspace; start over
+		delete(n.aeCursors, target) // covered the tail of the keyspace; start over
 	} else if len(d.Entries) > 0 {
-		n.aeCursor = d.Entries[len(d.Entries)-1].Key
+		n.aeCursors[target] = d.Entries[len(d.Entries)-1].Key
 	}
 	n.aeMu.Unlock()
 
-	d.From = n.cfg.NodeAddr
+	d.From = n.cfg.AdvertiseAddr
 	n.Metrics.AERounds.Add(1)
 	n.send(target, pb.KindDigest, d)
+}
+
+// forgetPeerCursor drops a departed peer's cursor, so its address does not
+// accumulate in a long-running node and a peer that returns starts a clean
+// sweep rather than resuming a walk from before it left.
+func (n *Node) forgetPeerCursor(addr string) {
+	n.aeMu.Lock()
+	delete(n.aeCursors, addr)
+	n.aeMu.Unlock()
 }
 
 // handleDigest answers a peer's digest: push what this node holds and the peer
@@ -61,7 +75,7 @@ func (n *Node) handleDigest(body []byte) {
 		n.Metrics.AEPulled.Add(uint64(len(pull)))
 		n.logActivity("anti-entropy: pulling %d entr%s from %s",
 			len(pull), plural(len(pull)), n.peerName(d.From))
-		n.send(d.From, pb.KindPullRequest, pb.PullRequest{From: n.cfg.NodeAddr, Keys: pull})
+		n.send(d.From, pb.KindPullRequest, pb.PullRequest{From: n.cfg.AdvertiseAddr, Keys: pull})
 	}
 }
 

@@ -150,6 +150,10 @@ func (t *MemTransport) LocalAddr() string { return t.addr }
 
 func (t *MemTransport) Packets() <-chan Packet { return t.packets }
 
+// StreamsAvailable is always true: the in-memory network has no listener to
+// fail to bind.
+func (t *MemTransport) StreamsAvailable() bool { return true }
+
 func (t *MemTransport) Streams() <-chan net.Conn { return t.streams }
 
 func (t *MemTransport) Send(addr string, data []byte) error {

@@ -23,6 +23,11 @@ case "$arch" in
   *)      echo "unsupported architecture: $arch"; exit 1 ;;
 esac
 
+# The same ldflags the Makefile uses. Without -X, the binaries inside a package
+# stamped with a version report "dev" instead — the same drift the
+# version-from-the-Makefile lookup above exists to prevent, one layer down.
+ldflags="-s -w -X main.version=$version"
+
 project="rezoagwe_${version}_${arch}"
 folder_name="build/$project"
 echo "creating $folder_name"
@@ -33,10 +38,12 @@ bin_dir="$folder_name/usr/bin"
 mkdir -p "$bin_dir"
 
 CGO_ENABLED=0 GOOS=linux GOARCH="$goarch" ${goarm:+GOARM=$goarm} \
-  go build -trimpath -ldflags "-s -w" -o "$bin_dir/rezoagwe-bootstrap" ./cmd/bootstrap
+  go build -trimpath -ldflags "$ldflags" -o "$bin_dir/rezoagwe-bootstrap" ./cmd/bootstrap
 CGO_ENABLED=0 GOOS=linux GOARCH="$goarch" ${goarm:+GOARM=$goarm} \
-  go build -trimpath -ldflags "-s -w" -o "$bin_dir/rezoagwe-discovery" ./cmd/discovery
+  go build -trimpath -ldflags "$ldflags" -o "$bin_dir/rezoagwe-discovery" ./cmd/discovery
 chmod 0755 "$bin_dir/rezoagwe-bootstrap" "$bin_dir/rezoagwe-discovery"
+
+./packaging/layout.sh "$folder_name"
 
 sed -i "s/_version_/$version/g" "$folder_name/DEBIAN/control"
 sed -i "s/^Architecture: .*/Architecture: $arch/" "$folder_name/DEBIAN/control"

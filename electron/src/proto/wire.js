@@ -27,6 +27,8 @@ const Kind = Object.freeze({
   PULL_REQUEST: 8,
   KV_BATCH: 9,
   DIRECT_MESSAGE: 10,
+  FINGERPRINT: 11,
+  FINGERPRINT_REPLY: 12,
   BOOTSTRAP_REGISTER: 20,
   BOOTSTRAP_DISCOVER: 21,
   BOOTSTRAP_ROSTER: 22,
@@ -44,6 +46,8 @@ const KIND_NAMES = {
   8: 'pull_request',
   9: 'kv_batch',
   10: 'direct_message',
+  11: 'fingerprint',
+  12: 'fingerprint_reply',
   20: 'bootstrap_register',
   21: 'bootstrap_discover',
   22: 'bootstrap_roster',
@@ -297,6 +301,41 @@ function decodePullRequest(o) {
   return { from: str(o && o.from), keys: list(o && o.keys).filter((k) => typeof k === 'string') };
 }
 
+/** How finely a store is summarised for a consistency check. Must match Go. */
+const FINGERPRINT_BUCKETS = 16;
+
+function encodeFingerprint(f) {
+  return { from: f.from };
+}
+
+function decodeFingerprint(o) {
+  return { from: str(o && o.from) };
+}
+
+function encodeFingerprintReply(r) {
+  return withOmitEmpty({
+    from: r.from,
+    nick: r.nick || '',
+    keys: r.keys || 0,
+    tombstones: r.tombstones || 0,
+    clock: r.clock || 0,
+    buckets: r.buckets || [],
+  }, ['nick']);
+}
+
+function decodeFingerprintReply(o) {
+  return {
+    from: str(o && o.from),
+    nick: str(o && o.nick),
+    keys: num(o && o.keys),
+    tombstones: num(o && o.tombstones),
+    clock: num(o && o.clock),
+    // Go marshals a nil slice as null, which has already dropped one packet
+    // in this project's history.
+    buckets: list(o && o.buckets).filter((b) => typeof b === 'string'),
+  };
+}
+
 function encodeBootstrapRegister(r) {
   return withOmitEmpty({ from: r.from, nick: r.nick || '' }, ['nick']);
 }
@@ -332,6 +371,11 @@ function decodeBootstrapRoster(o) {
 module.exports = {
   Kind,
   kindName,
+  FINGERPRINT_BUCKETS,
+  encodeFingerprint,
+  decodeFingerprint,
+  encodeFingerprintReply,
+  decodeFingerprintReply,
   KVAction,
   ChatKind,
   version,

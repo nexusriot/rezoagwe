@@ -1,10 +1,13 @@
 package com.nexusriot.rezoagwe.core
 
 import com.nexusriot.rezoagwe.proto.Digest
+import com.nexusriot.rezoagwe.proto.FINGERPRINT_BUCKETS
+import com.nexusriot.rezoagwe.proto.FingerprintReply
 import com.nexusriot.rezoagwe.proto.KVAction
 import com.nexusriot.rezoagwe.proto.KVUpdate
 import com.nexusriot.rezoagwe.proto.KeyVersion
 import com.nexusriot.rezoagwe.proto.Version
+import java.security.MessageDigest
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 
@@ -60,6 +63,19 @@ data class Reconciliation(
 )
 
 /**
+ * Bounds on what a store will hold. Both are off (0) by default.
+ *
+ * A limit is a choice to stay up rather than to converge: an update refused for
+ * size is a deliberate divergence from the peer that sent it, and nothing on the
+ * wire reports that. Set the same values on every replica, or the cluster splits
+ * along whichever node was configured tightest.
+ */
+data class Limits(
+    val maxValueBytes: Int = 0,
+    val maxKeys: Int = 0,
+)
+
+/**
  * Version-aware KV store with last-write-wins merge — the Kotlin twin of the Go
  * `model.KVStore`. Both sides have to agree on every rule here, or two replicas of
  * the same cluster silently disagree about what a key holds.
@@ -73,8 +89,26 @@ class KvStore(
     private val store = HashMap<String, KvEntry>()
     private val history = HashMap<String, MutableList<HistoryEntry>>()
     private var onChange: (() -> Unit)? = null
+    private var limits = Limits()
 
     fun setOnChange(f: () -> Unit) = synchronized(lock) { onChange = f }
+
+    fun setLimits(l: Limits) = synchronized(lock) { limits = l }
+
+    fun limits(): Limits = synchronized(lock) { limits }
+
+    /**
+     * Whether a value of this size may be stored under this key. Callers hold the
+     * lock. Enforced against a peer as well as a local writer: a limit the node
+     * it protects is the only one that cannot fill is not a limit.
+     */
+    private fun admits(key: String, value: String, now: Long): Boolean {
+        if (limits.maxValueBytes > 0 && value.toByteArray().size > limits.maxValueBytes) return false
+        if (limits.maxKeys <= 0) return true
+        val existing = store[key]
+        if (existing != null && existing.visible(now)) return true // an update never grows the keyspace
+        return store.count { it.value.visible(now) } < limits.maxKeys
+    }
 
     fun loadState(savedClock: Long, entries: Map<String, KvEntry>) = synchronized(lock) {
         clock = savedClock
@@ -104,6 +138,7 @@ class KvStore(
         val update: KVUpdate
         synchronized(lock) {
             val now = nowSec()
+            if (!remove && !admits(key, value, now)) return null
             val expect = opt.expect
             if (expect != null) {
                 val current = store[key]
@@ -144,6 +179,7 @@ class KvStore(
     fun apply(u: KVUpdate): Boolean {
         synchronized(lock) {
             if (u.version.counter > clock) clock = u.version.counter
+            if (!u.deleted && !admits(u.key, u.value, nowSec())) return false
             val current = store[u.key]
             if (current != null && !u.version.newerThan(current.version)) return false
             val entry = KvEntry(
@@ -222,6 +258,56 @@ class KvStore(
      * it covers with both bounds exclusive. An empty `hi` means the digest reached
      * the end of the keyspace and the caller should restart its cursor.
      */
+    /**
+     * Summarises the whole store as a fixed set of bucket digests, so two replicas
+     * can be compared without shipping either of them.
+     *
+     * A key's bucket comes from the hash of its **name alone**, and what is folded
+     * in is the hash of the whole entry. Bucketing on the name keeps a key in one
+     * place however its value changes, so a differing bucket names a stable region
+     * of the keyspace; folding with XOR keeps a bucket independent of the order
+     * entries were learned in. Tombstones count: two replicas that disagree about
+     * whether a key is deleted have diverged just as much as two that disagree
+     * about its value.
+     *
+     * Byte-for-byte identical to the Go and JavaScript stores, and pinned there.
+     */
+    fun fingerprint(buckets: Int = FINGERPRINT_BUCKETS): FingerprintReply = synchronized(lock) {
+        val n = if (buckets > 0) buckets else FINGERPRINT_BUCKETS
+        val folds = Array(n) { ByteArray(32) }
+        var keys = 0
+        var tombstones = 0
+        val now = nowSec()
+
+        for ((k, e) in store) {
+            if (e.deleted) tombstones++ else if (e.visible(now)) keys++
+
+            // The bucket is the first four bytes of SHA-256(key), big endian and
+            // unsigned, modulo the bucket count — exactly what Go's
+            // binary.BigEndian.Uint32 does.
+            val nameHash = MessageDigest.getInstance("SHA-256").digest(k.toByteArray())
+            var u32 = 0L
+            for (i in 0 until 4) u32 = (u32 shl 8) or (nameHash[i].toLong() and 0xff)
+            val idx = (u32 % n).toInt()
+
+            val digest = MessageDigest.getInstance("SHA-256")
+            digest.update(k.toByteArray())
+            digest.update(byteArrayOf(0))
+            digest.update("${e.version.counter}/${e.version.node}/${e.deleted}".toByteArray())
+            val sum = digest.digest()
+
+            val fold = folds[idx]
+            for (i in fold.indices) fold[i] = (fold[i].toInt() xor sum[i].toInt()).toByte()
+        }
+
+        FingerprintReply(
+            keys = keys,
+            tombstones = tombstones,
+            clock = clock,
+            buckets = folds.map { f -> f.joinToString("") { "%02x".format(it) } },
+        )
+    }
+
     fun digest(after: String, limit: Int): Digest = synchronized(lock) {
         val keys = store.keys.filter { after.isEmpty() || it > after }.sorted()
         val batch = if (keys.size > limit) keys.take(limit) else keys

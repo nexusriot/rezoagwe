@@ -32,7 +32,7 @@ BIN_DISC   := rezoagwe-discovery
 PKG_BOOT   := ./cmd/bootstrap
 PKG_DISC   := ./cmd/discovery
 GO         ?= go
-VERSION    ?= 0.2.0
+VERSION    ?= 0.4.0
 # The version is injected into both binaries: renaming the output file is not
 # the same as building a binary that knows what it is, and the two used to
 # drift apart the moment anyone passed VERSION=.
@@ -63,6 +63,7 @@ define build_deb
 	CGO_ENABLED=0 GOOS=linux GOARCH=$(2) $(if $(3),GOARM=$(3),) \
 		$(GO) build -trimpath -ldflags "$(LDFLAGS)" -o "$(BUILD_DIR)/$(APP)_$(VERSION)_$(1)/usr/bin/$(BIN_DISC)" $(PKG_DISC)
 	@chmod 0755 "$(BUILD_DIR)/$(APP)_$(VERSION)_$(1)/usr/bin/$(BIN_BOOT)" "$(BUILD_DIR)/$(APP)_$(VERSION)_$(1)/usr/bin/$(BIN_DISC)"
+	@./packaging/layout.sh "$(BUILD_DIR)/$(APP)_$(VERSION)_$(1)"
 	@sed -i "s/_version_/$(VERSION)/g" "$(BUILD_DIR)/$(APP)_$(VERSION)_$(1)/DEBIAN/control"
 	@sed -i "s/^Architecture: .*/Architecture: $(1)/" "$(BUILD_DIR)/$(APP)_$(VERSION)_$(1)/DEBIAN/control"
 	cd $(BUILD_DIR) && dpkg-deb --build -Z gzip --root-owner-group "$(APP)_$(VERSION)_$(1)"

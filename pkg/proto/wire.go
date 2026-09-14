@@ -34,6 +34,8 @@ const (
 	KindPullRequest   MessageKind = 8
 	KindKVBatch       MessageKind = 9
 	KindDirectMessage MessageKind = 10
+	KindFingerprint   MessageKind = 11
+	KindFingerprintOK MessageKind = 12
 
 	KindBootstrapRegister MessageKind = 20
 	KindBootstrapDiscover MessageKind = 21
@@ -65,6 +67,10 @@ func (k MessageKind) String() string {
 		return "kv_batch"
 	case KindDirectMessage:
 		return "direct_message"
+	case KindFingerprint:
+		return "fingerprint"
+	case KindFingerprintOK:
+		return "fingerprint_reply"
 	case KindBootstrapRegister:
 		return "bootstrap_register"
 	case KindBootstrapDiscover:
@@ -273,6 +279,35 @@ type PullRequest struct {
 	From string   `json:"from"`
 	Keys []string `json:"keys"`
 }
+
+// Fingerprint asks a peer to summarise its whole store, so two replicas can be
+// compared without shipping either of them.
+type Fingerprint struct {
+	From string `json:"from"`
+}
+
+// FingerprintReply summarises a whole store.
+//
+// Anti-entropy repairs divergence but never reports it, so a cluster can sit
+// split for as long as nobody looks. Buckets are the smallest thing that turns
+// "these two disagree" into "these two disagree about this part of the
+// keyspace": each is an order-independent fold of the (key, version) pairs
+// that hash into it, so two replicas holding the same versions produce the
+// same bucket whatever order they learned them in.
+type FingerprintReply struct {
+	From       string `json:"from"`
+	Nick       string `json:"nick,omitempty"`
+	Keys       int    `json:"keys"`
+	Tombstones int    `json:"tombstones"`
+	Clock      uint64 `json:"clock"`
+	// Buckets is FingerprintBuckets hex digests, indexed by bucket.
+	Buckets []string `json:"buckets"`
+}
+
+// FingerprintBuckets is how finely a store is summarised. Sixteen is enough to
+// point at a region of the keyspace and small enough that the reply fits in a
+// datagram alongside everything else.
+const FingerprintBuckets = 16
 
 // BootstrapRegister announces a node to the rendezvous service.
 type BootstrapRegister struct {

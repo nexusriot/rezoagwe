@@ -4,7 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const { KvStore } = require('../src/core/kvstore');
-const { version, KVAction } = require('../src/proto/wire');
+const { version, KVAction, FINGERPRINT_BUCKETS } = require('../src/proto/wire');
 
 /**
  * The replication rules, asserted the way the Go and Kotlin stores assert them.
@@ -250,4 +250,74 @@ test('stats describe the shape of the store for the diagnostics screen', () => {
   assert.equal(stats.largestKey, 'big');
   assert.equal(stats.largestValueBytes, 100);
   assert.ok(stats.valueBytes >= 101);
+});
+
+// The store fingerprint is what a consistency check compares, so a JavaScript
+// node and a Go node must produce byte-identical digests for the same entries.
+// Anything else reports two converged replicas as divergent — the loudest
+// possible false alarm, from the one feature whose whole job is to be trusted.
+//
+// These are the digests the Go KVStore.Fingerprint emits for the entries below.
+const GO_FINGERPRINT = {
+  7: 'a2026aaa5ddb78cb47d1db8e5973b787420dafb7fc1ad30cca5944a5495f9898',
+  13: '5afa98b8cab4abc9294acac825fad1b3f02d6125ec2f5b0def0456acb56e3abc',
+};
+const ZERO = '0'.repeat(64);
+
+function vectorStore() {
+  const kv = new KvStore('node-a');
+  kv.apply({ action: KVAction.SET, key: 'alpha', value: 'one', version: { counter: 3, node: 'node-a' }, expiresAt: 0, deletedAt: 0 });
+  kv.apply({ action: KVAction.SET, key: 'beta', value: 'two', version: { counter: 7, node: 'node-b' }, expiresAt: 0, deletedAt: 0 });
+  kv.apply({ action: KVAction.DELETE, key: 'gamma', value: '', version: { counter: 9, node: 'node-a' }, expiresAt: 0, deletedAt: 1700000000 });
+  return kv;
+}
+
+test('the store fingerprint matches the Go vectors byte for byte', () => {
+  const f = vectorStore().fingerprint();
+
+  assert.equal(f.buckets.length, FINGERPRINT_BUCKETS);
+  assert.equal(f.keys, 2, 'the tombstone must not be counted as a live key');
+  assert.equal(f.tombstones, 1);
+  assert.equal(f.clock, 9, 'the clock must have advanced past every version applied');
+
+  for (let i = 0; i < FINGERPRINT_BUCKETS; i++) {
+    assert.equal(f.buckets[i], GO_FINGERPRINT[i] ?? ZERO, `bucket ${i} differs from Go`);
+  }
+});
+
+// The fold is an XOR so it cannot depend on insertion order: two replicas that
+// learned the same writes in a different sequence have to agree, or the check
+// is worse than not having one.
+test('the fingerprint does not depend on the order entries were learned', () => {
+  const forwards = vectorStore().fingerprint();
+
+  const backwards = new KvStore('node-a');
+  backwards.apply({ action: KVAction.DELETE, key: 'gamma', value: '', version: { counter: 9, node: 'node-a' }, expiresAt: 0, deletedAt: 1700000000 });
+  backwards.apply({ action: KVAction.SET, key: 'beta', value: 'two', version: { counter: 7, node: 'node-b' }, expiresAt: 0, deletedAt: 0 });
+  backwards.apply({ action: KVAction.SET, key: 'alpha', value: 'one', version: { counter: 3, node: 'node-a' }, expiresAt: 0, deletedAt: 0 });
+
+  assert.deepEqual(backwards.fingerprint().buckets, forwards.buckets);
+});
+
+// A key stays in the bucket its *name* chose, whatever happens to its value.
+// Bucketing on the whole entry instead relocates a key on every write, so one
+// stale value lights up two buckets and neither names a region you could go and
+// look at — which is the only reason to have buckets rather than one digest.
+test('a differing version changes exactly one bucket, and does not relocate the key', () => {
+  const a = vectorStore();
+  const b = vectorStore();
+  b.apply({ action: KVAction.SET, key: 'alpha', value: 'one', version: { counter: 4, node: 'node-a' }, expiresAt: 0, deletedAt: 0 });
+
+  const fa = a.fingerprint();
+  const fb = b.fingerprint();
+  const differing = fa.buckets.filter((v, i) => v !== fb.buckets[i]).length;
+  assert.equal(differing, 1, 'exactly one bucket should differ for one differing key');
+});
+
+// Two empty stores must agree, or every fresh cluster starts out "divergent".
+test('two empty stores fingerprint identically', () => {
+  const a = new KvStore('node-a').fingerprint();
+  const b = new KvStore('node-b').fingerprint();
+  assert.deepEqual(a.buckets, b.buckets);
+  assert.ok(a.buckets.every((v) => v === ZERO), 'an empty store should fold to zeroes');
 });
