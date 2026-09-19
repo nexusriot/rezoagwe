@@ -32,7 +32,7 @@ BIN_DISC   := rezoagwe-discovery
 PKG_BOOT   := ./cmd/bootstrap
 PKG_DISC   := ./cmd/discovery
 GO         ?= go
-VERSION    ?= 0.4.0
+VERSION    ?= 0.4.1
 # The version is injected into both binaries: renaming the output file is not
 # the same as building a binary that knows what it is, and the two used to
 # drift apart the moment anyone passed VERSION=.
@@ -100,6 +100,7 @@ help:
 	@echo "  make electron-clean     - remove electron/dist/ and the generated icon"
 	@echo "  make test | test-race | vet | fmt | tidy | clean"
 	@echo "  make e2e                - hermetic multi-node run in Docker"
+	@echo "  make chart              - re-export rezo_agwe.png from rezo_agwe.drawio"
 
 # Gradle needs a JDK. Android Studio ships one, so fall back to it rather than
 # failing on a machine that has no system-wide java.
@@ -202,6 +203,13 @@ test-race:
 .PHONY: e2e
 e2e:
 	@scripts/e2e.sh
+
+# The README's picture, re-exported from its draw.io source. A committed
+# image keeps claiming whatever it claimed the day it was exported, and this
+# one spent four releases saying "protobuf" and "no auth".
+.PHONY: chart
+chart:
+	@scripts/render-chart.sh
 
 .PHONY: clean
 clean:

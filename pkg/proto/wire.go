@@ -23,19 +23,19 @@ import (
 type MessageKind byte
 
 const (
-	KindKV            MessageKind = 0
-	KindChat          MessageKind = 1
-	KindStateRequest  MessageKind = 2
-	KindStateResponse MessageKind = 3
-	KindPeerGossip    MessageKind = 4
-	KindHello         MessageKind = 5
-	KindGoodbye       MessageKind = 6
-	KindDigest        MessageKind = 7
-	KindPullRequest   MessageKind = 8
-	KindKVBatch       MessageKind = 9
-	KindDirectMessage MessageKind = 10
-	KindFingerprint   MessageKind = 11
-	KindFingerprintOK MessageKind = 12
+	KindKV               MessageKind = 0
+	KindChat             MessageKind = 1
+	KindStateRequest     MessageKind = 2
+	KindStateResponse    MessageKind = 3
+	KindPeerGossip       MessageKind = 4
+	KindHello            MessageKind = 5
+	KindGoodbye          MessageKind = 6
+	KindDigest           MessageKind = 7
+	KindPullRequest      MessageKind = 8
+	KindKVBatch          MessageKind = 9
+	KindDirectMessage    MessageKind = 10
+	KindFingerprint      MessageKind = 11
+	KindFingerprintReply MessageKind = 12
 
 	KindBootstrapRegister MessageKind = 20
 	KindBootstrapDiscover MessageKind = 21
@@ -69,7 +69,7 @@ func (k MessageKind) String() string {
 		return "direct_message"
 	case KindFingerprint:
 		return "fingerprint"
-	case KindFingerprintOK:
+	case KindFingerprintReply:
 		return "fingerprint_reply"
 	case KindBootstrapRegister:
 		return "bootstrap_register"

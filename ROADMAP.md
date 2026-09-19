@@ -10,15 +10,52 @@ the code it touches.
 
 ## Shipped
 
-The repository is at **0.4.0** — the version the Makefile stamps into the Go
+The repository is at **0.4.1** — the version the Makefile stamps into the Go
 binaries and their `.deb`, the desktop client's `package.json`, and the Android
-app's `versionName`; a test keeps the four in step. 0.4.0 is an observability,
-hardening and parity round: the Go node caught up with what its own ports could
-already show, the gateway stopped being an unauthenticated write surface, and
-the correctness fixes were carried into the Kotlin and JavaScript ports — which
-had been carrying the same anti-entropy defect all along.
+app's `versionName`; a test keeps the four in step.
+
+0.4.1 is a documentation round: the prose was in good shape because a test suite
+holds it there, and the two things that suite could not see — the picture, and
+whatever the code grew that no document mentions — were both wrong.
+
+0.4.0 before it was an observability, hardening and parity round: the Go node
+caught up with what its own ports could already show, the gateway stopped being
+an unauthenticated write surface, and the correctness fixes were carried into
+the Kotlin and JavaScript ports — which had been carrying the same anti-entropy
+defect all along.
 
 Newest first.
+
+### 0.4.1 — documentation and the chart
+
+- ✅ **The chart redrawn** — `rezo_agwe.png` was exported before wire v2 and had
+  been wrong ever since: "protobuf · UDP", "no acks, no auth, no anti-entropy",
+  message kinds 0–6 of the 16 that exist, a version tiebreak on the node's
+  *address*, and no sign of the HTTP gateway, the TCP state sync, the two ports,
+  or anything from §12–§14. It now draws the protocol as it is.
+- ✅ **`make chart`** (`scripts/render-chart.sh`) — the export is one command
+  rather than a GUI session, which is the actual reason the old one rotted for
+  four releases. It quantises the result, so the README's picture costs 400 KB
+  instead of 1.2 MB.
+- ✅ **The chart is tested** — the suite asserts the drawing names every message
+  kind, makes the claims about the protocol that are the point of having it, and
+  makes none of the ones it outgrew, and that the `.png` is not older than the
+  `.drawio` it came from. An image is the one document that rots invisibly.
+- ✅ **A complete command-line reference**
+  ([DESIGN.md §15](DESIGN.md#15-command-line-reference)) — every flag both
+  binaries accept. `-timeout` and `-version` were documented nowhere at all,
+  because the flag test only ever ran README → code and never code → README.
+  It now runs both ways.
+- ✅ **DESIGN.md §3.2 checked against Go** — the message-kind table was pinned to
+  the Kotlin and JavaScript ports and never to the reference implementation,
+  which is how `KindFingerprintOK` came to be the only name in the project that
+  was not the documented `FingerprintReply`. Renamed, and the third check added.
+- ✅ **Smaller corrections** — the desktop README pointed at the wrong roadmap
+  item for its own tray-icon entry; §9 and §10 listed the engine files of the
+  two ports but not their transports, persistence, runtime or — for the desktop
+  — the diagnostics module the README advertises a screen for; and the Android
+  section credited `Transport.kt` with the `Dispatchers.IO` dispatch that is
+  actually made, and enforced, at every call site in `ui/`.
 
 ### Parity across the three implementations
 

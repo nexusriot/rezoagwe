@@ -71,7 +71,7 @@ make deb-manual            # a .deb with dpkg-deb alone: no fpm, no network
 ```
 
 The version comes from `package.json` and can be overridden for a one-off build
-— `make deb VERSION=0.4.0` stamps it into the artifact *and* into the app, so
+— `make deb VERSION=0.9.0-rc1` stamps it into the artifact *and* into the app, so
 what the file is called and what the app reports cannot drift apart.
 
 Two packaging paths exist on purpose, because they fail in different places:
@@ -214,7 +214,7 @@ which has no desktop at all.
   announces a `Goodbye`, so peers drop this node at once instead of waiting out
   the eviction timeout. On macOS the app follows the platform convention and
   stays alive with its window closed. A tray icon and a close-to-tray setting
-  are item 9 in [the roadmap](../ROADMAP.md).
+  are item 6 in [the roadmap](../ROADMAP.md).
 * Settings are kept in the Electron user-data directory
   (`~/.config/rezoagwe-desktop/settings.json` on Linux), next to the node's own
   state file. Changing the port, cluster or key restarts whichever role is

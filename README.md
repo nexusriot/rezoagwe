@@ -24,6 +24,11 @@ For internals, wire protocol, and the failure model, see
 ### **Design (concept)**
 
 ![Pic](https://github.com/nexusriot/rezoagwe/blob/main/rezo_agwe.png)
+
+The picture is exported from [rezo_agwe.drawio](rezo_agwe.drawio) — edit that,
+then `make chart`. A test fails if the two drift apart, or if the drawing starts
+claiming something the protocol stopped doing.
+
 ---
 
 ### Features
@@ -166,7 +171,7 @@ one directly:
 ```
 
 The version comes from the Makefile, so the package and the binaries inside it
-always agree; `VERSION=0.4.0 ./build-deb.sh amd64` overrides both.
+always agree; `VERSION=0.9.0-rc1 ./build-deb.sh amd64` overrides both.
 
 The package also installs systemd units for both roles, their
 `/etc/default` files, and a `rezoagwe` system user owning
@@ -228,6 +233,10 @@ loopback address advertised to a LAN, peers that never answered.
 Nodes only talk to peers with the same `-cluster` **and** `-psk`. Without a
 `-psk` the framing key comes from the cluster name alone: that separates two
 clusters sharing a network, but provides no secrecy.
+
+The flags above are the ones a first run needs. For every flag both binaries
+accept — store limits, tombstone GC, TLS, logging — see
+[DESIGN.md §15](DESIGN.md#15-command-line-reference).
 
 ### Desktop app
 

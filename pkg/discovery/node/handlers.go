@@ -114,7 +114,7 @@ func (n *Node) dispatch(kind pb.MessageKind, body []byte) {
 		n.handlePullRequest(body)
 	case pb.KindFingerprint:
 		n.handleFingerprint(body)
-	case pb.KindFingerprintOK:
+	case pb.KindFingerprintReply:
 		n.handleFingerprintReply(body)
 	case pb.KindBootstrapRoster:
 		n.handleBootstrapRoster(body)
@@ -408,7 +408,7 @@ func (n *Node) serveStream(conn net.Conn) {
 			return
 		}
 		n.Model.TouchPeer(req.From)
-		resp, err := n.codec.Encode(pb.KindFingerprintOK, n.fingerprintReply())
+		resp, err := n.codec.Encode(pb.KindFingerprintReply, n.fingerprintReply())
 		if err != nil {
 			log.Errorf("encode fingerprint: %s", err)
 			return
@@ -418,7 +418,7 @@ func (n *Node) serveStream(conn net.Conn) {
 			log.Debugf("write fingerprint: %s", err)
 			return
 		}
-		n.Metrics.Sent(pb.KindFingerprintOK, len(resp))
+		n.Metrics.Sent(pb.KindFingerprintReply, len(resp))
 	default:
 		// Everything else belongs on the datagram path.
 		n.dispatch(kind, body)

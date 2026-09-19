@@ -1,105 +1,143 @@
-<mxfile host="Electron" agent="draw.io/24.7.5" version="24.7.5">
-  <diagram name="Page-1" id="cz9IgB68-VeOPfgHskPc">
-    <mxGraphModel dx="925" dy="733" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="860" pageHeight="820" math="0" shadow="0">
+<mxfile host="Electron" agent="draw.io" version="24.7.5">
+  <diagram name="rezoagwe" id="cz9IgB68-VeOPfgHskPc">
+    <mxGraphModel dx="1400" dy="1100" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1340" pageHeight="1090" math="0" shadow="0">
       <root>
         <mxCell id="0" />
         <mxCell id="1" parent="0" />
-        <mxCell id="title" value="Rezoagwe — eventually-consistent distributed KV store + embedded chat (concept)" style="text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=15;fontStyle=1" parent="1" vertex="1">
-          <mxGeometry x="120" y="15" width="620" height="40" as="geometry" />
+
+        <mxCell id="title" value="Rezoagwe — eventually-consistent distributed KV store + embedded chat" style="text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=17;fontStyle=1" parent="1" vertex="1">
+          <mxGeometry x="40" y="12" width="1260" height="28" as="geometry" />
         </mxCell>
-        <mxCell id="boot" value="Bootstrap node" style="rounded=0;whiteSpace=wrap;html=1;verticalAlign=top;spacingTop=6;fontStyle=1;" parent="1" vertex="1">
-          <mxGeometry x="330" y="90" width="200" height="95" as="geometry" />
+        <mxCell id="subtitle" value="wire v2 · every packet authenticated · UDP datagrams + TCP streams · four implementations of one protocol" style="text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=11;fontColor=#555555" parent="1" vertex="1">
+          <mxGeometry x="40" y="40" width="1260" height="20" as="geometry" />
         </mxCell>
-        <mxCell id="boot_nodes" value="known nodes&#xa;(addr → last-seen)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=11;" parent="1" vertex="1">
-          <mxGeometry x="345" y="128" width="170" height="45" as="geometry" />
+
+        <mxCell id="join" value="&lt;b&gt;Joining&lt;/b&gt;&#xa;1. bind the socket and start the loops — serving comes first, so an unreachable bootstrap can never stall startup&#xa;2. REGISTER with every seed, then DISCOVER the roster&#xa;3. greet every peer learned, so they learn this node back&#xa;4. pull one peer&#39;s whole store over a stream and &lt;i&gt;merge&lt;/i&gt; it by version, recent chat riding along" style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacingLeft=10;spacingTop=6;fontSize=10;fillColor=#f5f5f5;strokeColor=#999999;" parent="1" vertex="1">
+          <mxGeometry x="40" y="80" width="390" height="128" as="geometry" />
         </mxCell>
-        <mxCell id="boot_note" value="protobuf · UDP&#xa;consulted at join + 5 s heartbeat;&#xa;never sees KV or chat" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;fontSize=10;fontColor=#333333;" parent="1" vertex="1">
-          <mxGeometry x="545" y="108" width="165" height="55" as="geometry" />
+
+        <mxCell id="boot" value="Bootstrap — rendezvous service" style="rounded=0;whiteSpace=wrap;html=1;verticalAlign=top;spacingTop=8;fontStyle=1;fillColor=#fff2cc;strokeColor=#d6b656;" parent="1" vertex="1">
+          <mxGeometry x="470" y="80" width="400" height="128" as="geometry" />
         </mxCell>
-        <mxCell id="legend" value="&lt;b&gt;peer-to-peer&lt;/b&gt;  ·  1-byte kind + JSON body  ·  UDP&#xa;0  KV — versioned set/delete, last-write-wins&#xa;1  Chat — broadcast&#xa;2·3  StateRequest / StateResponse — full KV + recent&#xa;        chat on join, merged by version&#xa;4  PeerGossip — known peers, every 10 s&#xa;5  Hello — peer learning + heartbeat (5 s)&#xa;6  Goodbye — clean leave on Ctrl+Q" style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacingLeft=10;spacingTop=8;fontSize=11;fillColor=#e6f2ff;strokeColor=#0000CC;" parent="1" vertex="1">
-          <mxGeometry x="270" y="205" width="320" height="150" as="geometry" />
+        <mxCell id="boot_roster" value="roster&#xa;addr → nick, id, last-seen&#xa;persisted, survives a restart" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#999999;fontSize=11;" parent="1" vertex="1">
+          <mxGeometry x="486" y="116" width="182" height="76" as="geometry" />
         </mxCell>
-        <mxCell id="dA" value="Discovery node A" style="rounded=1;whiteSpace=wrap;html=1;verticalAlign=top;spacingTop=6;fontStyle=1;" parent="1" vertex="1">
-          <mxGeometry x="55" y="385" width="215" height="205" as="geometry" />
+        <mxCell id="boot_kinds" value="20 BootstrapRegister&#xa;21 BootstrapDiscover&#xa;22 BootstrapRoster" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#999999;fontSize=11;align=left;spacingLeft=12;" parent="1" vertex="1">
+          <mxGeometry x="682" y="116" width="172" height="76" as="geometry" />
         </mxCell>
-        <mxCell id="dA_kv" value="KV store&#xa;versioned (LWW) + tombstones" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;" parent="1" vertex="1">
-          <mxGeometry x="70" y="415" width="185" height="46" as="geometry" />
+
+        <mxCell id="boot_note" value="&lt;b&gt;What it is not&lt;/b&gt;&#xa;Consulted once at join, then REGISTER every 5 s so a dead client is forgotten. It speaks the same authenticated framing as every other packet — there is no unauthenticated path to keep tested.&#xa;It never sees KV data or chat, and if it dies after startup the cluster keeps working: peers gossip among themselves from then on." style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacingLeft=10;spacingTop=6;fontSize=10;fillColor=#f5f5f5;strokeColor=#999999;" parent="1" vertex="1">
+          <mxGeometry x="910" y="80" width="390" height="128" as="geometry" />
         </mxCell>
-        <mxCell id="dA_peers" value="peer list (addr, nick)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=11;" parent="1" vertex="1">
-          <mxGeometry x="70" y="468" width="185" height="32" as="geometry" />
+
+        <mxCell id="dA" value="Discovery node A — a full peer" style="rounded=1;whiteSpace=wrap;html=1;verticalAlign=top;spacingTop=8;fontStyle=1;fillColor=#f8f8f8;strokeColor=#666666;" parent="1" vertex="1">
+          <mxGeometry x="40" y="250" width="390" height="372" as="geometry" />
         </mxCell>
-        <mxCell id="dA_chat" value="chat log" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" parent="1" vertex="1">
-          <mxGeometry x="70" y="507" width="185" height="32" as="geometry" />
+        <mxCell id="dA_kv" value="KV store — every entry carries a version&#xa;{Lamport counter, node id}&#xa;last-write-wins · versioned tombstones · TTL · compare-and-swap" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;" parent="1" vertex="1">
+          <mxGeometry x="56" y="286" width="358" height="66" as="geometry" />
         </mxCell>
-        <mxCell id="dA_disk" value="KV snapshot&#xa;(JSON, atomic write)" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=12;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=10;" parent="1" vertex="1">
-          <mxGeometry x="102" y="625" width="120" height="60" as="geometry" />
+        <mxCell id="dA_peers" value="peer table&#xa;addr · nick · node id&#xa;last-seen (evict at 15 s)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#999999;fontSize=11;" parent="1" vertex="1">
+          <mxGeometry x="56" y="362" width="174" height="62" as="geometry" />
         </mxCell>
-        <mxCell id="dB" value="Discovery node B" style="rounded=1;whiteSpace=wrap;html=1;verticalAlign=top;spacingTop=6;fontStyle=1;" parent="1" vertex="1">
-          <mxGeometry x="590" y="385" width="215" height="205" as="geometry" />
+        <mxCell id="dA_views" value="gossiped peer views&#xa;what each peer says&#xa;&lt;i&gt;it&lt;/i&gt; can see → the graph" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#999999;fontSize=11;" parent="1" vertex="1">
+          <mxGeometry x="240" y="362" width="174" height="62" as="geometry" />
         </mxCell>
-        <mxCell id="dB_kv" value="KV store&#xa;versioned (LWW) + tombstones" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;" parent="1" vertex="1">
-          <mxGeometry x="605" y="415" width="185" height="46" as="geometry" />
+        <mxCell id="dA_chat" value="chat ring&#xa;structured entries,&#xa;not pre-rendered lines" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#999999;fontSize=11;" parent="1" vertex="1">
+          <mxGeometry x="56" y="434" width="174" height="60" as="geometry" />
         </mxCell>
-        <mxCell id="dB_peers" value="peer list (addr, nick)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=11;" parent="1" vertex="1">
-          <mxGeometry x="605" y="468" width="185" height="32" as="geometry" />
+        <mxCell id="dA_metrics" value="metrics&#xa;per-peer packets/bytes&#xa;both ways · gauges" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#999999;fontSize=11;" parent="1" vertex="1">
+          <mxGeometry x="240" y="434" width="174" height="60" as="geometry" />
         </mxCell>
-        <mxCell id="dB_chat" value="chat log" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" parent="1" vertex="1">
-          <mxGeometry x="605" y="507" width="185" height="32" as="geometry" />
+        <mxCell id="dA_disk" value="state file — identity, Lamport clock, every entry (tombstones included), chat&#xa;atomic rename + generation guard · at most one rewrite per 250 ms" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" parent="1" vertex="1">
+          <mxGeometry x="56" y="504" width="358" height="50" as="geometry" />
         </mxCell>
-        <mxCell id="dB_disk" value="KV snapshot&#xa;(JSON, atomic write)" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=12;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=10;" parent="1" vertex="1">
-          <mxGeometry x="637" y="625" width="120" height="60" as="geometry" />
+        <mxCell id="dA_front" value="one engine, three front ends:&#xa;TUI (tview) · HTTP gateway (-http) · -doctor" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;" parent="1" vertex="1">
+          <mxGeometry x="56" y="564" width="358" height="44" as="geometry" />
         </mxCell>
-        <mxCell id="e_regA" value="REGISTER / DISCOVER" style="endArrow=classic;html=1;rounded=0;strokeColor=#660033;fontColor=#660033;fontSize=10;exitX=0.16;exitY=0;exitDx=0;exitDy=0;entryX=0;entryY=0.55;entryDx=0;entryDy=0;" parent="1" source="dA" target="boot" edge="1">
-          <mxGeometry relative="1" as="geometry">
-            <Array as="points">
-              <mxPoint x="90" y="140" />
-            </Array>
-          </mxGeometry>
+
+        <mxCell id="dB" value="Discovery node B — a full peer" style="rounded=1;whiteSpace=wrap;html=1;verticalAlign=top;spacingTop=8;fontStyle=1;fillColor=#f8f8f8;strokeColor=#666666;" parent="1" vertex="1">
+          <mxGeometry x="910" y="250" width="390" height="372" as="geometry" />
         </mxCell>
-        <mxCell id="e_listA" value="node list" style="endArrow=classic;html=1;rounded=0;strokeColor=#0000CC;fontColor=#0000CC;fontSize=10;exitX=0;exitY=0.8;exitDx=0;exitDy=0;entryX=0;entryY=0.28;entryDx=0;entryDy=0;" parent="1" source="boot" target="dA" edge="1">
-          <mxGeometry relative="1" as="geometry">
-            <Array as="points">
-              <mxPoint x="35" y="166" />
-              <mxPoint x="35" y="442" />
-            </Array>
-          </mxGeometry>
+        <mxCell id="dB_kv" value="KV store — every entry carries a version&#xa;{Lamport counter, node id}&#xa;last-write-wins · versioned tombstones · TTL · compare-and-swap" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;" parent="1" vertex="1">
+          <mxGeometry x="926" y="286" width="358" height="66" as="geometry" />
         </mxCell>
-        <mxCell id="e_regB" value="REGISTER / DISCOVER" style="endArrow=classic;html=1;rounded=0;strokeColor=#660033;fontColor=#660033;fontSize=10;exitX=0.84;exitY=0;exitDx=0;exitDy=0;entryX=1;entryY=0.55;entryDx=0;entryDy=0;" parent="1" source="dB" target="boot" edge="1">
-          <mxGeometry relative="1" as="geometry">
-            <Array as="points">
-              <mxPoint x="770" y="140" />
-            </Array>
-          </mxGeometry>
+        <mxCell id="dB_peers" value="peer table&#xa;addr · nick · node id&#xa;last-seen (evict at 15 s)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#999999;fontSize=11;" parent="1" vertex="1">
+          <mxGeometry x="926" y="362" width="174" height="62" as="geometry" />
         </mxCell>
-        <mxCell id="e_listB" value="node list" style="endArrow=classic;html=1;rounded=0;strokeColor=#0000CC;fontColor=#0000CC;fontSize=10;exitX=1;exitY=0.8;exitDx=0;exitDy=0;entryX=1;entryY=0.28;entryDx=0;entryDy=0;" parent="1" source="boot" target="dB" edge="1">
-          <mxGeometry relative="1" as="geometry">
-            <Array as="points">
-              <mxPoint x="825" y="166" />
-              <mxPoint x="825" y="442" />
-            </Array>
-          </mxGeometry>
+        <mxCell id="dB_views" value="gossiped peer views&#xa;what each peer says&#xa;&lt;i&gt;it&lt;/i&gt; can see → the graph" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#999999;fontSize=11;" parent="1" vertex="1">
+          <mxGeometry x="1110" y="362" width="174" height="62" as="geometry" />
         </mxCell>
-        <mxCell id="e_p2p" value="peer-to-peer (UDP)" style="endArrow=classic;startArrow=classic;html=1;rounded=0;strokeColor=#0000CC;strokeWidth=2;fontColor=#0000CC;fontSize=11;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" parent="1" source="dA" target="dB" edge="1">
+        <mxCell id="dB_chat" value="chat ring&#xa;structured entries,&#xa;not pre-rendered lines" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#999999;fontSize=11;" parent="1" vertex="1">
+          <mxGeometry x="926" y="434" width="174" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="dB_metrics" value="metrics&#xa;per-peer packets/bytes&#xa;both ways · gauges" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#999999;fontSize=11;" parent="1" vertex="1">
+          <mxGeometry x="1110" y="434" width="174" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="dB_disk" value="state file — identity, Lamport clock, every entry (tombstones included), chat&#xa;atomic rename + generation guard · at most one rewrite per 250 ms" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" parent="1" vertex="1">
+          <mxGeometry x="926" y="504" width="358" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="dB_front" value="one engine, three front ends:&#xa;TUI (tview) · HTTP gateway (-http) · -doctor" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;" parent="1" vertex="1">
+          <mxGeometry x="926" y="564" width="358" height="44" as="geometry" />
+        </mxCell>
+
+        <mxCell id="frame" value="&lt;b&gt;Frame — every packet, node-to-node and node-to-bootstrap&lt;/b&gt;&#xa;kind(1) · nonce(8) · timestamp(8) · HMAC-SHA256 tag(32) · JSON body&#xa;key = HMAC(psk, &quot;rezoagwe/wire/v2&quot; ‖ 0x00 ‖ cluster)&#xa;rejected and counted on a bad tag, a timestamp outside ±30 s, or a replayed nonce&#xa;streams carry the same frames behind a 4-byte length prefix" style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacingLeft=10;spacingTop=8;fontSize=11;fillColor=#ffe6cc;strokeColor=#d79b00;" parent="1" vertex="1">
+          <mxGeometry x="470" y="250" width="400" height="106" as="geometry" />
+        </mxCell>
+
+        <mxCell id="legend" value="&lt;b&gt;Peer-to-peer message kinds&lt;/b&gt;&#xa;0  KV — versioned set / delete (LWW)&#xa;1  Chat — broadcast&#xa;2·3  StateRequest / StateResponse — the whole store + recent&#xa;        chat on join, over a stream, merged by version&#xa;4  PeerGossip — the peers I know, every 10 s&#xa;5  Hello — peer learning + heartbeat, every 5 s&#xa;6  Goodbye — clean leave, so peers drop me at once&#xa;7·8·9  Digest / PullRequest / KVBatch — anti-entropy:&#xa;        versions for a slice of the keyspace, then whatever&#xa;        each end is missing, repaired in both directions&#xa;10  DirectMessage — chat to one peer only&#xa;11·12  Fingerprint / FingerprintReply — 16 bucket digests&#xa;        over the whole store: do these replicas agree?" style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacingLeft=10;spacingTop=8;fontSize=11;fillColor=#e6f2ff;strokeColor=#0000CC;" parent="1" vertex="1">
+          <mxGeometry x="470" y="372" width="400" height="226" as="geometry" />
+        </mxCell>
+
+        <mxCell id="ports" value="The same node, four times over" style="text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;fontSize=13;fontStyle=1" parent="1" vertex="1">
+          <mxGeometry x="40" y="672" width="1260" height="24" as="geometry" />
+        </mxCell>
+
+        <mxCell id="p_go" value="&lt;b&gt;Go&lt;/b&gt; — rezoagwe-discovery / rezoagwe-bootstrap&#xa;the reference implementation: TUI, HTTP gateway,&#xa;headless mode, systemd units, .debs for five Linux&#xa;architectures, plus FreeBSD, macOS and Windows" style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacingLeft=10;spacingTop=8;fontSize=11;fillColor=#f8f8f8;strokeColor=#666666;" parent="1" vertex="1">
+          <mxGeometry x="40" y="704" width="304" height="92" as="geometry" />
+        </mxCell>
+        <mxCell id="p_kt" value="&lt;b&gt;Kotlin&lt;/b&gt; — android/&#xa;node and rendezvous on a phone or tablet, Compose UI,&#xa;a foreground service so the node survives screen-off,&#xa;layout follows the window: tabs, rail, or two panes" style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacingLeft=10;spacingTop=8;fontSize=11;fillColor=#f8f8f8;strokeColor=#666666;" parent="1" vertex="1">
+          <mxGeometry x="359" y="704" width="304" height="92" as="geometry" />
+        </mxCell>
+        <mxCell id="p_js" value="&lt;b&gt;JavaScript&lt;/b&gt; — electron/&#xa;node and rendezvous on a workstation, a sandboxed&#xa;renderer behind an explicit preload bridge, and an&#xa;engine half that depends on nothing from Electron" style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacingLeft=10;spacingTop=8;fontSize=11;fillColor=#f8f8f8;strokeColor=#666666;" parent="1" vertex="1">
+          <mxGeometry x="678" y="704" width="304" height="92" as="geometry" />
+        </mxCell>
+        <mxCell id="p_parity" value="&lt;b&gt;No shared code — only the protocol&lt;/b&gt;&#xa;so parity is pinned by tests: a frame the Go codec&#xa;produced is decoded by the other two, and all three&#xa;fold the same store into byte-identical bucket digests" style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacingLeft=10;spacingTop=8;fontSize=11;fillColor=#ffe6cc;strokeColor=#d79b00;" parent="1" vertex="1">
+          <mxGeometry x="997" y="704" width="303" height="92" as="geometry" />
+        </mxCell>
+
+        <mxCell id="obs" value="&lt;b&gt;Seeing what the protocol is doing&lt;/b&gt;&#xa;&lt;b&gt;Cluster graph&lt;/b&gt; (g · GET /topology) — roles, links only one end claims, and the connected components that make a partition visible. Built from the peer lists gossip already carries, so the picture is exactly as complete as gossip has made it, which is itself the diagnostic.&#xa;&lt;b&gt;Diagnostics&lt;/b&gt; (D · GET /diagnostics · -doctor) — the counters turned into causes: a key or cluster-name mismatch, a clock outside the skew window, one-way UDP through a firewall, a loopback address advertised to a LAN, peers about to be evicted.&#xa;&lt;b&gt;Consistency check&lt;/b&gt; (v · GET /consistency) — asks every peer to summarise its whole store and reports who disagrees, and about which region of the keyspace. Anti-entropy repairs divergence but never reports it, so a cluster can sit split for as long as nobody looks." style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacingLeft=10;spacingTop=8;fontSize=11;fillColor=#e6f2ff;strokeColor=#0000CC;" parent="1" vertex="1">
+          <mxGeometry x="40" y="816" width="1260" height="108" as="geometry" />
+        </mxCell>
+
+        <mxCell id="notes" value="&lt;b&gt;How it converges, and what it still is not&lt;/b&gt;&#xa;&lt;b&gt;Last-write-wins:&lt;/b&gt; every write stamps a version = Lamport counter + the node&#39;s &lt;i&gt;persistent&lt;/i&gt; id (not its address, so a node that moves ports is still the same writer). Higher counter wins, ties break on node id, equal is not newer — so re-delivery is idempotent and concurrent writes converge everywhere. A delete is a versioned tombstone, so a stale set cannot resurrect a key. TTL expiry keeps the entry&#39;s existing version, since every replica sweeps independently and a sweep must not outrank a concurrent write.&#xa;&lt;b&gt;Anti-entropy:&lt;/b&gt; a dropped write is not lost. Each gossip tick advertises a digest of a contiguous slice of the sorted keyspace to one random peer — versions, not values — and the receiver returns what it holds newer and asks for what it lacks. A cursor per peer walks the whole keyspace, and the digest is never wider than one repair round can carry.&#xa;&lt;b&gt;Still not a consensus system:&lt;/b&gt; compare-and-swap is evaluated against local state and there is no quorum, so two partitions will each grant the same lock. Every value is an LWW string, which means concurrent writes to one key lose data by design. The frame is authenticated but the body is plaintext, and one shared key means any member can impersonate any other." style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacingLeft=10;spacingTop=8;fontSize=11;fillColor=#f5f5f5;strokeColor=#666666;" parent="1" vertex="1">
+          <mxGeometry x="40" y="944" width="1260" height="126" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e_regA" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=0;exitDx=0;exitDy=0;entryX=0;entryY=1;entryDx=0;entryDy=0;dashed=1;strokeColor=#d6b656;strokeWidth=2;startArrow=classic;startFill=1;endArrow=classic;endFill=1;" parent="1" source="dA" target="boot" edge="1">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
-        <mxCell id="e_diskA" value="save / load" style="endArrow=classic;startArrow=classic;html=1;rounded=0;strokeColor=#d79b00;fontColor=#b46504;fontSize=10;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" parent="1" source="dA" target="dA_disk" edge="1">
-          <mxGeometry relative="1" as="geometry" />
-        </mxCell>
-        <mxCell id="e_diskB" value="save / load" style="endArrow=classic;startArrow=classic;html=1;rounded=0;strokeColor=#d79b00;fontColor=#b46504;fontSize=10;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" parent="1" source="dB" target="dB_disk" edge="1">
-          <mxGeometry relative="1" as="geometry" />
-        </mxCell>
-        <mxCell id="e_setB" value="set / delete key&#xa;(TUI)" style="endArrow=classic;html=1;rounded=0;strokeColor=#4D9900;fontColor=#2d6600;fontSize=10;entryX=1;entryY=0.25;entryDx=0;entryDy=0;" parent="1" target="dB" edge="1">
-          <mxGeometry relative="1" as="geometry">
-            <mxPoint x="845" y="430" as="sourcePoint" />
+        <mxCell id="e_regA_l" value="REGISTER / DISCOVER → roster" style="edgeLabel;html=1;align=center;verticalAlign=middle;fontSize=10;labelBackgroundColor=#ffffff;" parent="e_regA" vertex="1" connectable="0">
+          <mxGeometry x="-0.2" relative="1" as="geometry">
+            <mxPoint as="offset" />
           </mxGeometry>
         </mxCell>
-        <mxCell id="e_chatB" value="chat message&#xa;(TUI)" style="endArrow=classic;html=1;rounded=0;strokeColor=#CC6600;fontColor=#994d00;fontSize=10;entryX=1;entryY=0.62;entryDx=0;entryDy=0;" parent="1" target="dB" edge="1">
-          <mxGeometry relative="1" as="geometry">
-            <mxPoint x="845" y="520" as="sourcePoint" />
+
+        <mxCell id="e_regB" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=0;exitDx=0;exitDy=0;entryX=1;entryY=1;entryDx=0;entryDy=0;dashed=1;strokeColor=#d6b656;strokeWidth=2;startArrow=classic;startFill=1;endArrow=classic;endFill=1;" parent="1" source="dB" target="boot" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_regB_l" value="REGISTER / DISCOVER → roster" style="edgeLabel;html=1;align=center;verticalAlign=middle;fontSize=10;labelBackgroundColor=#ffffff;" parent="e_regB" vertex="1" connectable="0">
+          <mxGeometry x="-0.2" relative="1" as="geometry">
+            <mxPoint as="offset" />
           </mxGeometry>
         </mxCell>
-        <mxCell id="notes" value="&lt;b&gt;Notes.&lt;/b&gt;  Transport is plain UDP — no acks, no auth, no anti-entropy (a dropped write is not re-sent) — a &#34;Pre-PoC&#34;.  KV convergence: each write carries a version = Lamport counter + node-address tiebreak; the newer version wins on every node, and deletes are versioned tombstones so a stale set cannot resurrect a key.  A joining node pulls one peer&#39;s snapshot and &lt;i&gt;merges&lt;/i&gt; by version (never blindly overwriting).  Each discovery node persists its KV store to a JSON file, loaded on startup before contacting bootstrap, so keys survive a restart." style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacingLeft=10;spacingTop=8;fontSize=11;fillColor=#f9f9f9;strokeColor=#999999;" parent="1" vertex="1">
-          <mxGeometry x="55" y="700" width="750" height="95" as="geometry" />
+
+        <mxCell id="e_p2p" value="peer-to-peer: KV writes, chat, membership gossip, anti-entropy, state sync" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=1;entryDx=0;entryDy=0;startArrow=classic;startFill=1;endArrow=classic;endFill=1;strokeWidth=2;strokeColor=#0000CC;fontSize=11;labelBackgroundColor=#ffffff;verticalAlign=bottom;" parent="1" source="dA" target="dB" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="235" y="644" />
+              <mxPoint x="1105" y="644" />
+            </Array>
+          </mxGeometry>
         </mxCell>
       </root>
     </mxGraphModel>

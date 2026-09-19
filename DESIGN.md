@@ -93,11 +93,12 @@ rezoagwe/
 ├── android/                         Kotlin port: node + bootstrap + Compose UI
 ├── electron/                        JS port: node + bootstrap + desktop UI
 ├── e2e/                             containerised cluster + the suite that drives it
-├── scripts/                         e2e.sh and its shell helpers
+├── scripts/                         e2e.sh, render-chart.sh, shell helpers
 ├── packaging/                       systemd units, /etc/default files, layout.sh
 ├── DEBIAN/                          Debian packaging metadata + maintainer scripts
 ├── .github/workflows/ci.yml         Go, cross-build, desktop, Android, e2e
 ├── Makefile                         cross-build + deb + android + electron targets
+├── rezo_agwe.drawio                 the README's picture; `make chart` exports it
 ├── README.md
 ├── ROADMAP.md                       the prioritized backlog
 └── DESIGN.md                        this document
@@ -349,10 +350,18 @@ by default and its age must exceed the longest partition expected to heal.
   through it in both directions.
 * The documentation is checked too: `electron/test/docs.test.js` asserts that
   every command the docs offer exists, and that the tables a reader trusts
-  instead of the source — §3.2's message kinds, §8's routes, the README's chat
-  commands and hotkeys — still describe the code. Prose rots quietly, and this
-  repository has watched it happen. It works: the three routes and two message
-  kinds added for §12–§14 all failed this suite before they were documented.
+  instead of the source — §3.2's message kinds, §8's routes, §15's flags, the
+  README's chat commands and hotkeys — still describe the code. Prose rots
+  quietly, and this repository has watched it happen. It works: the three routes
+  and two message kinds added for §12–§14 all failed this suite before they were
+  documented.
+* The picture is checked too, which is newer and was overdue: `rezo_agwe.png` is
+  exported from `rezo_agwe.drawio` by `make chart`, and the suite asserts the
+  drawing names every message kind, makes the claims about the protocol that are
+  the reason for having it, and makes none of the ones it outgrew. An image is
+  the one document that rots invisibly — the previous export said "protobuf",
+  "no auth" and "no anti-entropy" for four releases after all three stopped
+  being true, because re-exporting it meant opening a GUI.
 * `.github/workflows/ci.yml` runs five jobs on every push: the Go suite under
   the race detector with `gofmt` and `go vet`, every cross-build target and
   every `.deb`, the desktop suite, the Android unit tests and APK, and the
@@ -431,9 +440,19 @@ duplicated deliberately and pinned by parity tests (§7).
   since Doze is a cause of "the cluster forgot me" that no protocol counter
   can explain.
 * `core/Metrics.kt` — counters, per-address traffic and sampled rates.
+* `core/Persistence.kt` — the same atomic, generation-guarded state file, and
+  `core/Runtime.kt`, the process-wide holder both roles and the settings live
+  in, since a foreground service and an Activity have to reach one node.
+* `net/Transport.kt` — datagrams and streams on one socket. Android refuses a
+  socket write on the main thread and the engine counts the refusal rather than
+  raising it, so every UI call that reaches this is wrapped in
+  `launch(Dispatchers.IO)` at the call site and `UiThreadingTest` fails the
+  build if one is not — see the end of this section for what that cost once.
 * `service/NodeService.kt` — a foreground service: a gossip node that only
   runs while its screen is open is not participating in a cluster, since
   peers evict it seconds after the phone sleeps.
+* `ui/` — the Compose screens, one per tab, plus `Layout.kt`, which is where
+  the window-size tiers below are decided.
 
 The UI adapts to the window rather than the device: tabs under 600dp, a
 navigation rail above it or in a short landscape window, and two captioned
@@ -468,12 +487,20 @@ replication rules in §5 are duplicated deliberately and pinned by parity tests
 * `src/core/topology.js` — the cluster graph, derived from the peer lists gossip
   already carries, with the layout computed once so a report and a drawing
   cannot disagree about where a node sits.
-* `src/net/mem.js` — an in-process network with loss, delay and partitions,
-  which is what lets the test suite run a whole cluster in one process and
-  assert convergence rather than hope for it.
+* `src/core/diagnostics.js` — the same counters-to-causes rules as the Go
+  package (§13), written as pure functions over a snapshot for the same reason,
+  and `src/core/metrics.js` behind them.
+* `src/core/persistence.js`, `src/core/settings.js` and `src/core/runtime.js` —
+  the state file, what the user can configure (and what needs a restart to take
+  effect), and the holder that owns both roles for the process.
+* `src/net/udp.js` and `src/net/framing.js` — datagrams and length-prefixed
+  streams on one socket; `src/net/mem.js` — an in-process network with loss,
+  delay and partitions, which is what lets the test suite run a whole cluster in
+  one process and assert convergence rather than hope for it.
+* `src/main.js` and `src/preload.js` — the window, the menu and the IPC, and
+  the one explicit bridge that is the whole renderer-visible API.
 * `renderer/` — the UI: no build step, no framework, a strict CSP, and a
-  sandboxed renderer that reaches the engine only through an explicit preload
-  bridge.
+  sandboxed renderer that reaches the engine only through that bridge.
 
 Packaging has two paths on purpose. `make -C electron deb` uses
 electron-builder, which wants `fpm` and can cross-build for arm64 and armhf;
@@ -631,7 +658,67 @@ digests are pinned to each other by fixed vectors in all three suites, and
 the pairing was exercised on hardware — a Kotlin fold and a Go fold agreeing
 byte for byte across a Wi-Fi LAN.
 
-## 15. Why "rezoagwe"?
+## 15. Command-line reference
+
+Every flag both binaries accept. The README shows the ones a first run needs;
+this is the whole surface, because a flag documented nowhere is a flag nobody
+finds — `-timeout` and `-version` existed for several releases with no mention
+in any document, and a test now fails if that happens again (§7).
+
+### `rezoagwe-discovery`
+
+| Flag                | Default              | What it does                                            |
+|---------------------|----------------------|---------------------------------------------------------|
+| `-bootstrap`        | `:9999`              | rendezvous address, or a comma-separated list of seeds  |
+| `-node`             | `:3137`              | address the sockets bind                                |
+| `-advertise`        | `-node`              | address peers are told to use — set this on a LAN (§13) |
+| `-nick`             | `anon`               | chat nickname                                           |
+| `-data`             | `<config dir>/rezoagwe/<node>.json` | state file; `-` disables persistence     |
+| `-psk`              | none                 | pre-shared key authenticating every packet (§3.1)       |
+| `-cluster`          | `rezoagwe`           | cluster name; nodes only talk to their own              |
+| `-http`             | off                  | serve the HTTP gateway here, e.g. `:8080` (§8)          |
+| `-http-token`       | none                 | require this bearer token on **every** gateway route    |
+| `-http-tls-cert`    | none                 | serve the gateway over TLS with this certificate        |
+| `-http-tls-key`     | none                 | private key for `-http-tls-cert`                        |
+| `-http-readonly`    | `false`              | refuse every mutating gateway request                   |
+| `-max-value-bytes`  | `0` (unbounded)      | refuse values longer than this, from a peer or a writer |
+| `-max-keys`         | `0` (unbounded)      | refuse writes that would exceed this many live keys     |
+| `-tombstone-ttl`    | `0` (GC off)         | reclaim tombstones older than this (§5.5)               |
+| `-doctor`           | `false`              | join, wait out two heartbeats, print diagnostics, exit  |
+| `-headless`         | `false`              | run without the TUI; pair with `-http` to drive it      |
+| `-debug`            | `false`              | debug logging — needs `-logfile`                        |
+| `-logfile`          | none                 | write logs here instead of discarding them              |
+| `-version`          | `false`              | print the version and exit                              |
+
+### `rezoagwe-bootstrap`
+
+| Flag         | Default                                        | What it does                                       |
+|--------------|------------------------------------------------|----------------------------------------------------|
+| `-port`      | `9999`                                         | listen port, UDP and TCP                           |
+| `-timeout`   | `30s`                                          | drop a node that has not registered within this    |
+| `-data`      | `<config dir>/rezoagwe/bootstrap-<port>.json`  | roster file; `-` disables persistence              |
+| `-psk`       | none                                           | pre-shared key; must match the nodes               |
+| `-cluster`   | `rezoagwe`                                     | cluster name; must match the nodes                 |
+| `-headless`  | `false`                                        | run without the TUI                                |
+| `-debug`     | `false`                                        | debug logging — needs `-logfile`                   |
+| `-logfile`   | none                                           | write logs here instead of discarding them         |
+| `-version`   | `false`                                        | print the version and exit                         |
+
+`-timeout` is how long the roster keeps a node that has stopped registering;
+the sweep that applies it runs every `-timeout`/2. Nodes REGISTER on their own
+heartbeat (5 s, §4.2) rather than at a rate derived from this, so the default
+30 s tolerates several lost REGISTERs before a live node is dropped. Lowering it
+below the heartbeat evicts every node in the cluster on a regular cycle.
+
+`-psk` and `-cluster` have to agree on every process in a cluster, bootstrap
+included — they are both folded into the framing key (§3.1), so a mismatch is
+not a rejected login but a packet that never authenticates. `-doctor` prints
+the key fingerprint precisely so the two ends can be compared without either
+printing the key.
+
+---
+
+## 16. Why "rezoagwe"?
 
 [Agwé](https://en.wikipedia.org/wiki/Agw%C3%A9) is the Haitian Vodou
 lwa of the sea — a fitting name for a protocol whose packets drift

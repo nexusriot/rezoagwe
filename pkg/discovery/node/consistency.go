@@ -167,7 +167,7 @@ func (n *Node) requestOverStream(peer string, kind pb.MessageKind, v interface{}
 		return nil, err
 	}
 	n.Metrics.Recv(respKind, len(frame))
-	if respKind != pb.KindFingerprintOK {
+	if respKind != pb.KindFingerprintReply {
 		return nil, fmt.Errorf("peer answered with %s", respKind)
 	}
 	return body, nil
@@ -194,7 +194,7 @@ func (n *Node) handleFingerprint(body []byte) {
 		return
 	}
 	n.Model.TouchPeer(req.From)
-	n.send(req.From, pb.KindFingerprintOK, n.fingerprintReply())
+	n.send(req.From, pb.KindFingerprintReply, n.fingerprintReply())
 }
 
 // handleFingerprintReply exists so a datagram answer is accepted rather than

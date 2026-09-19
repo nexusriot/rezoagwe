@@ -320,3 +320,110 @@ test('no document still claims the Android app has never run on hardware', () =>
     assert.ok(!/not on a phone yet/i.test(src), `${doc} still says the app has not run on a phone`);
   }
 });
+
+// The flag check above runs one way only: it catches a README that offers a
+// flag the binary dropped, and misses a flag the binary grew that no document
+// mentions. `-timeout` and `-version` sat undocumented for several releases
+// because nothing looked in this direction.
+test('DESIGN.md documents every flag the binaries define, and no others', () => {
+  const design = read('DESIGN.md');
+  const ref = design.slice(design.indexOf('## 15. Command-line reference'));
+  assert.ok(ref.length > 500, 'DESIGN.md no longer has a command-line reference');
+
+  // One table per binary, in the order the section presents them.
+  const tables = ref.split(/^### /m).slice(1);
+  const documented = (heading) => {
+    const table = tables.find((t) => t.startsWith(heading));
+    assert.ok(table, `DESIGN.md §15 has no table for ${heading}`);
+    return new Set([...table.matchAll(/^\|\s*`-([a-z-]+)`/gm)].map((m) => m[1]));
+  };
+  const defined = (file) => new Set(
+    [...read(file).matchAll(/flag\.\w+\("([a-z-]+)"/g)].map((m) => m[1]),
+  );
+
+  for (const [heading, source] of [
+    ['`rezoagwe-discovery`', 'cmd/discovery/discovery.go'],
+    ['`rezoagwe-bootstrap`', 'cmd/bootstrap/bootstrap.go'],
+  ]) {
+    const docs = documented(heading);
+    const code = defined(source);
+    for (const flag of code) {
+      assert.ok(docs.has(flag), `${source} accepts -${flag}, which DESIGN.md §15 never documents`);
+    }
+    for (const flag of docs) {
+      assert.ok(code.has(flag), `DESIGN.md §15 documents -${flag} for ${heading}, which it does not accept`);
+    }
+  }
+});
+
+// The two checks above hold DESIGN.md to the JavaScript and Kotlin ports. Go is
+// the reference implementation and was the one nothing compared the table to,
+// which is how its constant for kind 12 came to be the only name in the project
+// that was not the documented one.
+test('the message kinds in DESIGN.md are the ones the Go codec defines', () => {
+  const go = read('pkg/proto/wire.go');
+  const block = go.slice(go.indexOf('const ('), go.indexOf('// String names the kind'));
+  const defined = new Map();
+  for (const m of block.matchAll(/Kind(\w+)\s+MessageKind\s*=\s*(\d+)/g)) {
+    defined.set(m[1].toLowerCase(), Number(m[2]));
+  }
+  assert.ok(defined.size >= 14, `only ${defined.size} kinds found in wire.go`);
+
+  const design = read('DESIGN.md');
+  const documented = new Map();
+  for (const m of design.matchAll(/^\|\s*(\d+)\s*\|\s*`(\w+)`\s*\|/gm)) documented.set(m[2], Number(m[1]));
+
+  for (const [name, value] of documented) {
+    const key = name.toLowerCase();
+    assert.ok(defined.has(key), `DESIGN.md documents kind "${name}" that wire.go does not define`);
+    assert.equal(defined.get(key), value, `wire.go gives ${name} the wrong number`);
+  }
+  assert.equal(defined.size, documented.size, 'wire.go defines a kind DESIGN.md never documents');
+});
+
+/**
+ * The chart, which is the one document nothing used to check.
+ *
+ * It is an image, so it rots invisibly: the previous export said "protobuf",
+ * "no auth" and "no anti-entropy" for four releases after all three stopped
+ * being true, and a reader who trusts a picture has no way to tell. These are
+ * the claims in it that can be tied to the code.
+ */
+test('the chart names every message kind and contradicts none of the protocol', () => {
+  const chart = read('rezo_agwe.drawio');
+  const { Kind } = require('../src/proto/wire');
+
+  for (const [name, value] of Object.entries(Kind)) {
+    // The diagram writes the numbers and the CamelCase names the table uses.
+    const camel = name.split('_').map((w) => w[0] + w.slice(1).toLowerCase()).join('');
+    assert.ok(
+      new RegExp(`\\b${camel}\\b`, 'i').test(chart),
+      `the chart never mentions ${camel} (kind ${value})`,
+    );
+  }
+
+  // Claims the chart used to make that the protocol outgrew.
+  for (const stale of [/protobuf/i, /no auth\b/i, /no anti-entropy/i, /Pre-PoC/i]) {
+    assert.ok(!stale.test(chart), `the chart still claims ${stale} — re-export it: make chart`);
+  }
+  // And the ones it must keep making, since they are the reason for the picture.
+  for (const claim of [/wire v2/i, /HMAC/i, /anti-entropy/i, /last-write-wins/i]) {
+    assert.match(chart, claim, 'the chart no longer explains how the protocol works');
+  }
+});
+
+test('the chart image was exported from the chart source', () => {
+  // `make chart` is one command, but only if someone runs it. A .drawio edited
+  // after the .png it produced means the README is showing the old picture.
+  const src = fs.statSync(path.join(REPO, 'rezo_agwe.drawio'));
+  const png = fs.statSync(path.join(REPO, 'rezo_agwe.png'));
+  assert.ok(png.size > 10_000, 'rezo_agwe.png looks truncated');
+  // Generous, because git does not record mtimes: a fresh clone stamps both
+  // files with its own checkout time and the order is arbitrary. A minute is
+  // far longer than any checkout takes and far shorter than the gap this is
+  // looking for, which is an edit someone never exported.
+  assert.ok(
+    png.mtimeMs >= src.mtimeMs - 60_000,
+    'rezo_agwe.drawio is newer than rezo_agwe.png: run `make chart` to re-export it',
+  );
+});
