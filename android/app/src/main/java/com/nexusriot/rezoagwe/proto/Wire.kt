@@ -79,10 +79,92 @@ data class Version(
  */
 const val FINGERPRINT_BUCKETS = 16
 
+/**
+ * The largest frame a stream will carry, and so the hard ceiling on anything
+ * that has to replicate. The same number as transport.MaxFrameSize in Go and
+ * MAX_FRAME_SIZE in the desktop client; a test pins them together.
+ */
+const val MAX_FRAME_BYTES = 64 shl 20
+
+/** Room for the key, the version, the expiry, and the envelope around them. */
+private const val FRAME_RESERVE = 64 shl 10
+
+/**
+ * The largest a value may be, measured as it will be written on the wire
+ * rather than as it sits in memory, and still fit in a frame. Plain text costs
+ * its own length, so this is also the plain answer to "how big can a value
+ * be"; anything the encoder has to escape costs more.
+ *
+ * A value past this is not merely large, it is unreplicable: the datagram path
+ * refuses it on size, the stream path refuses the frame, and a state sync
+ * builds that same frame — so it would be accepted locally, reported as
+ * written, and then sit on one replica forever with nothing able to repair it.
+ * Refusing the write is the only honest answer, and it is a property of the
+ * protocol rather than a tuning knob.
+ */
+const val MAX_REPLICABLE_VALUE_BYTES = MAX_FRAME_BYTES - FRAME_RESERVE
+
+/**
+ * What each character below 0x80 costs inside a JSON string, derived from the
+ * encoder rather than from memory. A test re-derives the whole table and fails
+ * if kotlinx.serialization ever disagrees.
+ */
+private val ASCII_ESCAPE_LEN = IntArray(0x80) { c ->
+    when {
+        c == 0x08 || c == 0x09 || c == 0x0a || c == 0x0c || c == 0x0d || c == 0x22 || c == 0x5c -> 2
+        c < 0x20 -> 6 // \u00xx
+        else -> 1
+    }
+}
+
+/**
+ * How many bytes [s] occupies once encoded as a JSON string, counted without
+ * building it — the point is to measure values far too big to want a second
+ * copy of.
+ *
+ * Counted in UTF-8 bytes, since that is what goes on the wire — which is not
+ * the string's length: one character of CJK is three bytes, and a control
+ * character is six once escaped.
+ */
+fun escapedLen(s: String): Int {
+    var n = 2 // the surrounding quotes
+    var i = 0
+    while (i < s.length) {
+        val c = s[i]
+        when {
+            c.code < 0x80 -> n += ASCII_ESCAPE_LEN[c.code]
+            c.code < 0x800 -> n += 2
+            c.isHighSurrogate() && i + 1 < s.length && s[i + 1].isLowSurrogate() -> {
+                n += 4 // a well-formed pair is one four-byte code point
+                i++
+            }
+            // kotlinx.serialization writes an unpaired surrogate through
+            // unescaped, and Java's UTF-8 encoder replaces it with '?'. One
+            // byte, not the six an escape would cost — measured, because
+            // guessing it the other way refuses values that would have fit.
+            c.isSurrogate() -> n += 1
+            else -> n += 3
+        }
+        i++
+    }
+    return n
+}
+
 /** Asks a peer to summarise its whole store. */
 @Serializable
 data class Fingerprint(
     val from: String = "",
+    /**
+     * When set, also asks for the (key, version) pairs held in those buckets.
+     * A checker fills it on a second request, once the digests have said which
+     * buckets disagree — which turns "you differ somewhere in this sixteenth
+     * of the keyspace" into the names of the keys.
+     *
+     * Asking for nothing is the old request exactly, and a peer that does not
+     * understand the field answers with no entries, so a report against an
+     * older node degrades to bucket indices rather than failing.
+     */
+    val buckets: List<Int> = emptyList(),
 )
 
 /**
@@ -97,6 +179,13 @@ data class FingerprintReply(
     val tombstones: Int = 0,
     val clock: Long = 0,
     val buckets: List<String> = emptyList(),
+    /**
+     * Every (key, version) the sender holds in the buckets the request named,
+     * sorted by key, tombstones included — a key deleted on one replica and
+     * live on the other is exactly the kind of divergence worth naming. Empty
+     * unless [Fingerprint.buckets] asked.
+     */
+    val entries: List<KeyVersion> = emptyList(),
 )
 
 object KVAction {

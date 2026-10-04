@@ -43,6 +43,7 @@ contextBridge.exposeInMainWorld('rezoagwe', {
   },
   diag: {
     snapshot: () => invoke('diag:snapshot'),
+    consistency: () => invoke('diag:consistency'),
     copyReport: () => invoke('diag:copyReport'),
   },
   store: {

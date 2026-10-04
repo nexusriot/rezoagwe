@@ -148,6 +148,24 @@ fun healthChecks(d: NodeDiagnostics, nowMs: Long): List<HealthCheck> {
                     "Datagrams were sent from the UI thread, which Android refuses — this is a bug " +
                         "in the app, not the network. The writes survive locally and reach peers " +
                         "only on the next anti-entropy round. Last: $last."
+                // Also worth its own wording: an oversized frame and an
+                // unroutable peer both arrive here as "send error", and the
+                // advice is opposite. Blaming the route for the first sends
+                // the reader to check an address that is perfectly fine.
+                last.oversize ->
+                    "A frame too large for one datagram could not be sent. Nothing is wrong with " +
+                        "the route: an entry this big travels over a stream instead, and that did " +
+                        "not work. " +
+                        (
+                            if (d.streamListener) {
+                                "The peer's stream port is the thing to look at: a firewall that " +
+                                    "passes UDP and blocks TCP looks exactly like this."
+                            } else {
+                                "This device has no stream listener, which is why — see the check below."
+                            }
+                            ) +
+                        " Until it does, that entry cannot reach that peer by any path, and the " +
+                        "replicas stay divergent however long anti-entropy runs. Last: $last."
                 else ->
                     "Datagrams could not leave the device — usually a peer address that no longer " +
                         "routes, or Wi-Fi dropping while the node stays up. Last: $last."
@@ -160,7 +178,13 @@ fun healthChecks(d: NodeDiagnostics, nowMs: Long): List<HealthCheck> {
             Severity.WARN,
             "No stream listener on port ${d.configuredPort}",
             "Another app holds the TCP port, so large state syncs fall back to datagrams and a big " +
-                "keyspace may take several gossip rounds to converge.",
+                "keyspace may take several gossip rounds to converge." +
+                if (m.lastSendError?.oversize == true) {
+                    " It is also why the oversized frame above had nowhere to go: the stream is the " +
+                        "only path for an entry that does not fit a datagram."
+                } else {
+                    ""
+                },
         )
     }
 

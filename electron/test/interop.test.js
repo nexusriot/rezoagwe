@@ -183,7 +183,45 @@ test('the Electron client joins a real Go cluster and replicates both ways', { s
     return engine.store.get('while-deaf') === 'repaired';
   });
 
-  // 8. A clean shutdown is announced rather than timed out.
+  // 8. A value too large for a datagram, both ways, over real sockets.
+  //
+  // The datagram is refused on size, so the frame has to travel as a stream
+  // and arrive whole, framed by one implementation and parsed by the other.
+  // Four megabytes rather than a few hundred kilobytes so the frame outgrows
+  // the socket buffer and is written in several passes.
+  //
+  // What this does and does not prove is worth being exact about. It proves
+  // the two implementations agree on the wire for a value no packet can
+  // carry. It does not isolate either of the bugs that lived here — a sender
+  // that dropped the frame, and one that destroyed the socket before it had
+  // flushed — because the cluster has more than one way to deliver a missing
+  // key, and anti-entropy or a state sync repairs what the write path lost.
+  // That is the system working; it is also why a test at this level cannot
+  // tell you which path carried it. The deterministic guards are the
+  // in-process ones: cluster.test.js for the flush, and the Go suite for the
+  // fallback and the deadline.
+  const big = 'o'.repeat(4 * 1024 * 1024);
+  await engine.set('big-from-electron', big, 0);
+  await waitFor('the oversized value to reach the Go node whole', async () => {
+    const { status, text } = await http('GET', '/kv/big-from-electron');
+    return status === 200 && text.length === big.length && text === big;
+  });
+
+  const bigFromGo = 'g'.repeat(4 * 1024 * 1024);
+  await http('PUT', '/kv/big-from-go', bigFromGo);
+  await waitFor('the Go node’s oversized value to arrive whole', async () =>
+    engine.store.get('big-from-go') === bigFromGo);
+
+  // And carrying it cost neither side a send error: the counter climbing was
+  // the only evidence the first time, and it is still the only evidence that
+  // the datagram path is being retried for a frame that cannot fit it.
+  assert.equal(engine.metrics.sendErrors, 0,
+    'this client counted a send error while replicating an oversized value');
+  const { text: metrics } = await http('GET', '/metrics');
+  const goSendErrors = Number(/^rezoagwe_send_errors_total (\d+)/m.exec(metrics)?.[1] ?? 0);
+  assert.equal(goSendErrors, 0, 'the Go node counted a send error while replicating an oversized value');
+
+  // 9. A clean shutdown is announced rather than timed out.
   await engine.stop();
   await waitFor('the Go node to drop this client on goodbye', async () => {
     const { text } = await http('GET', '/peers');

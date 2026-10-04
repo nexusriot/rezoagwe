@@ -58,7 +58,17 @@ class NodeService : Service() {
                 return START_NOT_STICKY
             }
         }
-        // Sticky: if the system reclaims the process, the roles come back.
+        // Any start without an explicit action means "make sure the roles the
+        // user asked for are up". The sticky restart is the case that matters:
+        // it arrives with a null intent after the system reclaimed the process
+        // and rebuilt the service around an empty Runtime, where nothing is
+        // running. Without this, START_STICKY resurrects a service that finds
+        // nothing running and stops itself again, and the node stays gone —
+        // the one thing the foreground service exists to prevent.
+        //
+        // Idempotent, so a start from the UI costs nothing. Off the main
+        // thread: restoring a role binds sockets.
+        scope.launch(Dispatchers.IO) { Runtime.restoreWantedRoles(this@NodeService) }
         return START_STICKY
     }
 
@@ -75,10 +85,13 @@ class NodeService : Service() {
             notificationManager().notify(NOTIFICATION_ID, buildNotification(text))
         }.launchIn(scope)
 
-        // Nothing running means nothing to keep alive.
+        // Nothing running and nothing wanted means nothing to keep alive. The
+        // second half matters: on a sticky restart nothing is running yet, and
+        // a watcher that looked only at that would stop the service before the
+        // restore it was restarted for.
         scope.launch {
-            combine(engine.status, bootstrap.status) { node, boot -> node.running || boot.running }
-                .collect { active -> if (!active) stopSelf() }
+            keepAliveFlow(engine.status, bootstrap.status) { Runtime.anyRoleWanted(this@NodeService) }
+                .collect { alive -> if (!alive) stopSelf() }
         }
     }
 
@@ -134,6 +147,26 @@ class NodeService : Service() {
         }
     }
 }
+
+/**
+ * Whether the service still has a reason to exist.
+ *
+ * Running covers the ordinary case. Wanted covers the two moments when nothing
+ * is running and the service must stay anyway: the instant after a sticky
+ * restart, before the roles have been brought back, and a role that is failing
+ * to start — which the user asked for and should be told about, rather than
+ * have the service vanish under.
+ */
+internal fun shouldKeepAlive(nodeRunning: Boolean, bootstrapRunning: Boolean, anyWanted: Boolean): Boolean =
+    nodeRunning || bootstrapRunning || anyWanted
+
+/** [shouldKeepAlive] over the live status flows. */
+internal fun keepAliveFlow(
+    node: Flow<NodeStatus>,
+    boot: Flow<BootstrapStatus>,
+    anyWanted: () -> Boolean,
+): Flow<Boolean> = combine(node, boot) { n, b -> shouldKeepAlive(n.running, b.running, anyWanted()) }
+    .distinctUntilChanged()
 
 /**
  * What the ongoing notification says about the running roles.

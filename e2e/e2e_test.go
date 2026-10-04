@@ -38,7 +38,27 @@ const (
 	preJoinKey  = "pre-join/secret-of-the-mountain"
 	preJoinVal  = "written before dave arrived"
 	preJoinChat = "this was said before dave arrived"
+
+	// Larger than any datagram, so it can only reach a peer over a stream.
+	// Seeded with the rest so the late joiner and the restarted node have to
+	// pull it through a state sync rather than catch the broadcast.
+	//
+	// This is the value the whole suite exists to carry. A store merges it
+	// correctly in a unit test and the cluster still diverges forever,
+	// because the frame never left the process: the datagram was refused on
+	// size, the stream fallback truncated it, or the deadline expired
+	// mid-transfer. None of that is visible from inside one process.
+	bigKey   = "pre-join/oversized"
+	bigValue = 300 * 1024
+
+	// The same line, said twice in the same second. Nothing in a chat entry
+	// tells the two apart, so a merge that deduplicates on the entry deletes
+	// one of them — on the next state sync, which is routine.
+	saidTwice = "said exactly twice before dave arrived"
 )
+
+// bigBody is the oversized value, built rather than stored as a constant.
+func bigBody() string { return strings.Repeat("o", bigValue) }
 
 func TestMain(m *testing.M) {
 	// Seed before anything else runs. The point is to get this in while the late
@@ -65,8 +85,17 @@ func seed() error {
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
+	if err := post("PUT", a.url+"/kv/"+bigKey, bigBody()); err != nil {
+		return fmt.Errorf("seeding %s: %w", bigKey, err)
+	}
 	if err := post("POST", a.url+"/chat", preJoinChat); err != nil {
 		return fmt.Errorf("seeding the chat log: %w", err)
+	}
+	// Twice, deliberately, and close enough together to share a timestamp.
+	for i := 0; i < 2; i++ {
+		if err := post("POST", a.url+"/chat", saidTwice); err != nil {
+			return fmt.Errorf("seeding the repeated line: %w", err)
+		}
 	}
 	return nil
 }
@@ -124,6 +153,56 @@ func TestClusterFormsThroughTheRendezvous(t *testing.T) {
 }
 
 // ---- replication -----------------------------------------------------------
+
+// A value too large for one datagram has to reach every node.
+//
+// The bug this guards: the write was accepted, returned 204, and then never
+// replicated. Every gossip tick retried the same oversized datagram, the
+// kernel refused it, and the node counted a send error — so anti-entropy, the
+// one mechanism meant to repair divergence, was the mechanism generating it.
+// The cluster stayed split for as long as the key existed.
+//
+// Only a suite like this can see it. In one process the store merges
+// perfectly; the frame never leaving is the whole failure.
+func TestAValueTooLargeForADatagramReachesEveryNode(t *testing.T) {
+	want := bigBody()
+	// Only the nodes that are up from the first second: the joiner and the
+	// restarted node get their own test below, after they exist. Waiting for
+	// them here would also shift the timeline the timed containers are
+	// measured against.
+	for _, n := range earlyCluster {
+		n := n
+		eventually(t, n.name+" to hold the oversized value", converge, func() (bool, string) {
+			got, _, ok := n.get(t, bigKey)
+			if !ok {
+				return false, n.name + " does not have it at all"
+			}
+			if len(got) != len(want) {
+				return false, fmt.Sprintf("%s has %d bytes, want %d — a truncated frame",
+					n.name, len(got), len(want))
+			}
+			if got != want {
+				return false, n.name + " has the right length but the wrong bytes"
+			}
+			return true, ""
+		})
+	}
+}
+
+// And carrying it must cost no send errors anywhere.
+//
+// The counter is what the failure looked like from outside: a value that
+// would not replicate, and a number climbing on every tick with prose blaming
+// the route. A cluster that holds the value and still reports send errors is
+// repairing by luck.
+func TestCarryingALargeValueCostsNoSendErrors(t *testing.T) {
+	for _, n := range earlyCluster {
+		if got := n.metric(t, "rezoagwe_send_errors_total"); got != 0 {
+			t.Errorf("%s reports %.0f send error(s) while holding an oversized value; "+
+				"the datagram path is being retried for a frame that cannot fit it", n.name, got)
+		}
+	}
+}
 
 // The write path proper: a value handed to one node, read back from the two it
 // was not handed to, with the same version everywhere.
@@ -375,10 +454,43 @@ func TestARestartedNodeKeepsItsStoreWithoutRelivingTheConversation(t *testing.T)
 	assertNoDuplicateChat(t, restart)
 }
 
+// The joiner and the restarted node never heard the write: the value was
+// seeded before either existed, so the only way either holds it is a state
+// sync, which carries the whole store as one frame over a stream.
+//
+// Placed after both of them have been waited for, so this adds no delay of
+// its own — the timed containers are measured against the suite's own clock,
+// and a wait inserted earlier moves the window the restart has to be caught
+// in.
+func TestAStateSyncCarriesAnOversizedValue(t *testing.T) {
+	for _, n := range []node{late, restart} {
+		n := n
+		eventually(t, n.name+" to hold the oversized value it could only have synced", converge,
+			func() (bool, string) {
+				got, _, ok := n.get(t, bigKey)
+				if !ok {
+					return false, n.name + " synced without it"
+				}
+				if len(got) != bigValue {
+					return false, fmt.Sprintf("%s synced %d of %d bytes — a truncated frame",
+						n.name, len(got), bigValue)
+				}
+				return true, ""
+			})
+	}
+}
+
+// assertNoDuplicateChat checks that a snapshot was merged rather than
+// appended. saidTwice is exempt: it was sent twice on purpose, and the two
+// copies are two things that were said — the distinction this whole pair of
+// tests exists to draw.
 func assertNoDuplicateChat(t *testing.T, n node) {
 	t.Helper()
 	seen := map[string]int{}
 	for _, e := range n.chat(t) {
+		if e.Text == saidTwice {
+			continue
+		}
 		key := fmt.Sprintf("%d\x00%s\x00%s\x00%s", e.TS, e.Sender, e.Kind, e.Text)
 		seen[key]++
 		if seen[key] == 2 {
@@ -462,6 +574,31 @@ func TestSyncedHistoryIsNotDuplicated(t *testing.T) {
 	if got := countText(late.chat(t), preJoinChat); got != 1 {
 		t.Errorf("the late joiner holds the pre-join line %d times, want 1: %v",
 			got, chatTexts(late.chat(t)))
+	}
+}
+
+// Saying the same thing twice is not a duplicate to be cleaned up.
+//
+// The other half of the claim above, and the half that was wrong. The merge
+// deduplicated on the entry itself, and nothing in a chat entry distinguishes
+// two identical lines — same text, same sender, same second. So "ok" said
+// twice collapsed to one on the next state sync, which is routine: one per
+// peer a joiner syncs from. The line vanished from the screen and from the
+// persisted log, and nothing said why.
+//
+// The two nodes that matter are the ones that merged a snapshot into a log:
+// the joiner, which had nothing, and the restarted node, which already held
+// most of what it was handed again.
+func TestALineSaidTwiceSurvivesEverySync(t *testing.T) {
+	for _, n := range cluster {
+		n := n
+		eventually(t, n.name+" to hold both copies of the repeated line", converge, func() (bool, string) {
+			got := countText(n.chat(t), saidTwice)
+			if got == 2 {
+				return true, ""
+			}
+			return false, fmt.Sprintf("%s holds it %d times, want 2", n.name, got)
+		})
 	}
 }
 

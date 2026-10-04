@@ -132,6 +132,17 @@ fun KeysScreen(node: NodeEngine) {
                 // Android refuses a datagram sent from there, and the update reached
                 // the cluster only on the next anti-entropy round.
                 scope.launch {
+                    // A store refusal is not a lost guard and must not be
+                    // reported as one: "it already exists" is the wrong thing
+                    // to tell someone whose value was simply too big, and for
+                    // a while it was not reported at all.
+                    val rejected = withContext(Dispatchers.IO) { node.admit(key, value) }
+                    if (rejected != null) {
+                        val why = "$key was not written: ${rejected.explain()}"
+                        node.system(why)
+                        notice = why
+                        return@launch
+                    }
                     val refused = withContext(Dispatchers.IO) {
                         if (guard) {
                             node.compareAndSet(key, value, ttl, Version()) == null
@@ -167,6 +178,13 @@ fun KeysScreen(node: NodeEngine) {
                 editing = null
                 notice = null
                 scope.launch {
+                    val rejected = withContext(Dispatchers.IO) { node.admit(key, value) }
+                    if (rejected != null) {
+                        val why = "$key was not written: ${rejected.explain()}"
+                        node.system(why)
+                        notice = why
+                        return@launch
+                    }
                     val refused = withContext(Dispatchers.IO) {
                         if (guard) {
                             // The version on screen when the dialog opened is the guard:

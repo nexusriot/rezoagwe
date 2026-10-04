@@ -1,6 +1,8 @@
 package com.nexusriot.rezoagwe.core
 
+import com.nexusriot.rezoagwe.net.MAX_DATAGRAM_PAYLOAD
 import com.nexusriot.rezoagwe.net.Packet
+import com.nexusriot.rezoagwe.net.PacketTooLargeException
 import com.nexusriot.rezoagwe.net.UdpTransport
 import com.nexusriot.rezoagwe.net.readFrame
 import com.nexusriot.rezoagwe.net.writeFrame
@@ -15,6 +17,7 @@ import com.nexusriot.rezoagwe.proto.DecodeError
 import com.nexusriot.rezoagwe.proto.DecodeException
 import com.nexusriot.rezoagwe.proto.Digest
 import com.nexusriot.rezoagwe.proto.Fingerprint
+import com.nexusriot.rezoagwe.proto.FINGERPRINT_BUCKETS
 import com.nexusriot.rezoagwe.proto.FingerprintReply
 import com.nexusriot.rezoagwe.proto.Goodbye
 import com.nexusriot.rezoagwe.proto.Hello
@@ -33,6 +36,7 @@ import java.net.Inet4Address
 import java.net.NetworkInterface
 import java.net.Socket
 import java.util.UUID
+import kotlin.concurrent.thread
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -53,6 +57,18 @@ private const val STATE_SYNC_CHAT_LINES = 200
 private const val DATAGRAM_SYNC_LIMIT = 200
 
 /** Soft byte budget and entry cap for one anti-entropy batch. */
+/**
+ * How many diverging keys a consistency report names per peer.
+ *
+ * A report is something a person reads: two replicas that share nothing would
+ * otherwise print the whole keyspace, and the first fifty names say as much as
+ * the first fifty thousand. Must match Go's MaxReportedDifferences.
+ */
+const val MAX_REPORTED_DIFFERENCES = 50
+
+/** A version as the gateway's ETags render it, so a name in a report can be pasted into an If-Match. */
+private fun formatVersion(v: Version): String = "${v.counter}.${v.node}"
+
 private const val BATCH_BYTES = 48 * 1024
 private const val BATCH_ENTRIES = 64
 
@@ -241,13 +257,32 @@ class NodeEngine(
     // ---- outbound -------------------------------------------------------
 
     private inline fun <reified T> send(addr: String, kind: Byte, value: T) {
+        val pkt = try {
+            codec.encode(kind, value)
+        } catch (e: Exception) {
+            metrics.sendFailed(normalizeAddr(addr), e)
+            return
+        }
+        sendPacket(addr, kind, pkt)
+    }
+
+    /** The half of [send] that works on an already-encoded frame, so a broadcast can encode once. */
+    fun sendPacket(addr: String, kind: Byte, pkt: ByteArray) {
         val tr = synchronized(lock) { transport } ?: return
         try {
-            val pkt = codec.encode(kind, value)
             tr.send(addr, pkt)
             metrics.sent(kind, pkt.size)
             metrics.sentTo(normalizeAddr(addr), pkt.size)
         } catch (e: Exception) {
+            // Too big for a datagram is not a network failure: the stream path
+            // carries the identical authenticated frame, and the peer
+            // dispatches it exactly as it would a datagram. Without this an
+            // entry larger than a packet is counted as a send error and
+            // dropped on every gossip tick, so the cluster stays divergent for
+            // as long as the key lives — and anti-entropy, whose whole job is
+            // to repair that, is the very thing retrying the send that cannot
+            // work.
+            if (e is PacketTooLargeException && sendStream(addr, kind, pkt)) return
             // The reason matters: "3 send errors" reads as a flaky network, but the
             // cause can equally be this process (a datagram sent from the UI thread
             // throws NetworkOnMainThreadException). Record the class and message so
@@ -256,8 +291,49 @@ class NodeEngine(
         }
     }
 
+    /**
+     * Delivers one already-encoded frame over a stream, reporting whether the
+     * peer took it.
+     *
+     * One-way: unlike [exchangeStream] there is no reply to wait for, so the
+     * connection closes as soon as the frame is written.
+     */
+    fun sendStream(addr: String, kind: Byte, pkt: ByteArray): Boolean {
+        val tr = synchronized(lock) { transport } ?: return false
+        if (!tr.streamsAvailable) return false
+        val conn = tr.dial(addr) ?: return false
+        return try {
+            writeFrame(conn.getOutputStream(), pkt)
+            metrics.sent(kind, pkt.size)
+            metrics.sentTo(normalizeAddr(addr), pkt.size)
+            true
+        } catch (e: Exception) {
+            metrics.streamErrors.incrementAndGet()
+            false
+        } finally {
+            try {
+                conn.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
     private inline fun <reified T> broadcast(kind: Byte, value: T) {
-        for (peer in peerAddrs()) send(peer, kind, value)
+        val peers = peerAddrs()
+        // A packet that has to travel by stream costs a TCP dial per peer, and
+        // an unreachable peer costs the whole dial timeout. Taken in turn, a
+        // handful of dead peers would block the caller for as long as it takes
+        // every one of them to time out, so an oversized packet fans out at
+        // once and the wait is one timeout instead of N. Datagrams stay in
+        // line: they never block, and a thread apiece would be churn for
+        // nothing.
+        val pkt = runCatching { codec.encode(kind, value) }.getOrNull()
+        if (pkt != null && pkt.size > MAX_DATAGRAM_PAYLOAD) {
+            peers.map { peer -> thread(isDaemon = true) { sendPacket(peer, kind, pkt) } }
+                .forEach { it.join() }
+            return
+        }
+        for (peer in peers) send(peer, kind, value)
     }
 
     private fun peerAddrs(): List<String> = synchronized(lock) { peers.keys.toList() }
@@ -347,6 +423,15 @@ class NodeEngine(
      */
     fun compareAndSet(key: String, value: String, ttlSeconds: Long, expect: Version): KVUpdate? =
         write(key, value, ttlSeconds, expect)
+
+    /**
+     * Why the store would not take this value, or null when it would.
+     *
+     * Asked before writing rather than inferred after it: a null update says
+     * only that nothing landed, and the caller owes the user the difference
+     * between "someone got there first" and "no peer could ever receive this".
+     */
+    fun admit(key: String, value: String): Refusal? = store.admit(key, value)
 
     private fun write(key: String, value: String, ttlSeconds: Long, expect: Version?): KVUpdate? {
         val expiresAt = if (ttlSeconds > 0) System.currentTimeMillis() / 1000 + ttlSeconds else 0
@@ -670,11 +755,26 @@ class NodeEngine(
             // A snapshot carries history this node may already hold. Appending it
             // wholesale duplicated every line on the second sync, and a joiner that
             // syncs from two peers saw the same conversation two or three times.
+            //
+            // Counted, not a set. Two identical lines are two things that were
+            // said: nothing in a chat entry distinguishes them, so a set keeps
+            // one — and because this one rebuilt the log from that set, saying
+            // "ok" twice in the same second deleted one of them on the next
+            // state sync, from the screen and from the persisted log.
             val grew = synchronized(lock) {
-                val before = chatLog.size
-                val merged = LinkedHashSet(chatLog)
-                merged.addAll(resp.chat)
-                if (merged.size == before) return@synchronized false
+                val held = HashMap<ChatEntry, Int>(chatLog.size)
+                for (e in chatLog) held[e] = (held[e] ?: 0) + 1
+                val offered = HashMap<ChatEntry, Int>(resp.chat.size)
+                for (e in resp.chat) offered[e] = (offered[e] ?: 0) + 1
+
+                val merged = ArrayList(chatLog)
+                for (e in resp.chat) {
+                    val have = held[e] ?: 0
+                    if ((offered[e] ?: 0) <= have) continue // already hold as many as offered
+                    held[e] = have + 1
+                    merged.add(e)
+                }
+                if (merged.size == chatLog.size) return@synchronized false
                 val ordered = merged.sortedBy { it.ts }
                 chatLog.clear()
                 chatLog.addAll(ordered.takeLast(CHAT_RING))
@@ -832,7 +932,9 @@ class NodeEngine(
         } else if (frame.kind == Kind.FINGERPRINT) {
             val req = WireJson.decodeFromString<Fingerprint>(String(frame.body))
             touchPeer(req.from)
-            val pkt = codec.encode(Kind.FINGERPRINT_REPLY, fingerprintReply())
+            // A stream has no datagram ceiling, so this is where a request
+            // that named buckets gets the keys in them answered.
+            val pkt = codec.encode(Kind.FINGERPRINT_REPLY, fingerprintReply(req.buckets))
             writeFrame(conn.getOutputStream(), pkt)
             metrics.sent(Kind.FINGERPRINT_REPLY, pkt.size)
         } else {
@@ -856,6 +958,31 @@ class NodeEngine(
         val clock: Long = 0,
         val agrees: Boolean = false,
         val differingBuckets: List<Int> = emptyList(),
+        /**
+         * The keys behind those buckets, sorted, at most
+         * [MAX_REPORTED_DIFFERENCES] of them. Empty against a peer too old to
+         * be asked, which is why the buckets above are still reported.
+         */
+        val differences: List<KeyDifference> = emptyList(),
+        /** How many keys were left out of [differences]. */
+        val moreDifferences: Int = 0,
+    )
+
+    /**
+     * One key two replicas do not hold the same way.
+     *
+     * Either side may be empty, and that is the interesting case: a key
+     * present here and absent there is a write that never arrived, which reads
+     * very differently from the same key at two versions.
+     */
+    data class KeyDifference(
+        val key: String,
+        /** Versions formatted "counter.node", or empty where that replica does not hold the key. */
+        val local: String = "",
+        val remote: String = "",
+        /** Whether that side holds a tombstone rather than a value: same key, different fix. */
+        val localDeleted: Boolean = false,
+        val remoteDeleted: Boolean = false,
     )
 
     /**
@@ -909,6 +1036,10 @@ class NodeEngine(
             )
         }
         val differing = local.buckets.indices.filter { local.buckets[it] != reply.buckets[it] }
+        // A second round, now that the digests have said where to look. The
+        // first is the cheap one every peer answers; this ships a key list for
+        // a few sixteenths of the keyspace, and only to peers that disagree.
+        val named = if (differing.isEmpty()) emptyList() else namedDifferences(peerAddr, differing)
         return PeerConsistency(
             addr = peerAddr,
             nick = reply.nick.ifEmpty { nickOf(peerAddr) },
@@ -918,7 +1049,56 @@ class NodeEngine(
             clock = reply.clock,
             agrees = differing.isEmpty(),
             differingBuckets = differing,
+            differences = named.take(MAX_REPORTED_DIFFERENCES),
+            moreDifferences = (named.size - MAX_REPORTED_DIFFERENCES).coerceAtLeast(0),
         )
+    }
+
+    /**
+     * Asks a peer what it holds in the buckets that disagreed, and diffs it
+     * against what this node holds there.
+     *
+     * "They differ somewhere in bucket 7" is where a report used to stop,
+     * which on a store of a few hundred keys is a sixteenth of the keyspace to
+     * read by hand. A peer too old to understand the request answers with no
+     * entries and the report falls back to the bucket indices, which is worse
+     * than a key name but much better than an error.
+     */
+    private fun namedDifferences(peerAddr: String, buckets: List<Int>): List<KeyDifference> {
+        val reply = requestFingerprint(peerAddr, buckets) ?: return emptyList()
+        val remote = reply.entries.associateBy { it.key }
+        val local = store.bucketEntries(FINGERPRINT_BUCKETS, buckets)
+        val seen = HashSet<String>(local.size)
+        val diffs = ArrayList<KeyDifference>()
+
+        for (l in local) {
+            seen.add(l.key)
+            val r = remote[l.key]
+            if (r != null && r.version == l.version && r.deleted == l.deleted) continue
+            diffs.add(
+                KeyDifference(
+                    key = l.key,
+                    local = formatVersion(l.version),
+                    localDeleted = l.deleted,
+                    remote = r?.let { formatVersion(it.version) } ?: "",
+                    remoteDeleted = r?.deleted ?: false,
+                ),
+            )
+        }
+        // Keys the peer holds and this node has never seen: the direction a
+        // local-only walk cannot find, and the one that means a write never
+        // arrived here.
+        for (r in reply.entries) {
+            if (seen.contains(r.key)) continue
+            diffs.add(
+                KeyDifference(
+                    key = r.key,
+                    remote = formatVersion(r.version),
+                    remoteDeleted = r.deleted,
+                ),
+            )
+        }
+        return diffs.sortedBy { it.key }
     }
 
     /**
@@ -926,11 +1106,11 @@ class NodeEngine(
      * it like [exchangeStream] does. A consistency check needs the reply, not a
      * side effect.
      */
-    private fun requestFingerprint(peer: String): FingerprintReply? {
+    private fun requestFingerprint(peer: String, buckets: List<Int> = emptyList()): FingerprintReply? {
         val tr = synchronized(lock) { transport } ?: return null
         val conn = tr.dial(peer) ?: return null
         return try {
-            val pkt = codec.encode(Kind.FINGERPRINT, Fingerprint(from = addr))
+            val pkt = codec.encode(Kind.FINGERPRINT, Fingerprint(from = addr, buckets = buckets))
             writeFrame(conn.getOutputStream(), pkt)
             metrics.sent(Kind.FINGERPRINT, pkt.size)
             val frame = codec.decode(readFrame(conn.getInputStream()))
@@ -963,8 +1143,17 @@ class NodeEngine(
     }
 
     /** This node's store summary, labelled so a report can name who produced it. */
-    fun fingerprintReply(): FingerprintReply =
-        store.fingerprint().copy(from = addr, nick = nick)
+    /**
+     * This node's store summary. A request naming buckets also gets the keys
+     * held in them, which is what lets the checker turn a bucket index into a
+     * name.
+     */
+    fun fingerprintReply(buckets: List<Int> = emptyList()): FingerprintReply =
+        store.fingerprint().copy(
+            from = addr,
+            nick = nick,
+            entries = if (buckets.isEmpty()) emptyList() else store.bucketEntries(FINGERPRINT_BUCKETS, buckets),
+        )
 
     /** Answers a summary request that arrived as a datagram. */
     private fun handleFingerprint(req: Fingerprint) {

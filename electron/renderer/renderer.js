@@ -230,6 +230,14 @@ screens.keys = () => {
   const save = async (req, entry) => {
     ui.notice = null;
     const result = await api.kv.set({ ...req, expect: entry ? entry.version : null });
+    if (result && result.rejected) {
+      // The store would not take it at all — a size or key limit, or a value
+      // no peer could ever receive. Nothing to do with the guard, so saying
+      // "a peer changed it" would send the reader after the wrong thing.
+      ui.notice = `${req.key} was not written: ${result.reason}`;
+      render();
+      return;
+    }
     if (result && result.refused) {
       // A refused guarded write used to leave only a line in the chat log, which
       // is not the screen the user is looking at: the edit simply vanished.
@@ -707,12 +715,37 @@ screens.activity = () => {
 /** Diagnostics: the whole node in one screen, starting with what is wrong. */
 screens.diag = () => {
   const body = h('div', {});
+
+  // Anti-entropy repairs divergence but never reports it, so a cluster can sit
+  // split for as long as nobody looks. The terminal client and the Android app
+  // both have this; the desktop could ask in its engine but gave the user no
+  // way to.
+  let verdict = null;
+  let verifying = false;
+  const verifyButton = h('button', {
+    class: 'btn', type: 'button', text: 'Verify replicas',
+    onclick: async () => {
+      if (verifying) return;
+      verifying = true;
+      verifyButton.textContent = 'Verifying…';
+      verifyButton.disabled = true;
+      try {
+        verdict = await api.diag.consistency();
+      } finally {
+        verifying = false;
+        verifyButton.textContent = 'Verify replicas';
+        verifyButton.disabled = false;
+        paint();
+      }
+    },
+  });
   const root = h('div', { class: 'pane-body-inner' },
     h('div', { class: 'toolbar' },
       h('button', {
         class: 'btn', type: 'button', text: 'Copy report', onclick: () => api.diag.copyReport(),
       }),
       h('button', { class: 'btn ghost', type: 'button', text: 'Refresh', onclick: () => refresh() }),
+      verifyButton,
       h('span', { class: 'chip', text: 'refreshed every 2s' })),
     body);
 
@@ -818,6 +851,8 @@ screens.diag = () => {
       line('groups', String(groups.length)),
       groups.map((g, i) => line(`group ${i + 1}`, `${g.length}: ${g.join(', ')}`)),
       d.topology.links.filter((l) => l.kind === 'observed').map((l) => line('unconfirmed', `${l.a} → ${l.b}`))));
+
+    if (verdict) body.append(consistencyCard(verdict));
   }
 
   return {
@@ -830,6 +865,72 @@ screens.diag = () => {
     unmounted: () => clearInterval(timer),
   };
 };
+
+/**
+ * What the replicas actually hold right now, by name.
+ *
+ * A bucket index localises a disagreement to a sixteenth of the keyspace,
+ * which on a few hundred keys is still a list to read by hand. The check knows
+ * the key; this is where it says so.
+ */
+function consistencyCard(r) {
+  const rows = [];
+  const line = (k, v) => h('div', { class: 'line' },
+    h('span', { class: 'k', text: k }), h('span', { class: 'v', text: v }));
+
+  rows.push(line('this node', `${r.keys} keys, ${r.tombstones} tombstones, clock ${r.clock}`));
+  if (!r.peers.length) rows.push(h('div', { class: 'kv-meta mt6', text: 'No peers to compare against.' }));
+
+  for (const p of r.peers) {
+    const name = p.nick ? `${p.nick} (${p.addr})` : p.addr;
+    if (!p.reachable) {
+      rows.push(line(name, `did not answer: ${p.error || 'no reply'}`));
+      continue;
+    }
+    rows.push(line(name, p.agrees
+      ? `agrees — ${p.keys} keys, clock ${p.clock}`
+      : `disagrees — ${p.keys} keys, clock ${p.clock}`));
+    if (p.agrees) continue;
+    if (!p.differences.length) {
+      // No names means the peer could not be asked for them — an older node,
+      // or a second round that failed. The ranges are all there is to say.
+      rows.push(h('div', { class: 'kv-meta mt6',
+        text: `differs in ${p.differingBuckets.length} of ${S.FINGERPRINT_BUCKETS} key ranges` }));
+      continue;
+    }
+    for (const d of p.differences) {
+      rows.push(h('div', { class: 'line' },
+        h('span', { class: 'k', text: d.key }),
+        h('span', { class: 'v', text: `here ${describeSide(d.local, d.localDeleted)}  ·  there ${describeSide(d.remote, d.remoteDeleted)}` })));
+    }
+    if (p.moreDifferences) {
+      rows.push(h('div', { class: 'kv-meta mt6', text: `and ${p.moreDifferences} more` }));
+    }
+  }
+
+  if (r.unreachable) {
+    rows.push(h('div', { class: 'kv-meta mt6', text:
+      `${r.unreachable} peer(s) did not answer; a silent peer says nothing about whether it agrees.` }));
+  }
+  if (!r.converged) {
+    rows.push(h('div', { class: 'kv-meta mt6', text:
+      'Anti-entropy repairs this on its own. A disagreement that persists across several checks is '
+      + 'the one worth chasing.' }));
+  }
+  return h('div', { class: 'card' },
+    h('h3', { text: r.converged ? 'Replicas agree' : 'Replicas disagree' }), ...rows);
+}
+
+/**
+ * One side of a difference, in the terms that decide what to do about it: a
+ * key missing on one side is a write that never arrived, two versions is a
+ * race anti-entropy will settle, and a tombstone against a value is a delete
+ * still travelling.
+ */
+function describeSide(version, deleted) {
+  if (!version) return 'absent';
+  return deleted ? `deleted ${version}` : version;
+}
 
 function symbolFor(severity) {
   if (severity === 'ok') return '✓';

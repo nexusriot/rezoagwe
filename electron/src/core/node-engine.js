@@ -4,10 +4,11 @@ const crypto = require('node:crypto');
 const { EventEmitter } = require('node:events');
 
 const W = require('../proto/wire');
-const { Kind, KVAction, ChatKind } = W;
+const { Kind, KVAction, ChatKind, versionEqual } = W;
 const { Codec, DecodeError, DecodeException, keyFingerprint } = require('../proto/codec');
-const { UdpTransport } = require('../net/udp');
-const { writeFrame, readFrame } = require('../net/framing');
+const { UdpTransport, PacketTooLargeError } = require('../net/udp');
+const { StoreRefusal } = require('./refusal');
+const { writeFrame, readFrame, frameWithLength } = require('../net/framing');
 const { normalizeAddr, validPeerAddr, localIpv4 } = require('../net/addr');
 const { KvStore } = require('./kvstore');
 const { Metrics } = require('./metrics');
@@ -24,6 +25,20 @@ const DATAGRAM_SYNC_LIMIT = 200;
 /** Soft byte budget and entry cap for one anti-entropy batch. */
 const BATCH_BYTES = 48 * 1024;
 const BATCH_ENTRIES = 64;
+
+/**
+ * How many diverging keys a consistency report names per peer.
+ *
+ * A report is something a person reads: two replicas that share nothing would
+ * otherwise print the whole keyspace, and the first fifty names say as much as
+ * the first fifty thousand. Must match Go's MaxReportedDifferences.
+ */
+const MAX_REPORTED_DIFFERENCES = 50;
+
+/** A version as the gateway's ETags render it, so a name in a report can be pasted into an If-Match. */
+function formatVersion(v) {
+  return `${v.counter}.${v.node}`;
+}
 
 const DEFAULTS = {
   advertiseHost: '',
@@ -212,7 +227,57 @@ class NodeEngine extends EventEmitter {
       this.metrics.sent(kind, pkt.length);
       this.metrics.sentTo(normalizeAddr(addr), pkt.length);
     } catch (e) {
+      // Too big for a datagram is not a network failure: the stream path
+      // carries the identical authenticated frame, and the peer dispatches it
+      // exactly as it would a datagram. Without this an entry larger than a
+      // packet is counted as a send error and dropped on every gossip tick,
+      // so the cluster stays divergent for as long as the key lives — and
+      // anti-entropy, whose whole job is to repair that, is the very thing
+      // retrying the send that cannot work.
+      if (e instanceof PacketTooLargeError && await this.sendStream(addr, kind, pkt)) return;
       this.metrics.sendFailed(normalizeAddr(addr), e);
+    }
+  }
+
+  /**
+   * Delivers one already-encoded frame over a stream, reporting whether the
+   * peer took it.
+   *
+   * One-way: unlike exchangeStream there is no reply to wait for, so the
+   * connection closes as soon as the frame is written.
+   */
+  async sendStream(addr, kind, pkt) {
+    const transport = this.transport;
+    if (!transport || !transport.streamsAvailable) return false;
+    let conn;
+    try {
+      conn = await transport.dial(addr);
+    } catch {
+      return false;
+    }
+    try {
+      // end(frame, cb) rather than write(frame): it flushes and then sends the
+      // FIN, and the callback is the only signal that the bytes actually left.
+      // Writing and closing instead discards whatever is still queued — for a
+      // small frame that is nothing, for a large one it is most of it, and the
+      // receiver then reads a length prefix promising more than ever arrives.
+      // This path exists for exactly the frames big enough to hit that.
+      await new Promise((resolve, reject) => {
+        conn.once('error', reject);
+        conn.end(frameWithLength(pkt), () => resolve());
+      });
+      this.metrics.sent(kind, pkt.length);
+      this.metrics.sentTo(normalizeAddr(addr), pkt.length);
+      return true;
+    } catch {
+      this.metrics.streamErrors++;
+      return false;
+    } finally {
+      try {
+        if (conn.destroy) conn.destroy();
+      } catch {
+        // already gone
+      }
     }
   }
 
@@ -345,6 +410,14 @@ class NodeEngine extends EventEmitter {
   }
 
   async write(key, value, ttlSeconds, expect) {
+    // Asked before the write rather than inferred after it: a null return says
+    // only that nothing landed, and the caller owes the user the difference
+    // between "someone got there first" and "no peer could ever receive this".
+    // Safe to ask separately because nothing else runs in between — this is
+    // one synchronous stretch up to the store call.
+    const refusal = this.store.admit(key, value);
+    if (refusal) throw new StoreRefusal(refusal, key);
+
     const expiresAt = ttlSeconds > 0 ? Math.floor(this.now() / 1000) + Number(ttlSeconds) : 0;
     const update = this.store.write(key, value, { expiresAt, expect });
     if (!update) {
@@ -733,7 +806,11 @@ class NodeEngine extends EventEmitter {
   }
 
   async fingerprintPeer(addr, local) {
-    const base = { addr, nick: this.nickOf(addr), reachable: false, error: '', keys: 0, tombstones: 0, clock: 0, agrees: false, differingBuckets: [] };
+    const base = {
+      addr, nick: this.nickOf(addr), reachable: false, error: '',
+      keys: 0, tombstones: 0, clock: 0, agrees: false, differingBuckets: [],
+      differences: [], moreDifferences: 0,
+    };
     const reply = await this.requestFingerprint(addr);
     if (!reply) return { ...base, error: 'no answer' };
     if (reply.buckets.length !== local.buckets.length) {
@@ -744,6 +821,13 @@ class NodeEngine extends EventEmitter {
     const differingBuckets = local.buckets
       .map((v, i) => (v === reply.buckets[i] ? -1 : i))
       .filter((i) => i >= 0);
+    // A second round, now that the digests have said where to look. The first
+    // is the cheap one every peer answers; this ships a key list for a few
+    // sixteenths of the keyspace, and only to peers that actually disagree.
+    const named = differingBuckets.length
+      ? await this.namedDifferences(addr, differingBuckets)
+      : { differences: [], moreDifferences: 0 };
+
     return {
       ...base,
       nick: reply.nick || base.nick,
@@ -753,7 +837,60 @@ class NodeEngine extends EventEmitter {
       clock: reply.clock,
       agrees: differingBuckets.length === 0,
       differingBuckets,
+      ...named,
     };
+  }
+
+  /**
+   * Asks a peer what it holds in the buckets that disagreed, and diffs it
+   * against what this node holds there.
+   *
+   * "They differ somewhere in bucket 7" is where a report used to stop, which
+   * on a store of a few hundred keys is a sixteenth of the keyspace to go and
+   * read by hand. A peer too old to understand the request answers with no
+   * entries and the report falls back to the bucket indices, which is worse
+   * than a key name but much better than an error.
+   */
+  async namedDifferences(addr, buckets) {
+    const reply = await this.requestFingerprint(addr, buckets);
+    if (!reply) return { differences: [], moreDifferences: 0 };
+
+    const remote = new Map(reply.entries.map((e) => [e.key, e]));
+    const local = this.store.bucketEntries(W.FINGERPRINT_BUCKETS, buckets);
+    const seen = new Set();
+    const diffs = [];
+
+    for (const l of local) {
+      seen.add(l.key);
+      const r = remote.get(l.key);
+      if (r && versionEqual(r.version, l.version) && !!r.deleted === !!l.deleted) continue;
+      diffs.push({
+        key: l.key,
+        local: formatVersion(l.version),
+        localDeleted: !!l.deleted,
+        remote: r ? formatVersion(r.version) : '',
+        remoteDeleted: r ? !!r.deleted : false,
+      });
+    }
+    // Keys the peer holds and this node has never seen: the direction a
+    // local-only walk cannot find, and the one that means a write never
+    // arrived here.
+    for (const r of reply.entries) {
+      if (seen.has(r.key)) continue;
+      diffs.push({
+        key: r.key, local: '', localDeleted: false,
+        remote: formatVersion(r.version), remoteDeleted: !!r.deleted,
+      });
+    }
+    diffs.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+
+    if (diffs.length > MAX_REPORTED_DIFFERENCES) {
+      return {
+        differences: diffs.slice(0, MAX_REPORTED_DIFFERENCES),
+        moreDifferences: diffs.length - MAX_REPORTED_DIFFERENCES,
+      };
+    }
+    return { differences: diffs, moreDifferences: 0 };
   }
 
   /**
@@ -761,11 +898,11 @@ class NodeEngine extends EventEmitter {
    * like exchangeStream does. A consistency check needs the reply, not a side
    * effect.
    */
-  async requestFingerprint(peer) {
+  async requestFingerprint(peer, buckets = []) {
     let conn;
     try {
       conn = await this.transport.dial(peer);
-      const pkt = this.codec.encode(Kind.FINGERPRINT, W.encodeFingerprint({ from: this.addr }));
+      const pkt = this.codec.encode(Kind.FINGERPRINT, W.encodeFingerprint({ from: this.addr, buckets }));
       writeFrame(conn, pkt);
       this.metrics.sent(Kind.FINGERPRINT, pkt.length);
 
@@ -786,11 +923,16 @@ class NodeEngine extends EventEmitter {
     }
   }
 
-  /** This node's store summary, labelled so a report can name who produced it. */
-  fingerprintReply() {
+  /**
+   * This node's store summary, labelled so a report can name who produced it.
+   * A request naming buckets also gets the keys held in them, which is what
+   * lets the checker turn a bucket index into a name.
+   */
+  fingerprintReply(buckets = []) {
     const r = this.store.fingerprint();
     r.from = this.addr;
     r.nick = this.nick;
+    if (buckets.length) r.entries = this.store.bucketEntries(W.FINGERPRINT_BUCKETS, buckets);
     return r;
   }
 
@@ -798,6 +940,8 @@ class NodeEngine extends EventEmitter {
   async handleFingerprint(req) {
     if (!req.from) return;
     this.touchPeer(req.from);
+    // Digests only on this path: a key listing has no bound that fits a
+    // packet, and the checker uses the stream path anyway.
     await this.send(req.from, Kind.FINGERPRINT_REPLY, W.encodeFingerprintReply(this.fingerprintReply()));
   }
 
@@ -886,12 +1030,26 @@ class NodeEngine extends EventEmitter {
    */
   mergeChat(history) {
     const key = (e) => `${e.ts}\u0001${e.sender}\u0001${e.nick}\u0001${e.text}\u0001${e.kind}\u0001${e.to}`;
-    const seen = new Set(this.chatLog.map(key));
+    // Counted, not a set. Two identical lines are two things that were said:
+    // nothing in a chat entry distinguishes them, so a set keeps one, and a
+    // snapshot of a conversation where someone said "ok" twice in the same
+    // second arrived here as one "ok".
+    const held = new Map();
+    for (const e of this.chatLog) {
+      const k = key(e);
+      held.set(k, (held.get(k) || 0) + 1);
+    }
+    const offered = new Map();
+    for (const e of history) {
+      const k = key(e);
+      offered.set(k, (offered.get(k) || 0) + 1);
+    }
     let grew = false;
     for (const entry of history) {
       const k = key(entry);
-      if (seen.has(k)) continue;
-      seen.add(k);
+      const have = held.get(k) || 0;
+      if (offered.get(k) <= have) continue; // we already hold as many as the snapshot has
+      held.set(k, have + 1);
       this.chatLog.push(entry);
       grew = true;
     }
@@ -1055,7 +1213,10 @@ class NodeEngine extends EventEmitter {
       } else if (frame.kind === Kind.FINGERPRINT) {
         const req = W.decodeFingerprint(JSON.parse(frame.body.toString('utf8')));
         this.touchPeer(req.from);
-        const pkt = this.codec.encode(Kind.FINGERPRINT_REPLY, W.encodeFingerprintReply(this.fingerprintReply()));
+        // A stream has no datagram ceiling, so this is where a request that
+        // named buckets gets the keys in them answered.
+        const pkt = this.codec.encode(Kind.FINGERPRINT_REPLY,
+          W.encodeFingerprintReply(this.fingerprintReply(req.buckets)));
         writeFrame(conn, pkt);
         this.metrics.sent(Kind.FINGERPRINT_REPLY, pkt.length);
       } else {
@@ -1064,8 +1225,19 @@ class NodeEngine extends EventEmitter {
     } catch (e) {
       this.metrics.streamErrors++;
     } finally {
-      conn.end();
-      if (conn.destroy) setTimeout(() => conn.destroy(), 100).unref?.();
+      // Wait for the flush rather than guessing at it: a state response is a
+      // whole store, and a fixed grace period before destroy is a throughput
+      // assumption that a large one outgrows — truncating the reply into
+      // something the peer reads as a broken stream.
+      try {
+        await new Promise((resolve) => {
+          conn.once('error', resolve);
+          conn.end(() => resolve());
+        });
+      } catch {
+        // already gone
+      }
+      if (conn.destroy) conn.destroy();
     }
   }
 

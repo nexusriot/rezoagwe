@@ -109,17 +109,38 @@ func Checks(d Snapshot, now time.Time) []Check {
 				"steadily climbing count is not.")
 	}
 	if m.SendErrors > 0 {
+		// The last failure decides what this says. An oversized frame and an
+		// unroutable peer both arrive here as "send error", and the advice is
+		// opposite: one is a payload this node built too big to send, the
+		// other is the network. Blaming the route for the first sends the
+		// reader to check an address that is perfectly fine.
 		detail := "Datagrams could not leave this machine — usually a peer address that no longer " +
 			"routes, or an interface dropping while the node stays up."
+		if e := m.LastSendError; e != nil && e.Oversize {
+			detail = "A frame too large for one datagram could not be sent. Nothing is wrong with " +
+				"the route: an entry this big travels over a stream instead, and that did not work."
+			if !d.StreamListener {
+				detail += " This node has no stream listener, which is why — see the check below."
+			} else {
+				detail += " The peer's stream port is the thing to look at: a firewall that passes " +
+					"UDP and blocks TCP looks exactly like this."
+			}
+			detail += " Until it does, that entry cannot reach that peer by any path, and the " +
+				"replicas stay divergent however long anti-entropy runs."
+		}
 		if e := m.LastSendError; e != nil {
 			detail += fmt.Sprintf(" Last: %s to %s (%s).", e.Kind, e.Addr, e.Message)
 		}
 		add(SeverityWarn, fmt.Sprintf("%d send error(s)", m.SendErrors), detail)
 	}
 	if !d.StreamListener {
-		add(SeverityWarn, fmt.Sprintf("No stream listener on %s", d.BindAddr),
-			"Another process holds the TCP port, so large state syncs fall back to datagrams and a "+
-				"big keyspace may take several gossip rounds to converge.")
+		detail := "Another process holds the TCP port, so large state syncs fall back to datagrams " +
+			"and a big keyspace may take several gossip rounds to converge."
+		if e := m.LastSendError; e != nil && e.Oversize {
+			detail += " It is also why the oversized frame above had nowhere to go: the stream is " +
+				"the only path for an entry that does not fit a datagram."
+		}
+		add(SeverityWarn, fmt.Sprintf("No stream listener on %s", d.BindAddr), detail)
 	}
 
 	// A node seconds old has not failed to do anything yet: a peer answers on

@@ -269,3 +269,66 @@ func TestReportNamesTheAdvertisedAddressEvenWhenItIsTheBindAddress(t *testing.T)
 		t.Fatalf("report does not mark an overridden advertise address:\n%s", out)
 	}
 }
+
+// An oversized frame and an unroutable peer are both "send error", and the
+// advice is opposite. Blaming the route for the first is what the live run
+// found: the counter said "message too long" and the prose said to go and
+// check an address that was perfectly fine.
+func TestAnOversizedFrameIsNotBlamedOnTheRoute(t *testing.T) {
+	d := healthy()
+	d.Metrics.SendErrors = 7
+	d.Metrics.LastSendError = &metrics.SendError{
+		Addr: "10.0.0.4:3137", Kind: "kv", Oversize: true,
+		Message: "packet exceeds maximum datagram payload",
+	}
+
+	c := findCheck(t, Checks(d, now), "send error")
+	if strings.Contains(c.Detail, "no longer routes") {
+		t.Errorf("an oversized frame was blamed on the route:\n%s", c.Detail)
+	}
+	for _, want := range []string{"too large for one datagram", "stream", "divergent"} {
+		if !strings.Contains(c.Detail, want) {
+			t.Errorf("detail does not mention %q:\n%s", want, c.Detail)
+		}
+	}
+}
+
+// With no stream listener the oversized frame had nowhere to go, and that is
+// the actionable half: the two checks have to point at each other rather than
+// leave the reader to join them up.
+func TestAnOversizedFrameWithNoStreamNamesTheListener(t *testing.T) {
+	d := healthy()
+	d.StreamListener = false
+	d.Metrics.SendErrors = 1
+	d.Metrics.LastSendError = &metrics.SendError{
+		Addr: "10.0.0.4:3137", Kind: "kv_batch", Oversize: true,
+		Message: "packet exceeds maximum datagram payload",
+	}
+
+	checks := Checks(d, now)
+	send := findCheck(t, checks, "send error")
+	if !strings.Contains(send.Detail, "no stream listener") {
+		t.Errorf("the send check does not name the missing listener:\n%s", send.Detail)
+	}
+	listener := findCheck(t, checks, "No stream listener")
+	if !strings.Contains(listener.Detail, "oversized frame") {
+		t.Errorf("the listener check does not connect to the failure:\n%s", listener.Detail)
+	}
+}
+
+// An ordinary failure keeps the ordinary explanation: the network really is
+// the usual cause, and the oversize wording would be a wrong guess.
+func TestAnOrdinarySendErrorStillBlamesTheNetwork(t *testing.T) {
+	d := healthy()
+	d.Metrics.SendErrors = 1
+	d.Metrics.LastSendError = &metrics.SendError{
+		Addr: "10.0.0.4:3137", Kind: "hello", Message: "no route to host",
+	}
+	c := findCheck(t, Checks(d, now), "send error")
+	if !strings.Contains(c.Detail, "no longer routes") {
+		t.Errorf("an ordinary failure lost its explanation:\n%s", c.Detail)
+	}
+	if strings.Contains(c.Detail, "too large") {
+		t.Errorf("an ordinary failure was described as oversized:\n%s", c.Detail)
+	}
+}

@@ -96,6 +96,11 @@ class Metrics {
       addr,
       cause: (err && (err.code || err.name)) || 'Error',
       message: (err && err.message) || '',
+      // The one failure whose cause is this node's own payload rather than
+      // the network: a frame too large for a datagram, which the stream path
+      // should have carried and did not. Told apart because the advice is
+      // opposite — nothing about the route is wrong.
+      oversize: !!(err && err.name === 'PacketTooLargeError'),
     };
   }
 

@@ -2,6 +2,7 @@ package node
 
 import (
 	"encoding/json"
+	"errors"
 	"sort"
 	"time"
 
@@ -17,55 +18,64 @@ func (n *Node) Join() { n.join() }
 
 // Set writes a key and replicates it. A non-zero ttl expires the key on every
 // replica at the same instant.
-func (n *Node) Set(key, value string, ttl time.Duration) pb.KVUpdate {
-	u, _ := n.write(key, value, ttl, nil)
-	return u
+//
+// The error says why a write did not land — a size or key limit, or a value
+// no peer could ever be sent. A caller that ignores it is telling someone a
+// write succeeded when the store refused it, which is what the HTTP gateway
+// used to do.
+func (n *Node) Set(key, value string, ttl time.Duration) (pb.KVUpdate, error) {
+	return n.write(key, value, ttl, nil)
 }
 
-// CompareAndSet writes only if the key currently holds expect, and reports
-// whether it did. A zero expect requires the key to be absent, which is what
-// turns this store into something you can build a lock or a leader election on.
-func (n *Node) CompareAndSet(key, value string, ttl time.Duration, expect pb.Version) (pb.KVUpdate, bool) {
+// CompareAndSet writes only if the key currently holds expect. A zero expect
+// requires the key to be absent, which is what turns this store into something
+// you can build a lock or a leader election on. A refused swap returns
+// model.ErrVersionMismatch, which a caller must tell apart from a refusal for
+// size: one means "someone got there first", the other "this will never work".
+func (n *Node) CompareAndSet(key, value string, ttl time.Duration, expect pb.Version) (pb.KVUpdate, error) {
 	return n.write(key, value, ttl, &expect)
 }
 
-func (n *Node) write(key, value string, ttl time.Duration, expect *pb.Version) (pb.KVUpdate, bool) {
+func (n *Node) write(key, value string, ttl time.Duration, expect *pb.Version) (pb.KVUpdate, error) {
 	opt := model.WriteOptions{Expect: expect}
 	if ttl > 0 {
 		opt.ExpiresAt = time.Now().Add(ttl).Unix()
 	}
-	u, ok := n.Model.Store.Write(key, value, opt)
-	if !ok {
-		n.Metrics.KVCASFailures.Add(1)
-		return u, false
+	u, err := n.Model.Store.Write(key, value, opt)
+	if err != nil {
+		if errors.Is(err, model.ErrVersionMismatch) {
+			n.Metrics.KVCASFailures.Add(1)
+		}
+		return u, err
 	}
 	n.Metrics.KVLocalWrites.Add(1)
 	n.broadcast(pb.KindKV, u)
 	n.ev.KVChanged()
-	return u, true
+	return u, nil
 }
 
 // Delete tombstones a key and replicates the tombstone.
-func (n *Node) Delete(key string) pb.KVUpdate {
-	u, _ := n.remove(key, nil)
-	return u
+func (n *Node) Delete(key string) (pb.KVUpdate, error) {
+	return n.remove(key, nil)
 }
 
 // CompareAndDelete deletes only if the key currently holds expect.
-func (n *Node) CompareAndDelete(key string, expect pb.Version) (pb.KVUpdate, bool) {
+func (n *Node) CompareAndDelete(key string, expect pb.Version) (pb.KVUpdate, error) {
 	return n.remove(key, &expect)
 }
 
-func (n *Node) remove(key string, expect *pb.Version) (pb.KVUpdate, bool) {
-	u, ok := n.Model.Store.Remove(key, model.WriteOptions{Expect: expect})
-	if !ok {
-		n.Metrics.KVCASFailures.Add(1)
-		return u, false
+func (n *Node) remove(key string, expect *pb.Version) (pb.KVUpdate, error) {
+	u, err := n.Model.Store.Remove(key, model.WriteOptions{Expect: expect})
+	if err != nil {
+		if errors.Is(err, model.ErrVersionMismatch) {
+			n.Metrics.KVCASFailures.Add(1)
+		}
+		return u, err
 	}
 	n.Metrics.KVLocalWrites.Add(1)
 	n.broadcast(pb.KindKV, u)
 	n.ev.KVChanged()
-	return u, true
+	return u, nil
 }
 
 func (n *Node) Get(key string) (string, bool) { return n.Model.Store.Get(key) }

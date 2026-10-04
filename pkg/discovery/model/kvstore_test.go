@@ -89,13 +89,13 @@ func TestCompareAndSwap(t *testing.T) {
 	kv := NewKVStore("self")
 	first := kv.Set("lock", "alice")
 
-	if _, ok := kv.Write("lock", "bob", WriteOptions{Expect: &pb.Version{Counter: 99, Node: "x"}}); ok {
+	if _, err := kv.Write("lock", "bob", WriteOptions{Expect: &pb.Version{Counter: 99, Node: "x"}}); err == nil {
 		t.Fatal("CAS succeeded against the wrong version")
 	}
 	if v, _ := kv.Get("lock"); v != "alice" {
 		t.Fatalf("value = %q after failed CAS, want alice", v)
 	}
-	if _, ok := kv.Write("lock", "bob", WriteOptions{Expect: &first.Version}); !ok {
+	if _, err := kv.Write("lock", "bob", WriteOptions{Expect: &first.Version}); err != nil {
 		t.Fatal("CAS against the current version failed")
 	}
 	if v, _ := kv.Get("lock"); v != "bob" {
@@ -108,10 +108,10 @@ func TestCompareAndSwapRequiresAbsence(t *testing.T) {
 	kv := NewKVStore("self")
 	zero := pb.Version{}
 
-	if _, ok := kv.Write("lock", "alice", WriteOptions{Expect: &zero}); !ok {
+	if _, err := kv.Write("lock", "alice", WriteOptions{Expect: &zero}); err != nil {
 		t.Fatal("claiming a free key failed")
 	}
-	if _, ok := kv.Write("lock", "bob", WriteOptions{Expect: &zero}); ok {
+	if _, err := kv.Write("lock", "bob", WriteOptions{Expect: &zero}); err == nil {
 		t.Fatal("claimed a key that was already held")
 	}
 	if v, _ := kv.Get("lock"); v != "alice" {
@@ -123,10 +123,10 @@ func TestCompareAndDelete(t *testing.T) {
 	kv := NewKVStore("self")
 	u := kv.Set("k", "v")
 
-	if _, ok := kv.Remove("k", WriteOptions{Expect: &pb.Version{Counter: 42}}); ok {
+	if _, err := kv.Remove("k", WriteOptions{Expect: &pb.Version{Counter: 42}}); err == nil {
 		t.Fatal("guarded delete succeeded against the wrong version")
 	}
-	if _, ok := kv.Remove("k", WriteOptions{Expect: &u.Version}); !ok {
+	if _, err := kv.Remove("k", WriteOptions{Expect: &u.Version}); err != nil {
 		t.Fatal("guarded delete failed against the current version")
 	}
 	if _, ok := kv.Get("k"); ok {

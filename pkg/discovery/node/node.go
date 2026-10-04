@@ -7,6 +7,7 @@
 package node
 
 import (
+	"errors"
 	"fmt"
 	"math/rand"
 	"sort"
@@ -278,12 +279,50 @@ func (n *Node) send(addr string, kind pb.MessageKind, v interface{}) {
 }
 
 func (n *Node) sendRaw(addr string, kind pb.MessageKind, pkt []byte) {
-	if err := n.tr.Send(addr, pkt); err != nil {
+	err := n.tr.Send(addr, pkt)
+	if errors.Is(err, transport.ErrPacketTooLarge) {
+		// Too big for a datagram is not a network failure: the stream path
+		// carries the identical authenticated frame, and the peer dispatches
+		// it exactly as it would a datagram. Without this an entry larger than
+		// a packet is counted as a send error and dropped on every gossip
+		// tick, so the cluster stays divergent for as long as the key lives —
+		// and anti-entropy, whose whole job is to repair that, is the very
+		// thing retrying the send that cannot work.
+		if n.sendStream(addr, kind, pkt) {
+			return
+		}
+	}
+	if err != nil {
 		n.Metrics.SendFailed(model.NormalizeAddr(addr), kind, err, time.Now().Unix())
 		log.Debugf("send %s to %s: %s", kind, addr, err)
 		return
 	}
 	n.Metrics.SentTo(model.NormalizeAddr(addr), kind, len(pkt))
+}
+
+// sendStream delivers one already-encoded frame over a stream and reports
+// whether the peer took it. One-way: unlike exchangeStream there is no reply
+// to wait for, so the connection closes as soon as the frame is written.
+func (n *Node) sendStream(addr string, kind pb.MessageKind, pkt []byte) bool {
+	if !n.tr.StreamsAvailable() {
+		return false
+	}
+	conn, err := n.tr.Dial(addr)
+	if err != nil {
+		log.Debugf("stream dial %s: %s", addr, err)
+		return false
+	}
+	defer conn.Close()
+	// The deadline scales with the frame: a fixed one is a throughput
+	// assumption, and this path exists precisely for the frames big enough to
+	// break it.
+	if err := transport.WriteFrameTo(conn, streamTimeout, pkt); err != nil {
+		n.Metrics.StreamErrors.Add(1)
+		log.Debugf("stream write %s to %s: %s", kind, addr, err)
+		return false
+	}
+	n.Metrics.SentTo(model.NormalizeAddr(addr), kind, len(pkt))
+	return true
 }
 
 // broadcast sends one encoded packet to every known peer. Encoding once means
@@ -293,6 +332,27 @@ func (n *Node) broadcast(kind pb.MessageKind, v interface{}) {
 	pkt, err := n.codec.Encode(kind, v)
 	if err != nil {
 		log.Errorf("encode %s: %s", kind, err)
+		return
+	}
+	// A packet that has to travel by stream costs a TCP dial per peer, and an
+	// unreachable peer costs the whole dial timeout. Sent in turn, a handful
+	// of dead peers would block the caller — and the gossip loop behind it —
+	// for as long as it takes every one of them to time out, so an oversized
+	// packet fans out at once and the wait is one timeout instead of N.
+	// Datagrams stay in line: they never block, and a goroutine apiece would
+	// be churn for nothing.
+	if len(pkt) > transport.MaxDatagramPayload {
+		var wg sync.WaitGroup
+		n.Model.Nodes.Range(func(key, _ interface{}) bool {
+			addr := key.(string)
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				n.sendRaw(addr, kind, pkt)
+			}()
+			return true
+		})
+		wg.Wait()
 		return
 	}
 	n.Model.Nodes.Range(func(key, _ interface{}) bool {

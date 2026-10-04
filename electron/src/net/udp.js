@@ -5,6 +5,26 @@ const net = require('node:net');
 const { EventEmitter } = require('node:events');
 const { targetOf } = require('./addr');
 
+/**
+ * The largest payload a datagram can carry: 65535 less the 8-byte UDP and
+ * 20-byte IPv4 headers.
+ *
+ * send checks this itself rather than letting the OS reject the write, because
+ * the OS refusal is a platform-specific errno the caller cannot portably
+ * recognise — and the caller has to recognise it, since the right answer is to
+ * put the same frame on a stream, not to count a send error and drop it.
+ */
+const MAX_DATAGRAM_PAYLOAD = 65507;
+
+/** Thrown by send for a payload no datagram can carry: "use a stream", not "the network failed". */
+class PacketTooLargeError extends Error {
+  constructor(size) {
+    super(`packet of ${size} bytes exceeds the ${MAX_DATAGRAM_PAYLOAD}-byte datagram payload`);
+    this.name = 'PacketTooLargeError';
+    this.code = 'EPACKETTOOLARGE';
+  }
+}
+
 /** Bounds a stream dial so an unreachable peer cannot stall a joiner. */
 const DIAL_TIMEOUT_MS = 5_000;
 /** Bounds one request/response exchange on a stream. */
@@ -96,6 +116,7 @@ class UdpTransport extends EventEmitter {
     const target = targetOf(addr);
     if (!target) return Promise.reject(new Error(`unusable address: ${addr}`));
     if (this.closed) return Promise.reject(new Error('transport closed'));
+    if (data.length > MAX_DATAGRAM_PAYLOAD) return Promise.reject(new PacketTooLargeError(data.length));
     return new Promise((resolve, reject) => {
       this.socket.send(data, 0, data.length, target.port, target.host, (err) => {
         if (err) reject(err);
@@ -145,4 +166,10 @@ class UdpTransport extends EventEmitter {
   }
 }
 
-module.exports = { UdpTransport, DIAL_TIMEOUT_MS, STREAM_TIMEOUT_MS };
+module.exports = {
+  UdpTransport,
+  PacketTooLargeError,
+  MAX_DATAGRAM_PAYLOAD,
+  DIAL_TIMEOUT_MS,
+  STREAM_TIMEOUT_MS,
+};

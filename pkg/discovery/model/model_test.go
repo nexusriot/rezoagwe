@@ -236,3 +236,41 @@ func TestPrependChatOrdersByTime(t *testing.T) {
 		}
 	}
 }
+
+// Saying the same thing twice is not a duplicate to be cleaned up.
+//
+// The merge deduplicated on the entry itself, and nothing in a chat entry
+// distinguishes two identical lines — same text, same sender, same second. So
+// "ok" said twice collapsed to one on the next state sync, which is routine:
+// one per peer a joiner syncs from. The line vanished from the screen and from
+// the persisted log, and nothing said why.
+func TestPrependChatKeepsALineThatWasGenuinelySaidTwice(t *testing.T) {
+	m := newModel(t, "")
+	said := pb.ChatEntry{Text: "ok", TS: 5, Sender: "10.0.0.1:3137", Nick: "alice"}
+	m.AppendChat(said)
+	m.AppendChat(said)
+
+	// A snapshot that happens to carry one copy of it.
+	m.PrependChat([]pb.ChatEntry{said})
+
+	if got := len(m.ChatLog()); got != 2 {
+		t.Fatalf("chat = %d lines, want both copies kept: %v", got, m.ChatLog())
+	}
+}
+
+// And the snapshot may legitimately carry more copies than this node holds.
+func TestPrependChatTakesTheSurplusASnapshotCarries(t *testing.T) {
+	m := newModel(t, "")
+	said := pb.ChatEntry{Text: "ok", TS: 5, Sender: "10.0.0.2:3137", Nick: "bob"}
+	m.AppendChat(said)
+
+	m.PrependChat([]pb.ChatEntry{said, said, said})
+	if got := len(m.ChatLog()); got != 3 {
+		t.Fatalf("chat = %d lines, want 3: %v", got, m.ChatLog())
+	}
+	// Still idempotent: syncing again adds nothing.
+	m.PrependChat([]pb.ChatEntry{said, said, said})
+	if got := len(m.ChatLog()); got != 3 {
+		t.Fatalf("a repeated snapshot grew the log to %d lines", got)
+	}
+}

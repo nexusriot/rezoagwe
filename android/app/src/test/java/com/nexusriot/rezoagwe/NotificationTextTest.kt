@@ -2,14 +2,18 @@ package com.nexusriot.rezoagwe
 
 import com.nexusriot.rezoagwe.core.BootstrapStatus
 import com.nexusriot.rezoagwe.core.NodeStatus
+import com.nexusriot.rezoagwe.service.keepAliveFlow
 import com.nexusriot.rezoagwe.service.notificationText
 import com.nexusriot.rezoagwe.service.notificationTextFlow
+import com.nexusriot.rezoagwe.service.shouldKeepAlive
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
@@ -95,4 +99,60 @@ class NotificationTextTest {
             notificationText(node(peers = 1, uptime = 9_999), BootstrapStatus()),
         )
     }
+
+    /**
+     * The service must not stop itself out from under a sticky restart.
+     *
+     * START_STICKY brings the service back after the system reclaims the
+     * process, but the process comes back empty: the engine is freshly built
+     * and stopped. A watcher that looked only at "is anything running" saw
+     * nothing, called stopSelf, and the node the user started never returned.
+     * Observed on a tablet — activity closed, service restarted, and twelve
+     * seconds later Android logged "Stop FGS timeout" and froze the process.
+     */
+    @Test
+    fun aStickyRestartIsNotStoppedBeforeItCanRestoreAnything() {
+        assertTrue(
+            "nothing is running yet, but the user asked for a node",
+            shouldKeepAlive(nodeRunning = false, bootstrapRunning = false, anyWanted = true),
+        )
+    }
+
+    @Test
+    fun aServiceWithNothingRunningAndNothingWantedStops() {
+        assertFalse(shouldKeepAlive(nodeRunning = false, bootstrapRunning = false, anyWanted = false))
+    }
+
+    @Test
+    fun aRunningRoleKeepsTheServiceAliveEvenIfTheIntentWasCleared() {
+        assertTrue(shouldKeepAlive(nodeRunning = true, bootstrapRunning = false, anyWanted = false))
+        assertTrue(shouldKeepAlive(nodeRunning = false, bootstrapRunning = true, anyWanted = false))
+    }
+
+    /**
+     * And over the live flows: the service stays up while a role is wanted,
+     * and goes down on the tick after the user stops everything.
+     */
+    @Test
+    fun theKeepAliveFlowFollowsTheIntentAndTheStatus() = runBlocking {
+        val node = MutableStateFlow(NodeStatus())
+        val boot = MutableStateFlow(BootstrapStatus())
+        var wanted = true
+        val seen = mutableListOf<Boolean>()
+        val job = CoroutineScope(Dispatchers.Unconfined).launch {
+            keepAliveFlow(node, boot) { wanted }.collect { seen += it }
+        }
+
+        // Nothing running, but wanted: stay up.
+        assertEquals(listOf(true), seen)
+
+        // The role comes up, then the user stops it and the intent clears.
+        node.value = NodeStatus(running = true)
+        wanted = false
+        node.value = NodeStatus(running = false)
+
+        assertEquals("the service should have been told to stop exactly once", listOf(true, false), seen)
+        job.cancel()
+    }
+
 }

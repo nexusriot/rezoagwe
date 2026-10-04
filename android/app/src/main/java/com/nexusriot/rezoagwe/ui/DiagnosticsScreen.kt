@@ -68,6 +68,18 @@ private const val REFRESH_MS = 2_000L
  * several checks is the one worth chasing — one that clears is anti-entropy
  * doing its job.
  */
+/**
+ * One side of a difference, in the terms that decide what to do about it: a
+ * key missing on one side is a write that never arrived, two versions is a
+ * race anti-entropy will settle, and a tombstone against a value is a delete
+ * still travelling.
+ */
+private fun describeSide(version: String, deleted: Boolean): String = when {
+    version.isEmpty() -> "absent"
+    deleted -> "deleted $version"
+    else -> version
+}
+
 @Composable
 private fun ConsistencyCard(report: NodeEngine.ConsistencyReport) {
     Section(if (report.converged) "Replicas agree" else "Replicas disagree") {
@@ -80,10 +92,26 @@ private fun ConsistencyCard(report: NodeEngine.ConsistencyReport) {
             val detail = when {
                 !p.reachable -> "did not answer: ${p.error}"
                 p.agrees -> "agrees — ${p.keys} keys, clock ${p.clock}"
-                else -> "differs in ${p.differingBuckets.size} of $FINGERPRINT_BUCKETS key ranges " +
-                    "(${p.keys} keys, clock ${p.clock})"
+                // No names means the peer could not be asked for them — an
+                // older node, or a second round that failed. The ranges are
+                // all there is to say.
+                p.differences.isEmpty() ->
+                    "differs in ${p.differingBuckets.size} of $FINGERPRINT_BUCKETS key ranges " +
+                        "(${p.keys} keys, clock ${p.clock})"
+                else -> "disagrees — ${p.keys} keys, clock ${p.clock}"
             }
             Line(name, detail)
+            // A bucket index localises a disagreement to a sixteenth of the
+            // keyspace, which on a few hundred keys is still a list to read by
+            // hand. The check knows the key; this is where it says so.
+            p.differences.forEach { d ->
+                Line(
+                    "  ${d.key}",
+                    "here ${describeSide(d.local, d.localDeleted)}  ·  " +
+                        "there ${describeSide(d.remote, d.remoteDeleted)}",
+                )
+            }
+            if (p.moreDifferences > 0) Line("", "and ${p.moreDifferences} more")
         }
         if (report.unreachable > 0) {
             Line(

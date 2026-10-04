@@ -133,9 +133,11 @@ make help             # full list of targets
 `make e2e` builds the real binaries into an image and runs a cluster of
 containers on a private network — a rendezvous, three peers, a node that
 arrives after the store already has content, one that shuts down mid-run, one
-that restarts with its state file intact, and two strangers that share the
-network but differ in the key or the cluster name. A Go suite in a further
-container drives all of it through the HTTP gateway. Nothing is published to
+that restarts with its state file intact, one configured tighter than the rest
+so the cluster has something to disagree about, one alone in its own cluster
+with limits small enough to trip in a single request, and two strangers that
+share the network but differ in the key or the cluster name. A Go suite in a
+further container drives all of it through the HTTP gateway. Nothing is published to
 the host, no node persists anything outside its container, and the stack comes
 down whether the run passes or fails.
 

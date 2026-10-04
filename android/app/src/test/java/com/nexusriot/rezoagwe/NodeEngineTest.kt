@@ -7,6 +7,7 @@ import com.nexusriot.rezoagwe.core.NodeEngine
 import com.nexusriot.rezoagwe.core.NodeRole
 import com.nexusriot.rezoagwe.core.Severity
 import com.nexusriot.rezoagwe.core.healthChecks
+import com.nexusriot.rezoagwe.net.MAX_DATAGRAM_PAYLOAD
 import com.nexusriot.rezoagwe.proto.ChatKind
 import com.nexusriot.rezoagwe.proto.Version
 import java.io.IOException
@@ -21,6 +22,7 @@ import kotlinx.coroutines.cancel
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -101,6 +103,26 @@ class NodeEngineTest {
         throw AssertionError("timed out waiting for $what")
     }
 
+    /**
+     * Runs a consistency check until its single peer reports named
+     * differences.
+     *
+     * Naming the keys costs a second round trip over a real socket, and the
+     * check degrades to bucket indices when that fails rather than erroring —
+     * deliberately, so a peer too old to ask still produces a report. Retrying
+     * is what a person does, and it keeps the assertion about the diff rather
+     * than about whether one TCP exchange happened to land.
+     */
+    private fun namedDifferencesOf(node: NodeEngine): NodeEngine.PeerConsistency {
+        var found: NodeEngine.PeerConsistency? = null
+        waitFor("the check to name the diverging keys") {
+            found = node.checkConsistency().peers.singleOrNull()
+                ?.takeIf { !it.agrees && it.differences.isNotEmpty() }
+            found != null
+        }
+        return found!!
+    }
+
     private fun pair(): Pair<NodeEngine, NodeEngine> {
         val a = engine(freePort(), "alice")
         val b = engine(freePort(), "bob")
@@ -173,10 +195,18 @@ class NodeEngineTest {
         a.sendChat("only once")
         waitFor("the message to reach the peer") { b.chat.value.any { it.text == "only once" } }
 
-        val before = b.chat.value.size
+        // The size is measured after the first sync, not before it. The first
+        // one legitimately brings lines this node has not seen — a's own
+        // "joined" observations — and whether gossip has already delivered
+        // them is a race. Idempotency is a claim about the syncs after that,
+        // which is what this test is for.
+        b.requestStateFrom(a.addr)
+        waitFor("the first snapshot to be served") { a.metrics.stateSyncOut.get() >= 1 }
+        Thread.sleep(200)
+        val settled = b.chat.value.size
+
         repeat(3) { b.requestStateFrom(a.addr) }
-        // Give the snapshots time to arrive and be merged.
-        waitFor("the snapshots to be served") { a.metrics.stateSyncOut.get() >= 3 }
+        waitFor("the snapshots to be served") { a.metrics.stateSyncOut.get() >= 4 }
         Thread.sleep(200)
 
         assertEquals(
@@ -184,7 +214,7 @@ class NodeEngineTest {
             1,
             b.chat.value.count { it.text == "only once" },
         )
-        assertEquals("nothing else should have been duplicated", before, b.chat.value.size)
+        assertEquals("repeated snapshots added lines", settled, b.chat.value.size)
     }
 
     /** Chat merged out of a snapshot has to end up in time order, not remote-then-local. */
@@ -487,4 +517,228 @@ class NodeEngineTest {
         val checks = healthChecks(diagnostics, System.currentTimeMillis())
         assertTrue(checks.any { it.severity == Severity.ERROR && it.title.contains("authentication") })
     }
+
+    /**
+     * A value too big for one datagram still has to reach the peer.
+     *
+     * Found on a live LAN cluster of a Go node, the desktop client and this
+     * app: a 200 KB write was accepted, reported success, and then never
+     * replicated. Every gossip tick retried the same oversized datagram, the
+     * kernel refused it with EMSGSIZE, and the node counted a send error — so
+     * the one mechanism meant to repair divergence was the mechanism
+     * generating it, and the cluster stayed split for as long as the key
+     * existed with nothing but a counter to say so.
+     *
+     * Over real loopback sockets, so the ceiling under test is the kernel's.
+     */
+    @Test
+    fun anOversizedValueReplicatesOverAStream() {
+        val (a, b) = pair()
+        val big = "x".repeat(MAX_DATAGRAM_PAYLOAD + 1)
+
+        a.set("big", big)
+
+        waitFor("the oversized value to reach the peer") { b.store["big"] == big }
+        assertEquals("the stream fallback still counted a send error", 0, a.metrics.sendErrors.get())
+    }
+
+    /**
+     * The same value must converge through anti-entropy, not only through the
+     * write path: a peer that missed the write is repaired by the digest
+     * round, which ships entries the same way.
+     */
+    @Test
+    fun antiEntropyRepairsAnOversizedValue() {
+        val a = engine(freePort(), "alice")
+        a.start()
+        val big = "y".repeat(MAX_DATAGRAM_PAYLOAD + 1)
+        a.set("big", big)
+
+        // b only learns of a afterwards, so it never saw the write go out.
+        val b = engine(freePort(), "bob")
+        b.start()
+        a.addPeer(b.addr)
+        b.addPeer(a.addr)
+
+        a.antiEntropyRound(b.addr)
+        waitFor("anti-entropy to repair the oversized value") { b.store["big"] == big }
+    }
+
+    /**
+     * With nothing listening there is nowhere to put it, and the node must say
+     * so rather than report the write as sent.
+     */
+    @Test
+    fun anOversizedValueWithNoReachablePeerIsASendError() {
+        val a = engine(freePort(), "alice")
+        a.start()
+        a.addPeer("127.0.0.1:${freePort()}") // nothing bound: both paths fail
+
+        a.set("big", "z".repeat(MAX_DATAGRAM_PAYLOAD + 1))
+        waitFor("the failed send to be counted") { a.metrics.sendErrors.get() > 0 }
+    }
+
+
+    /**
+     * "They differ somewhere in bucket 7" is where a report used to stop,
+     * which on a store of a few hundred keys is a sixteenth of the keyspace to
+     * read by hand. The check knows which key it is; it just never said.
+     *
+     * Over real loopback sockets, so this exercises the second round trip the
+     * naming needs, not a second copy of the diffing rules.
+     */
+    @Test
+    fun aConsistencyReportNamesTheDivergingKey() {
+        val a = engine(freePort(), "alice")
+        a.start()
+        for (k in listOf("alpha", "beta", "gamma", "delta")) a.set(k, "shared")
+
+        // b is built from a's updates directly, then given one of its own, so
+        // the two stores differ on exactly one name without needing a
+        // partition between two real sockets.
+        val b = engine(freePort(), "bob")
+        b.start()
+        a.store.updates().forEach { b.store.apply(it) }
+        b.set("beta", "only-on-b")
+
+        a.addPeer(b.addr)
+        b.addPeer(a.addr)
+
+        val peer = namedDifferencesOf(a)
+        assertEquals("named ${peer.differences}", 1, peer.differences.size)
+        assertEquals("beta", peer.differences[0].key)
+        assertTrue(
+            "both sides hold the key, so both versions should be named",
+            peer.differences[0].local.isNotEmpty() && peer.differences[0].remote.isNotEmpty(),
+        )
+        assertNotEquals(peer.differences[0].local, peer.differences[0].remote)
+    }
+
+    /**
+     * A key one replica has never seen is the divergence that matters most — a
+     * write that never arrived — and it cannot be found by walking the local
+     * store, which is the direction a naive diff takes.
+     */
+    @Test
+    fun aReportNamesAKeyThisNodeHasNeverSeen() {
+        val a = engine(freePort(), "alice")
+        val b = engine(freePort(), "bob")
+        a.start()
+        b.start()
+        b.set("orphan", "never-arrived")
+        a.addPeer(b.addr)
+        b.addPeer(a.addr)
+
+        val found = namedDifferencesOf(a).differences.find { it.key == "orphan" }
+        assertNotNull("a key only the peer holds was not named", found)
+        assertEquals("this node never saw the key, so its version must be empty", "", found!!.local)
+        assertTrue("the peer's version should be named", found.remote.isNotEmpty())
+    }
+
+    /**
+     * A key deleted on one side and live on the other is a divergence the
+     * version alone does not explain, so the report has to say which side
+     * holds a tombstone.
+     */
+    @Test
+    fun aReportSaysWhichSideHoldsATombstone() {
+        val a = engine(freePort(), "alice")
+        val b = engine(freePort(), "bob")
+        a.start()
+        b.start()
+        a.set("doomed", "v")
+        a.store.updates().forEach { b.store.apply(it) }
+        b.delete("doomed")
+
+        a.addPeer(b.addr)
+        b.addPeer(a.addr)
+
+        val d = namedDifferencesOf(a).differences.single()
+        assertEquals("doomed", d.key)
+        assertFalse("this node holds the value, not a tombstone", d.localDeleted)
+        assertTrue("the peer holds a tombstone and the report does not say so", d.remoteDeleted)
+    }
+
+    /** Agreement still reports nothing to look at. */
+    @Test
+    fun aConvergedReportNamesNothing() {
+        val a = engine(freePort(), "alice")
+        val b = engine(freePort(), "bob")
+        a.start()
+        b.start()
+        a.set("k", "v")
+        a.store.updates().forEach { b.store.apply(it) }
+        a.addPeer(b.addr)
+        b.addPeer(a.addr)
+
+        val report = a.checkConsistency()
+        assertTrue("a converged cluster reported as divergent", report.converged)
+        assertTrue("an agreeing peer was given differences", report.peers.single().differences.isEmpty())
+    }
+
+
+    /**
+     * Saying the same thing twice is not a duplicate to be cleaned up.
+     *
+     * The merge deduplicated on the entry itself, and nothing in a chat entry
+     * distinguishes two identical lines — same text, same sender, same second.
+     * So "ok" said twice collapsed to one on the next state sync, which is
+     * routine: one per peer a joiner syncs from. The line vanished from the
+     * screen and from the persisted log, and nothing said why.
+     *
+     * It surfaced as an intermittent failure in
+     * [repeatedStateSyncDoesNotDuplicateChatHistory], where two identical join
+     * lines landed in the same second.
+     */
+    @Test
+    fun aLineGenuinelySaidTwiceSurvivesAStateSync() {
+        val (a, b) = pair()
+        b.sendChat("ok")
+        b.sendChat("ok") // same text, same sender, same second
+        waitFor("both lines to be logged") { b.chat.value.count { it.text == "ok" } == 2 }
+
+        b.requestStateFrom(a.addr)
+        waitFor("the snapshot to be served") { a.metrics.stateSyncOut.get() >= 1 }
+        Thread.sleep(200)
+
+        assertEquals(
+            "a state sync deleted one of two lines that were genuinely said",
+            2,
+            b.chat.value.count { it.text == "ok" },
+        )
+    }
+
+    /**
+     * And a snapshot may legitimately carry more copies than this node holds.
+     *
+     * Pulled over the stream rather than waited for over the broadcast: two
+     * datagrams both arriving is not something a test can rely on, and this is
+     * about the merge, not the transport.
+     */
+    @Test
+    fun aJoinerReceivesEveryCopyOfALineSaidTwice() {
+        val a = engine(freePort(), "alice")
+        a.start()
+        a.sendChat("ok")
+        a.sendChat("ok")
+        waitFor("the writer to hold both") { a.chat.value.count { it.text == "ok" } == 2 }
+
+        val joiner = engine(freePort(), "carol")
+        joiner.start()
+        joiner.addPeer(a.addr)
+        joiner.requestStateFrom(a.addr)
+        waitFor("the joiner to receive both copies") {
+            joiner.chat.value.count { it.text == "ok" } == 2
+        }
+
+        // Syncing again must not grow it further.
+        joiner.requestStateFrom(a.addr)
+        Thread.sleep(200)
+        assertEquals(
+            "a repeated snapshot duplicated the conversation",
+            2,
+            joiner.chat.value.count { it.text == "ok" },
+        )
+    }
+
 }

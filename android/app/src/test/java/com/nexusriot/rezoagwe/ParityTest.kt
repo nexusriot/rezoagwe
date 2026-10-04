@@ -4,7 +4,10 @@ import com.nexusriot.rezoagwe.core.KvStore
 import com.nexusriot.rezoagwe.core.Limits
 import com.nexusriot.rezoagwe.core.NodeConfig
 import com.nexusriot.rezoagwe.core.NodeEngine
+import com.nexusriot.rezoagwe.core.Refusal
+import com.nexusriot.rezoagwe.core.WriteOptions
 import com.nexusriot.rezoagwe.proto.FINGERPRINT_BUCKETS
+import com.nexusriot.rezoagwe.proto.MAX_REPLICABLE_VALUE_BYTES
 import com.nexusriot.rezoagwe.proto.KVAction
 import com.nexusriot.rezoagwe.proto.KVUpdate
 import com.nexusriot.rezoagwe.proto.Version
@@ -247,4 +250,67 @@ class ParityTest {
         assertFalse(report.peers[0].reachable)
         assertTrue(report.peers[0].error.isNotEmpty())
     }
+
+    /**
+     * A value no peer could ever receive is refused where it is written, not
+     * stored and reported as written.
+     *
+     * Found by end-to-end testing the Go node: the datagram path refuses it on
+     * size, the stream path refuses the frame, and a state sync builds that
+     * same frame — so it was accepted locally and sat on one replica forever
+     * with nothing able to repair it. Unlike maxValueBytes this is not
+     * configurable, because it is not a policy: no setting makes such a value
+     * replicate.
+     */
+    @Test
+    fun aValueTooLargeToReplicateIsRefusedWithNoLimitConfigured() {
+        val kv = KvStore("n1")
+        val atTheLine = "x".repeat(MAX_REPLICABLE_VALUE_BYTES)
+        assertNull("a value exactly at the ceiling was refused", kv.admit("fits", atTheLine))
+        assertEquals(Refusal.UNSHIPPABLE, kv.admit("over", atTheLine + "x"))
+        assertNull("a refused value was written anyway", kv.write("over", atTheLine + "x", WriteOptions()))
+    }
+
+    /**
+     * The ceiling is measured as the value will be written, not as it sits in
+     * memory: one character of CJK is three bytes on the wire, so a string a
+     * third of the ceiling is already at it and a raw length check would wave
+     * it through to strand itself.
+     */
+    @Test
+    fun theReplicationCeilingCountsEncodedBytesNotCharacters() {
+        val kv = KvStore("n1")
+        val wide = "\u65e5".repeat(MAX_REPLICABLE_VALUE_BYTES / 2)
+        assertTrue("the test value is not under the ceiling by character count",
+            wide.length < MAX_REPLICABLE_VALUE_BYTES)
+        assertEquals(
+            "a string that triples on the wire slipped past the ceiling",
+            Refusal.UNSHIPPABLE,
+            kv.admit("blob", wide),
+        )
+    }
+
+    /**
+     * Why a write was refused has to be answerable: "null" reads the same for
+     * a lost race and a value that will never fit, and the caller owes the
+     * user different answers.
+     */
+    @Test
+    fun aRefusedWriteSaysWhichRuleRefusedIt() {
+        val kv = KvStore("n1")
+        kv.setLimits(Limits(maxValueBytes = 4, maxKeys = 1))
+        assertEquals(Refusal.TOO_LARGE, kv.admit("a", "toolong"))
+        assertNull(kv.admit("a", "ok"))
+        kv.write("a", "ok", WriteOptions())
+        assertEquals(Refusal.TOO_MANY_KEYS, kv.admit("b", "ok"))
+    }
+
+    /** Every refusal has something to say; a blank one is a dialog with no message. */
+    @Test
+    fun everyRefusalExplainsItself() {
+        for (r in Refusal.entries) {
+            assertTrue("$r has no explanation", r.explain().isNotBlank())
+        }
+    }
+
 }

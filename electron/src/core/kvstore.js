@@ -4,7 +4,28 @@ const { createHash } = require('crypto');
 
 const {
   KVAction, version, versionNewer, versionEqual, versionZero, FINGERPRINT_BUCKETS,
+  MAX_REPLICABLE_VALUE_BYTES, escapedLen,
 } = require('../proto/wire');
+
+/**
+ * Why a write was refused. A bare null says only that it did not land, which
+ * reads the same for a lost compare-and-swap and a value no peer could ever
+ * receive — and those need opposite answers.
+ */
+const REFUSAL = Object.freeze({
+  UNSHIPPABLE: 'unshippable',
+  TOO_LARGE: 'too-large',
+  TOO_MANY_KEYS: 'too-many-keys',
+  VERSION_MISMATCH: 'version-mismatch',
+});
+
+/**
+ * Which bucket a key name folds into. The one definition, so a digest and a
+ * listing can never disagree about where a key lives.
+ */
+function bucketOf(key, buckets) {
+  return createHash('sha256').update(key, 'utf8').digest().readUInt32BE(0) % buckets;
+}
 
 /** How many versions of a key are remembered. History is a debugging aid: neither persisted nor synced. */
 const HISTORY_PER_KEY = 20;
@@ -71,16 +92,60 @@ class KvStore {
     this.limits = { maxValueBytes: 0, maxKeys: 0, ...(limits || {}) };
   }
 
-  /** Whether a value of this size may be stored under this key. */
-  admits(key, value, nowSec) {
+  /**
+   * Why a value may not be stored under this key, or null when it may.
+   *
+   * The reason matters: "refused" reads the same for a lost race and a value
+   * that will never fit, and the caller owes the user different answers — and
+   * for a while owed them none at all, since a refusal came back as success.
+   */
+  admit(key, value, nowSec = this.nowSec()) {
+    // Measured as the value will be written on the wire, not as it sits in
+    // memory: an unpaired surrogate is escaped to six characters, and a raw
+    // length check would wave it through to strand itself.
+    //
+    // The cheap test first, because the exact one walks the value and almost
+    // every value is nowhere near: nothing shorter than a sixth of the ceiling
+    // can exceed it however badly it escapes. escapedLen counts the quotes,
+    // which the reserve covers, so they come back off here.
+    if (value.length > MAX_REPLICABLE_VALUE_BYTES / 6
+      && escapedLen(value) - 2 > MAX_REPLICABLE_VALUE_BYTES) {
+      return REFUSAL.UNSHIPPABLE;
+    }
     const { maxValueBytes, maxKeys } = this.limits;
-    if (maxValueBytes > 0 && Buffer.byteLength(value, 'utf8') > maxValueBytes) return false;
-    if (maxKeys <= 0) return true;
+    if (maxValueBytes > 0 && Buffer.byteLength(value, 'utf8') > maxValueBytes) return REFUSAL.TOO_LARGE;
+    if (maxKeys <= 0) return null;
     const existing = this.store.get(key);
-    if (existing && KvStore.visible(existing, nowSec)) return true; // an update never grows the keyspace
+    if (existing && KvStore.visible(existing, nowSec)) return null; // an update never grows the keyspace
     let live = 0;
     for (const e of this.store.values()) if (KvStore.visible(e, nowSec)) live++;
-    return live < maxKeys;
+    return live < maxKeys ? null : REFUSAL.TOO_MANY_KEYS;
+  }
+
+  /** Whether a value of this size may be stored under this key. */
+  admits(key, value, nowSec) {
+    return this.admit(key, value, nowSec) === null;
+  }
+
+  /**
+   * The (key, version) pairs held in the named buckets, sorted by key,
+   * tombstones included.
+   *
+   * This is the second half of a consistency check: the digests say which
+   * sixteenth of the keyspace two replicas disagree about, and this says which
+   * keys. Bounded by the buckets asked for, so naming the divergence costs a
+   * slice of the store rather than all of it.
+   */
+  bucketEntries(buckets = FINGERPRINT_BUCKETS, want = []) {
+    if (!want.length) return [];
+    const wanted = new Set(want);
+    const out = [];
+    for (const [k, e] of this.store) {
+      if (!wanted.has(bucketOf(k, buckets))) continue;
+      out.push({ key: k, version: e.version, deleted: e.deleted });
+    }
+    out.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+    return out;
   }
 
   static expired(e, nowSec) {
@@ -305,8 +370,7 @@ class KvStore {
       if (e.deleted) tombstones++;
       else if (KvStore.visible(e, now)) keys++;
 
-      const nameHash = createHash('sha256').update(k, 'utf8').digest();
-      const idx = nameHash.readUInt32BE(0) % n;
+      const idx = bucketOf(k, n);
 
       const sum = createHash('sha256')
         .update(k, 'utf8')
@@ -413,4 +477,4 @@ class KvStore {
   }
 }
 
-module.exports = { KvStore, HISTORY_PER_KEY };
+module.exports = { KvStore, HISTORY_PER_KEY, REFUSAL, bucketOf };

@@ -6,6 +6,7 @@ package httpapi
 import (
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -15,12 +16,34 @@ import (
 	"time"
 
 	"github.com/nexusriot/rezoagwe/pkg/discovery/diagnostics"
+	"github.com/nexusriot/rezoagwe/pkg/discovery/model"
 	"github.com/nexusriot/rezoagwe/pkg/discovery/node"
 	pb "github.com/nexusriot/rezoagwe/pkg/proto"
 )
 
 // maxBody caps a request body: a PUT value or an import file.
 const maxBody = 32 << 20
+
+// readBody reads a request body, refusing one past maxBody rather than
+// truncating it.
+//
+// io.LimitReader stops at the limit and reports no error, so a PUT one byte
+// over used to store the first maxBody bytes and answer 204: the client is
+// told its value was written, and what the cluster replicates is a prefix of
+// it. A body that does not fit has to be refused, not silently shortened.
+func readBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBody))
+	if err != nil {
+		var tooBig *http.MaxBytesError
+		if errors.As(err, &tooBig) {
+			writeErr(w, http.StatusRequestEntityTooLarge, "body exceeds %d bytes", maxBody)
+			return nil, false
+		}
+		writeErr(w, http.StatusBadRequest, "read body: %s", err)
+		return nil, false
+	}
+	return body, true
+}
 
 // Config describes the gateway.
 //
@@ -312,9 +335,8 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxBody))
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, "read body: %s", err)
+	body, ok := readBody(w, r)
+	if !ok {
 		return
 	}
 	var ttl time.Duration
@@ -335,18 +357,47 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusBadRequest, "%s", err)
 			return
 		}
-		u, ok := s.node.CompareAndSet(key, string(body), ttl, expect)
-		if !ok {
-			writeErr(w, http.StatusPreconditionFailed, "version mismatch for %s", key)
+		u, err := s.node.CompareAndSet(key, string(body), ttl, expect)
+		if err != nil {
+			writeRefusal(w, key, err)
 			return
 		}
 		w.Header().Set("ETag", `"`+formatVersion(u.Version)+`"`)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	u := s.node.Set(key, string(body), ttl)
+	u, err := s.node.Set(key, string(body), ttl)
+	if err != nil {
+		writeRefusal(w, key, err)
+		return
+	}
 	w.Header().Set("ETag", `"`+formatVersion(u.Version)+`"`)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// writeRefusal turns the reason a write did not land into a status a client
+// can act on.
+//
+// All of these used to be a 204 with an ETag of the zero version: Set's result
+// was discarded, so a value over the size limit, or a key past the key limit,
+// was dropped and reported as written. A client has no way to notice that, and
+// the three cases need different answers — retry with less, free some keys, or
+// re-read and try again.
+func writeRefusal(w http.ResponseWriter, key string, err error) {
+	switch {
+	case errors.Is(err, model.ErrVersionMismatch):
+		writeErr(w, http.StatusPreconditionFailed, "version mismatch for %s", key)
+	case errors.Is(err, model.ErrUnshippable):
+		writeErr(w, http.StatusRequestEntityTooLarge,
+			"value for %s is too large to replicate: at most %d bytes once encoded",
+			key, pb.MaxReplicableValueBytes)
+	case errors.Is(err, model.ErrTooLarge):
+		writeErr(w, http.StatusRequestEntityTooLarge, "value for %s exceeds this node's size limit", key)
+	case errors.Is(err, model.ErrTooManyKeys):
+		writeErr(w, http.StatusInsufficientStorage, "store is at its key limit; %s was not written", key)
+	default:
+		writeErr(w, http.StatusInternalServerError, "write %s: %s", key, err)
+	}
 }
 
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
@@ -357,8 +408,8 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusBadRequest, "%s", err)
 			return
 		}
-		if _, ok := s.node.CompareAndDelete(key, expect); !ok {
-			writeErr(w, http.StatusPreconditionFailed, "version mismatch for %s", key)
+		if _, err := s.node.CompareAndDelete(key, expect); err != nil {
+			writeRefusal(w, key, err)
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -397,9 +448,8 @@ func (s *Server) handleChatGet(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleChatPost(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxBody))
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, "read body: %s", err)
+	body, ok := readBody(w, r)
+	if !ok {
 		return
 	}
 	text := strings.TrimSpace(string(body))
@@ -425,9 +475,8 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
-	data, err := io.ReadAll(io.LimitReader(r.Body, maxBody))
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, "read body: %s", err)
+	data, ok := readBody(w, r)
+	if !ok {
 		return
 	}
 	// mode=seed re-stamps every entry as a local write so it outranks whatever

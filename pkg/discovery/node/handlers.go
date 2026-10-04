@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"net"
-	"time"
 
 	log "github.com/sirupsen/logrus"
 
@@ -367,9 +366,8 @@ func (n *Node) streamLoop() {
 
 func (n *Node) serveStream(conn net.Conn) {
 	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(streamTimeout))
 
-	frame, err := transport.ReadFrame(conn)
+	frame, err := transport.ReadFrameFrom(conn, streamTimeout)
 	if err != nil {
 		n.Metrics.StreamErrors.Add(1)
 		log.Debugf("read stream frame: %s", err)
@@ -396,7 +394,8 @@ func (n *Node) serveStream(conn net.Conn) {
 			log.Errorf("encode state response: %s", err)
 			return
 		}
-		if err := transport.WriteFrame(conn, resp); err != nil {
+		// A whole store can be tens of megabytes; the deadline follows it.
+		if err := transport.WriteFrameTo(conn, streamTimeout, resp); err != nil {
 			n.Metrics.StreamErrors.Add(1)
 			log.Debugf("write state response: %s", err)
 			return
@@ -408,12 +407,14 @@ func (n *Node) serveStream(conn net.Conn) {
 			return
 		}
 		n.Model.TouchPeer(req.From)
-		resp, err := n.codec.Encode(pb.KindFingerprintReply, n.fingerprintReply())
+		// A stream has no datagram ceiling, so this is where a request that
+		// named buckets gets the keys in them answered.
+		resp, err := n.codec.Encode(pb.KindFingerprintReply, n.fingerprintReply(req.Buckets...))
 		if err != nil {
 			log.Errorf("encode fingerprint: %s", err)
 			return
 		}
-		if err := transport.WriteFrame(conn, resp); err != nil {
+		if err := transport.WriteFrameTo(conn, streamTimeout, resp); err != nil {
 			n.Metrics.StreamErrors.Add(1)
 			log.Debugf("write fingerprint: %s", err)
 			return

@@ -53,16 +53,35 @@ function healthChecks(d, nowMs) {
 
   if (m.sendErrors > 0) {
     const last = m.lastSendError;
-    add(Severity.WARN, `${m.sendErrors} send error(s)`,
-      'Datagrams could not leave this machine — usually a peer address that no longer routes, or a '
-      + 'network interface dropping while the node stays up.'
-      + (last ? ` Last: ${last.cause} to ${last.addr}${last.message ? ` (${last.message})` : ''}.` : ''));
+    // The last failure decides what this says. An oversized frame and an
+    // unroutable peer both arrive here as "send error", and the advice is
+    // opposite: one is a payload this node built too big to send, the other
+    // is the network. Blaming the route for the first sends the reader to
+    // check an address that is perfectly fine.
+    let detail = 'Datagrams could not leave this machine — usually a peer address that no longer '
+      + 'routes, or a network interface dropping while the node stays up.';
+    if (last && last.oversize) {
+      detail = 'A frame too large for one datagram could not be sent. Nothing is wrong with the '
+        + 'route: an entry this big travels over a stream instead, and that did not work.'
+        + (d.streamListener
+          ? " The peer's stream port is the thing to look at: a firewall that passes UDP and "
+            + 'blocks TCP looks exactly like this.'
+          : ' This node has no stream listener, which is why — see the check below.')
+        + ' Until it does, that entry cannot reach that peer by any path, and the replicas stay '
+        + 'divergent however long anti-entropy runs.';
+    }
+    if (last) detail += ` Last: ${last.cause} to ${last.addr}${last.message ? ` (${last.message})` : ''}.`;
+    add(Severity.WARN, `${m.sendErrors} send error(s)`, detail);
   }
 
   if (d.running && !d.streamListener) {
     add(Severity.WARN, `No stream listener on port ${d.configuredPort}`,
       'Another process holds the TCP port, so large state syncs fall back to datagrams and a big keyspace '
-      + 'may take several gossip rounds to converge.');
+      + 'may take several gossip rounds to converge.'
+      + (m.lastSendError && m.lastSendError.oversize
+        ? ' It is also why the oversized frame above had nowhere to go: the stream is the only path '
+          + 'for an entry that does not fit a datagram.'
+        : ''));
   }
 
   // A node seconds old has not failed to do anything yet: a peer answers on its

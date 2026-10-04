@@ -157,6 +157,12 @@ func (t *MemTransport) StreamsAvailable() bool { return true }
 func (t *MemTransport) Streams() <-chan net.Conn { return t.streams }
 
 func (t *MemTransport) Send(addr string, data []byte) error {
+	// The in-memory network has no MTU of its own, but it exists to stand in
+	// for the real one: without this the size fallback is only ever exercised
+	// against a live socket.
+	if len(data) > MaxDatagramPayload {
+		return ErrPacketTooLarge
+	}
 	t.mu.RLock()
 	closed := t.closed
 	t.mu.RUnlock()
@@ -210,7 +216,7 @@ func (t *MemTransport) accept(conn net.Conn) bool {
 	select {
 	case t.streams <- conn:
 		return true
-	case <-time.After(dialTimeout):
+	case <-time.After(DialTimeout):
 		return false
 	}
 }

@@ -28,13 +28,25 @@ var (
 	restart = node{"node-restart", env("E2E_NODE_RESTART", "http://node-restart:8080")}
 	wrongPS = node{"stranger-key", env("E2E_STRANGER_KEY", "http://stranger-key:8080")}
 	wrongCl = node{"stranger-cluster", env("E2E_STRANGER_CLUSTER", "http://stranger-cluster:8080")}
+	// A full member, configured tighter than the rest. It takes everything the
+	// suite writes until one test deliberately exceeds its value limit, which
+	// is the only way to make a healthy cluster disagree on purpose.
+	limited = node{"node-limited", env("E2E_NODE_LIMITED", "http://node-limited:8080")}
+	// Alone in its own cluster, with limits small enough to trip in one
+	// request. Refusing a write is a gateway and store property, not a cluster
+	// one, so it is tested where it cannot disturb anything.
+	solo = node{"node-solo", env("E2E_NODE_SOLO", "http://node-solo:8080")}
 
 	// The whole cluster as the suite expects it to settle, leaver excluded: it
 	// is gone by the end and the tests that care name it explicitly.
-	cluster = []node{a, b, c, late, restart}
+	cluster = []node{a, b, c, late, restart, limited}
 	// The three that are up from the first second, which is what most
 	// convergence assertions are about.
 	core = []node{a, b, c}
+	// Every node that exists from the first second. What a test can assert on
+	// before the timed containers arrive — and waiting for those early moves
+	// the window the restart has to be caught in.
+	earlyCluster = []node{a, b, c, limited}
 )
 
 func env(key, fallback string) string {
@@ -120,13 +132,27 @@ type diagnostics struct {
 	Checks []diagCheck `json:"checks"`
 }
 
+// keyDifference is one key two replicas do not hold the same way. Either
+// version may be empty, and that is the interesting case: present here and
+// absent there is a write that never arrived.
+type keyDifference struct {
+	Key           string `json:"key"`
+	Local         string `json:"local,omitempty"`
+	Remote        string `json:"remote,omitempty"`
+	LocalDeleted  bool   `json:"local_deleted,omitempty"`
+	RemoteDeleted bool   `json:"remote_deleted,omitempty"`
+}
+
 type peerConsistency struct {
-	Addr             string `json:"addr"`
-	Reachable        bool   `json:"reachable"`
-	Error            string `json:"error,omitempty"`
-	Keys             int    `json:"keys"`
-	Agrees           bool   `json:"agrees"`
-	DifferingBuckets []int  `json:"differing_buckets,omitempty"`
+	Addr             string          `json:"addr"`
+	Nick             string          `json:"nick,omitempty"`
+	Reachable        bool            `json:"reachable"`
+	Error            string          `json:"error,omitempty"`
+	Keys             int             `json:"keys"`
+	Agrees           bool            `json:"agrees"`
+	DifferingBuckets []int           `json:"differing_buckets,omitempty"`
+	Differences      []keyDifference `json:"differences,omitempty"`
+	MoreDifferences  int             `json:"more_differences,omitempty"`
 }
 
 type consistency struct {
@@ -318,6 +344,14 @@ func (n node) putIfMatch(t *testing.T, key, value, expect string) (int, string) 
 	hdrs := map[string]string{"If-Match": `"` + expect + `"`}
 	code, hdr, _ := n.do(t, http.MethodPut, "/kv/"+key, value, hdrs)
 	return code, strings.Trim(hdr.Get("ETag"), `"`)
+}
+
+// putStatus writes and hands back the status, for the cases where the refusal
+// is the point. put itself fails the test on anything but 204.
+func (n node) putStatus(t *testing.T, key, value string) (int, string) {
+	t.Helper()
+	code, _, body := n.do(t, http.MethodPut, "/kv/"+key, value, nil)
+	return code, body
 }
 
 func (n node) del(t *testing.T, key string) {

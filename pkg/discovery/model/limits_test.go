@@ -1,6 +1,7 @@
 package model
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,11 +15,11 @@ func TestLimitRefusesAnOversizeLocalWrite(t *testing.T) {
 	kv := NewKVStore("n1")
 	kv.SetLimits(Limits{MaxValueBytes: 8})
 
-	if _, ok := kv.Write("k", "12345678", WriteOptions{}); !ok {
-		t.Fatal("a value exactly at the limit was refused")
+	if _, err := kv.Write("k", "12345678", WriteOptions{}); err != nil {
+		t.Fatalf("a value exactly at the limit was refused: %v", err)
 	}
-	if _, ok := kv.Write("k", "123456789", WriteOptions{}); ok {
-		t.Fatal("a value over the limit was accepted")
+	if _, err := kv.Write("k", "123456789", WriteOptions{}); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("a value over the limit returned %v, want ErrTooLarge", err)
 	}
 	if v, _ := kv.Get("k"); v != "12345678" {
 		t.Fatalf("refused write still landed: %q", v)
@@ -56,11 +57,11 @@ func TestKeyLimitAllowsUpdatesToKeysAlreadyHeld(t *testing.T) {
 
 	kv.Set("a", "1")
 	kv.Set("b", "1")
-	if _, ok := kv.Write("c", "1", WriteOptions{}); ok {
-		t.Fatal("a third key was accepted past MaxKeys=2")
+	if _, err := kv.Write("c", "1", WriteOptions{}); !errors.Is(err, ErrTooManyKeys) {
+		t.Fatalf("a third key past MaxKeys=2 returned %v, want ErrTooManyKeys", err)
 	}
-	if _, ok := kv.Write("a", "2", WriteOptions{}); !ok {
-		t.Fatal("an update to a key already held was refused")
+	if _, err := kv.Write("a", "2", WriteOptions{}); err != nil {
+		t.Fatalf("an update to a key already held was refused: %v", err)
 	}
 	if v, _ := kv.Get("a"); v != "2" {
 		t.Fatalf("a = %q, want the updated value", v)
@@ -74,12 +75,12 @@ func TestKeyLimitCountsLiveKeysOnly(t *testing.T) {
 	kv.SetLimits(Limits{MaxKeys: 1})
 
 	kv.Set("a", "1")
-	if _, ok := kv.Write("b", "1", WriteOptions{}); ok {
+	if _, err := kv.Write("b", "1", WriteOptions{}); err == nil {
 		t.Fatal("second key accepted at MaxKeys=1")
 	}
 	kv.Delete("a")
-	if _, ok := kv.Write("b", "1", WriteOptions{}); !ok {
-		t.Fatal("a key was refused after the only live key was deleted")
+	if _, err := kv.Write("b", "1", WriteOptions{}); err != nil {
+		t.Fatalf("a key was refused after the only live key was deleted: %v", err)
 	}
 }
 
@@ -252,5 +253,82 @@ func TestFingerprintMatchesThePublishedVectors(t *testing.T) {
 		if got != expect {
 			t.Errorf("bucket %d = %s, want %s", i, got, expect)
 		}
+	}
+}
+
+// A value no peer could ever receive is refused where it is written, not
+// stored and reported as written.
+//
+// Found by end-to-end testing: the datagram path refuses it on size, the
+// stream path refuses the frame, and a state sync builds that same frame — so
+// it was accepted locally and sat on one replica forever with nothing able to
+// repair it. Unlike MaxValueBytes this is not configurable, because it is not
+// a policy: no setting makes such a value replicate.
+func TestAValueTooLargeToReplicateIsRefusedWithoutAnyLimitSet(t *testing.T) {
+	kv := NewKVStore("n1")
+
+	ok := strings.Repeat("x", pb.MaxReplicableValueBytes)
+	if _, err := kv.Write("fits", ok, WriteOptions{}); err != nil {
+		t.Fatalf("a value exactly at the ceiling was refused: %v", err)
+	}
+	if _, err := kv.Write("over", ok+"x", WriteOptions{}); !errors.Is(err, ErrUnshippable) {
+		t.Fatalf("a value over the ceiling returned %v, want ErrUnshippable", err)
+	}
+	if _, present := kv.Get("over"); present {
+		t.Fatal("a refused value was stored anyway")
+	}
+}
+
+// The ceiling is measured as the value will be written, not as it sits in
+// memory. Bytes that are not valid UTF-8 become U+FFFD — six bytes each — so a
+// blob a sixth of the ceiling is already at it, and a raw length check would
+// wave it through to strand itself.
+func TestTheReplicationCeilingCountsEscapedBytes(t *testing.T) {
+	kv := NewKVStore("n1")
+
+	// Comfortably under the ceiling by raw length, far over it once encoded.
+	binary := strings.Repeat("\xff", pb.MaxReplicableValueBytes/4)
+	if len(binary) >= pb.MaxReplicableValueBytes {
+		t.Fatal("the test value is not under the ceiling by raw length")
+	}
+	if _, err := kv.Write("blob", binary, WriteOptions{}); !errors.Is(err, ErrUnshippable) {
+		t.Fatalf("a blob that sextuples on the wire returned %v, want ErrUnshippable", err)
+	}
+}
+
+// A peer cannot push past the ceiling either — though in practice it could
+// never have sent one, since the same limit stops it leaving.
+func TestAnUnshippableRemoteApplyIsRefused(t *testing.T) {
+	kv := NewKVStore("n1")
+	u := pb.KVUpdate{
+		Action:  pb.KVSet,
+		Key:     "k",
+		Value:   strings.Repeat("x", pb.MaxReplicableValueBytes+1),
+		Version: pb.Version{Counter: 9, Node: "peer"},
+	}
+	if kv.Apply(u) {
+		t.Fatal("an unshippable remote update was applied")
+	}
+}
+
+// Why a write was refused has to be answerable: "false" reads the same for a
+// lost race and a value that will never fit, and the caller owes the user
+// different answers.
+func TestARefusedWriteSaysWhichRuleRefusedIt(t *testing.T) {
+	kv := NewKVStore("n1")
+	kv.SetLimits(Limits{MaxValueBytes: 4, MaxKeys: 1})
+
+	if _, err := kv.Write("a", "toolong", WriteOptions{}); !errors.Is(err, ErrTooLarge) {
+		t.Errorf("over the size limit: %v, want ErrTooLarge", err)
+	}
+	if _, err := kv.Write("a", "ok", WriteOptions{}); err != nil {
+		t.Fatalf("a fine write was refused: %v", err)
+	}
+	if _, err := kv.Write("b", "ok", WriteOptions{}); !errors.Is(err, ErrTooManyKeys) {
+		t.Errorf("past the key limit: %v, want ErrTooManyKeys", err)
+	}
+	stale := pb.Version{Counter: 99, Node: "nobody"}
+	if _, err := kv.Write("a", "ok", WriteOptions{Expect: &stale}); !errors.Is(err, ErrVersionMismatch) {
+		t.Errorf("guarded against a stale version: %v, want ErrVersionMismatch", err)
 	}
 }

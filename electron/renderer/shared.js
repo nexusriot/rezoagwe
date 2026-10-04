@@ -105,6 +105,13 @@
   /** Below this a graph node is drawn as fading: nothing has been heard from it lately. */
   const STALE_AFTER_MS = 30_000;
 
+  /**
+   * How finely a store is summarised for a consistency check. The same number
+   * as proto/wire.js, repeated here because the renderer is sandboxed and
+   * cannot require it; a test pins the pair together.
+   */
+  const FINGERPRINT_BUCKETS = 16;
+
   function isStale(lastSeenMs, nowMs) {
     return lastSeenMs > 0 && nowMs - lastSeenMs > STALE_AFTER_MS;
   }
@@ -123,6 +130,7 @@
     ttlRemaining,
     isStale,
     STALE_AFTER_MS,
+    FINGERPRINT_BUCKETS,
     PALETTE,
   };
 }));

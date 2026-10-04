@@ -2,8 +2,11 @@ package transport
 
 import (
 	"bytes"
+	"net"
 	"testing"
 	"time"
+
+	pb "github.com/nexusriot/rezoagwe/pkg/proto"
 )
 
 func TestFrameRoundTrip(t *testing.T) {
@@ -194,5 +197,75 @@ func TestMemNetSendAfterClose(t *testing.T) {
 	a.Close()
 	if err := a.Send("b", []byte("x")); err != ErrClosed {
 		t.Fatalf("send from closed transport: err = %v, want ErrClosed", err)
+	}
+}
+
+// proto.MaxFrameBytes is the same number as MaxFrameSize, declared where the
+// store can see it without importing this package. Two copies of a constant
+// drift; this is the thing that notices.
+func TestTheFrameCeilingAgreesWithTheProtocol(t *testing.T) {
+	if MaxFrameSize != pb.MaxFrameBytes {
+		t.Fatalf("transport.MaxFrameSize = %d but proto.MaxFrameBytes = %d: a value the store "+
+			"admits would be refused by the frame writer, and strand itself",
+			MaxFrameSize, pb.MaxFrameBytes)
+	}
+	if pb.MaxReplicableValueBytes >= MaxFrameSize {
+		t.Fatalf("MaxReplicableValueBytes = %d leaves no room for the key, version and envelope "+
+			"inside a %d-byte frame", pb.MaxReplicableValueBytes, MaxFrameSize)
+	}
+}
+
+// A deadline that does not grow with the payload is a throughput assumption.
+//
+// Found by re-running the end-to-end suite: a value at the replication
+// ceiling was accepted, the stream carried it partway, and the fixed ten
+// seconds ran out mid-transfer — so the entry never replicated and the only
+// evidence was a stream-error counter. On the same Wi-Fi LAN 30 MB arrived
+// and 64 MB did not, which is the shape of a timeout, not of a broken link.
+func TestAStreamDeadlineGrowsWithThePayload(t *testing.T) {
+	const base = 10 * time.Second
+
+	if got := StreamDeadline(base, 0); got != base {
+		t.Errorf("an empty payload should get the base deadline, got %s", got)
+	}
+	if got := StreamDeadline(base, 1024); got != base {
+		t.Errorf("a small payload should get the base deadline, got %s", got)
+	}
+
+	// 64 MiB at the assumed floor is 64 seconds of allowance on top.
+	big := StreamDeadline(base, 64<<20)
+	if big != base+64*time.Second {
+		t.Fatalf("64 MiB got %s, want %s", big, base+64*time.Second)
+	}
+
+	// The whole point: the largest frame the protocol allows must still get
+	// enough time at the assumed floor to actually arrive.
+	atCeiling := StreamDeadline(base, MaxFrameSize)
+	needed := time.Duration(MaxFrameSize/MinStreamThroughput) * time.Second
+	if atCeiling < needed {
+		t.Fatalf("a %d-byte frame gets %s but needs %s at the assumed floor",
+			MaxFrameSize, atCeiling, needed)
+	}
+}
+
+// ReadFrameFrom cannot know the size before reading it, so it has to widen
+// the deadline once the prefix says what is coming.
+func TestReadFrameFromWidensTheDeadlineOnceTheSizeIsKnown(t *testing.T) {
+	client, server := net.Pipe()
+	t.Cleanup(func() { client.Close(); server.Close() })
+
+	// Three megabytes, written slowly enough that a fixed one-second deadline
+	// would expire partway and a scaled one would not.
+	payload := bytes.Repeat([]byte("x"), 3<<20)
+	go func() {
+		WriteFrame(client, payload)
+	}()
+
+	got, err := ReadFrameFrom(server, time.Second)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(got) != len(payload) {
+		t.Fatalf("read %d bytes, want %d", len(got), len(payload))
 	}
 }

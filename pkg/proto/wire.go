@@ -3,6 +3,7 @@ package proto
 import (
 	"encoding/json"
 	"strings"
+	"unicode/utf8"
 )
 
 // Wire format for every rezoagwe packet — node-to-node *and* node-to-bootstrap:
@@ -284,6 +285,15 @@ type PullRequest struct {
 // compared without shipping either of them.
 type Fingerprint struct {
 	From string `json:"from"`
+	// Buckets, when set, also asks for the (key, version) pairs held in those
+	// buckets. A checker fills it on a second request, once the digests have
+	// said which buckets disagree — which turns "you differ somewhere in this
+	// sixteenth of the keyspace" into the names of the keys.
+	//
+	// Asking for nothing is the old request exactly, and a peer that does not
+	// understand the field answers with no Entries, so a report against an
+	// older node degrades to bucket indices rather than failing.
+	Buckets []int `json:"buckets,omitempty"`
 }
 
 // FingerprintReply summarises a whole store.
@@ -302,6 +312,87 @@ type FingerprintReply struct {
 	Clock      uint64 `json:"clock"`
 	// Buckets is FingerprintBuckets hex digests, indexed by bucket.
 	Buckets []string `json:"buckets"`
+	// Entries is every (key, version) the sender holds in the buckets the
+	// request named, sorted by key, including its tombstones — a key deleted
+	// on one replica and live on the other is exactly the kind of divergence
+	// worth naming. Empty unless Fingerprint.Buckets asked.
+	Entries []KeyVersion `json:"entries,omitempty"`
+}
+
+// MaxFrameBytes is the largest frame a stream will carry, and so the hard
+// ceiling on anything that has to replicate. transport.MaxFrameSize is the
+// same number at the layer that enforces it; a test pins the two together.
+const MaxFrameBytes = 64 << 20
+
+// frameReserve leaves room for everything in a KV frame that is not the value:
+// the key, the version, the expiry, the JSON around them, and the kind, nonce,
+// timestamp and authentication tag the codec wraps it all in.
+const frameReserve = 64 << 10
+
+// MaxReplicableValueBytes is the largest a value may be, measured as it will
+// be written on the wire rather than as it sits in memory, and still fit in a
+// frame. Plain text costs its own length, so this is also the plain answer to
+// "how big can a value be"; anything the encoder has to escape costs more.
+//
+// A value past this is not merely large, it is unreplicable: the datagram path
+// refuses it on size, the stream path refuses the frame, and a state sync
+// builds that same frame — so it would be accepted locally, reported as
+// written, and then sit on one replica forever with nothing able to repair it.
+// Refusing the write is the only honest answer, and it is a property of the
+// protocol rather than a tuning knob, which is why it is here and not in
+// Limits.
+const MaxReplicableValueBytes = MaxFrameBytes - frameReserve
+
+// asciiEscapeLen is what each ASCII byte costs inside a JSON string. Derived
+// from the encoder rather than from memory — it uses the short form for seven
+// characters, spells the rest of the C0 controls out as \u00xx, and escapes
+// the three characters that would end an HTML element or entity. A test
+// re-derives the whole table and fails if a toolchain ever disagrees.
+var asciiEscapeLen = func() (t [utf8.RuneSelf]uint8) {
+	for c := 0; c < utf8.RuneSelf; c++ {
+		switch {
+		case c == '\b', c == '\t', c == '\n', c == '\f', c == '\r', c == '"', c == '\\':
+			t[c] = 2
+		case c < 0x20, c == '<', c == '>', c == '&':
+			t[c] = 6
+		default:
+			t[c] = 1
+		}
+	}
+	return t
+}()
+
+// EscapedLen is how many bytes s occupies once encoded as a JSON string,
+// counted without building it — the point is to measure values far too big to
+// want a second copy of.
+//
+// Printable text costs its own length. Control bytes cost up to six times it,
+// and bytes that are not valid UTF-8 cost most of all: the encoder replaces
+// each one with U+FFFD, six bytes written out. A value arriving through the
+// HTTP gateway is whatever bytes the client sent, so a binary blob really can
+// sextuple on the wire — which is why this is measured rather than assumed.
+func EscapedLen(s string) int {
+	n := 2 // the surrounding quotes
+	for i := 0; i < len(s); {
+		if c := s[i]; c < utf8.RuneSelf {
+			n += int(asciiEscapeLen[c])
+			i++
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(s[i:])
+		switch {
+		case r == utf8.RuneError && size == 1:
+			n += 6 // �, one per byte the encoder could not decode
+			i++
+		case r == ' ', r == ' ':
+			n += 6
+			i += size
+		default:
+			n += size
+			i += size
+		}
+	}
+	return n
 }
 
 // FingerprintBuckets is how finely a store is summarised. Sixteen is enough to

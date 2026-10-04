@@ -121,6 +121,43 @@ services:
         exec rezoagwe-discovery -headless -node=node-restart:3137 -bootstrap=bootstrap:9999
         -psk=e2e-secret -cluster=e2e -nick=frank -http=:8080 -data=/tmp/rezoagwe.json
 
+  # Configured tighter than its peers, which is the one way a healthy cluster
+  # diverges on purpose: a limit refuses a peer's update, and nothing on the
+  # wire reports it. Generous enough that the suite's ordinary traffic — large
+  # values included — passes straight through, so only the test that means to
+  # trip it does.
+  node-limited:
+    <<: *node
+    command:
+      - -headless
+      - -node=node-limited:3137
+      - -bootstrap=bootstrap:9999
+      - -psk=e2e-secret
+      - -cluster=e2e
+      - -nick=grace
+      - -http=:8080
+      - -data=-
+      - -max-value-bytes=1048576
+
+  # Alone in a cluster of its own, with limits small enough to hit from a
+  # single request. Refusing a write is a property of the gateway and the
+  # store, not of a cluster, and testing it here keeps the statuses out of the
+  # way of everything that asserts the real cluster agrees.
+  node-solo:
+    <<: *node
+    depends_on: [bootstrap]
+    command:
+      - -headless
+      - -node=node-solo:3137
+      - -bootstrap=bootstrap:9999
+      - -psk=e2e-secret
+      - -cluster=solo
+      - -nick=solo
+      - -http=:8080
+      - -data=-
+      - -max-value-bytes=64
+      - -max-keys=3
+
   # Right cluster, wrong key. It knows the rendezvous address and shares the
   # network, so only the key is keeping it out.
   stranger-key:
@@ -163,6 +200,8 @@ services:
       node-late: {condition: service_started}
       node-leaver: {condition: service_started}
       node-restart: {condition: service_started}
+      node-limited: {condition: service_healthy}
+      node-solo: {condition: service_healthy}
     environment:
       E2E_NODE_A: "http://node-a:8080"
       E2E_NODE_B: "http://node-b:8080"
@@ -172,6 +211,8 @@ services:
       E2E_NODE_RESTART: "http://node-restart:8080"
       E2E_STRANGER_KEY: "http://stranger-key:8080"
       E2E_STRANGER_CLUSTER: "http://stranger-cluster:8080"
+      E2E_NODE_LIMITED: "http://node-limited:8080"
+      E2E_NODE_SOLO: "http://node-solo:8080"
       E2E_LATE_JOIN_SEC: "${E2E_LATE_JOIN_SEC:-25}"
       E2E_LEAVE_SEC: "${E2E_LEAVE_SEC:-45}"
       E2E_RESTART_SEC: "${E2E_RESTART_SEC:-30}"

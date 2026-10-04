@@ -160,9 +160,11 @@ func (s *Server) streamLoop() {
 
 func (s *Server) serveStream(conn net.Conn) {
 	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(streamTimeout))
 
-	frame, err := transport.ReadFrame(conn)
+	// Deadlines scale with what is actually on the wire. A roster is small
+	// today, but a fixed deadline is a throughput assumption, and this is the
+	// same stream code the nodes use.
+	frame, err := transport.ReadFrameFrom(conn, streamTimeout)
 	if err != nil {
 		log.Debugf("read stream frame: %s", err)
 		return
@@ -173,7 +175,7 @@ func (s *Server) serveStream(conn net.Conn) {
 		return
 	}
 	s.handle(kind, body, func(reply []byte) {
-		if err := transport.WriteFrame(conn, reply); err != nil {
+		if err := transport.WriteFrameTo(conn, streamTimeout, reply); err != nil {
 			log.Debugf("write stream reply: %s", err)
 		}
 	})

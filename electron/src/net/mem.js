@@ -2,6 +2,7 @@
 
 const { EventEmitter } = require('node:events');
 const { normalizeAddr } = require('./addr');
+const { PacketTooLargeError, MAX_DATAGRAM_PAYLOAD } = require('./udp');
 
 // An in-process network with configurable loss, delay and partitions, so a
 // whole cluster can be tested without sockets, sleeps or flakiness — the twin
@@ -20,17 +21,33 @@ class MemStream extends EventEmitter {
     if (this.destroyed || !this.peer) return false;
     const peer = this.peer;
     setImmediate(() => {
+      // A destroyed socket discards whatever it had not yet flushed. A
+      // stand-in that delivers it anyway hides every write-then-close bug —
+      // which is how a truncating one-way send passed this whole suite and
+      // only showed up against a real socket carrying tens of megabytes.
+      if (this.destroyed) return;
       if (!peer.destroyed) peer.emit('data', Buffer.from(chunk));
     });
     return true;
   }
 
-  end() {
-    if (this.ended) return;
+  /**
+   * Matches net.Socket: an optional final chunk, and a callback once it has
+   * been handed on. A stand-in that ignored both would let a flush bug
+   * through here and only show it against a real socket.
+   */
+  end(data, cb) {
+    const done = typeof data === 'function' ? data : cb;
+    if (this.ended) {
+      if (done) setImmediate(done);
+      return;
+    }
+    if (data && typeof data !== 'function') this.write(data);
     this.ended = true;
     const peer = this.peer;
     setImmediate(() => {
       if (peer && !peer.destroyed) peer.emit('end');
+      if (done) done();
     });
   }
 
@@ -67,6 +84,10 @@ class MemTransport extends EventEmitter {
 
   send(addr, data) {
     if (this.closed) return Promise.reject(new Error('transport closed'));
+    // This network has no MTU of its own, but it stands in for the one that
+    // does: without the same ceiling the stream fallback is only ever
+    // exercised against a live socket.
+    if (data.length > MAX_DATAGRAM_PAYLOAD) return Promise.reject(new PacketTooLargeError(data.length));
     return this.network.deliver(this.addr, addr, data);
   }
 

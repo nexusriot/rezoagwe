@@ -41,7 +41,11 @@ step "building the node image"
 "${COMPOSE[@]}" build --quiet
 
 step "starting the cluster (late joiner at ${E2E_LATE_JOIN_SEC}s, leaver until ${E2E_LEAVE_SEC}s, restart at ${E2E_RESTART_SEC}s)"
-"${COMPOSE[@]}" up -d --wait --force-recreate node-a node-b node-c
+# node-limited and node-solo are waited on with the core three: both are up
+# from the first second, and both are asked for statuses rather than for
+# convergence, so a test that reaches one before it binds is a failure for the
+# wrong reason.
+"${COMPOSE[@]}" up -d --wait --force-recreate node-a node-b node-c node-limited node-solo
 
 # The timed ones are not waited on: when they should have arrived, and whether
 # they came back, is what the suite is there to decide.
@@ -55,7 +59,7 @@ set -e
 
 if [ $status -ne 0 ]; then
     warn "the suite failed — cluster logs follow"
-    for svc in bootstrap node-a node-b node-c node-late node-leaver node-restart; do
+    for svc in bootstrap node-a node-b node-c node-late node-leaver node-restart node-limited node-solo; do
         warn "--- $svc"
         "${COMPOSE[@]}" logs --no-color --tail 40 "$svc" >&2 || true
     done

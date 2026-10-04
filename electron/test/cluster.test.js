@@ -6,6 +6,7 @@ const assert = require('node:assert/strict');
 const { NodeEngine } = require('../src/core/node-engine');
 const { BootstrapServer } = require('../src/core/bootstrap-server');
 const { MemNetwork } = require('../src/net/mem');
+const { MAX_DATAGRAM_PAYLOAD } = require('../src/net/udp');
 
 /**
  * A whole cluster in one process, over an in-memory network with configurable
@@ -502,4 +503,231 @@ test('diagnostics describe one consistent instant of the node', async () => {
   assert.equal(d.keyFingerprint.length, 8);
   assert.ok(d.topology.nodes.length >= 2);
   await c.stopAll();
+});
+
+/**
+ * A value too big for one datagram still has to reach the peer.
+ *
+ * Found on a live LAN cluster of a Go node, this client and the Android app: a
+ * 200 KB write was accepted, reported success, and then never replicated.
+ * Every gossip tick retried the same oversized datagram, the OS refused it,
+ * and the node counted a send error — so the one mechanism meant to repair
+ * divergence was the mechanism generating it, and the cluster stayed split for
+ * as long as the key existed with nothing but a counter to say so.
+ */
+test('a value too large for a datagram replicates over a stream', async () => {
+  const c = cluster();
+  const a = await c.make('alice');
+  const b = await c.make('bob');
+  await link(a, b);
+
+  const big = 'x'.repeat(MAX_DATAGRAM_PAYLOAD + 1);
+  await a.set('big', big);
+  await settle(120);
+
+  assert.equal(b.store.get('big'), big, 'the peer never received the oversized value');
+  assert.equal(a.metrics.sendErrors, 0, 'the stream fallback still counted a send error');
+  await c.stopAll();
+});
+
+test('anti-entropy repairs an oversized value, not just the write path', async () => {
+  const c = cluster();
+  const a = await c.make('alice');
+  const b = await c.make('bob');
+  await link(a, b);
+
+  // A partition, not packet loss: loss only drops datagrams, and the point of
+  // the fix is that this write no longer travels as one.
+  c.net.partition(a.addr, b.addr);
+  const big = 'y'.repeat(MAX_DATAGRAM_PAYLOAD + 1);
+  await a.set('big', big);
+  await settle();
+  assert.equal(b.store.get('big'), undefined, 'the write crossed a partition');
+
+  c.net.heal(a.addr, b.addr);
+  await a.antiEntropyRound(b.addr);
+  await settle(120);
+  assert.equal(b.store.get('big'), big, 'anti-entropy never repaired the oversized value');
+  await c.stopAll();
+});
+
+test('with no stream there is nowhere to put an oversized value, and it counts as an error', async () => {
+  const c = cluster({ streams: false });
+  const a = await c.make('alice');
+  const b = await c.make('bob');
+  await link(a, b);
+
+  await a.set('big', 'z'.repeat(MAX_DATAGRAM_PAYLOAD + 1));
+  await settle(120);
+
+  assert.equal(b.store.get('big'), undefined);
+  assert.ok(a.metrics.sendErrors > 0, 'a drop with no fallback must still be reported');
+  await c.stopAll();
+});
+
+/**
+ * "They differ somewhere in bucket 7" is where a report used to stop, which on
+ * a store of a few hundred keys is a sixteenth of the keyspace to go and read
+ * by hand. The check knows which key it is; it just never said.
+ */
+test('a consistency report names the diverging key', async () => {
+  const c = cluster();
+  const a = await c.make('alice');
+  const b = await c.make('bob');
+  await link(a, b);
+  for (const k of ['alpha', 'beta', 'gamma', 'delta']) await a.set(k, 'shared');
+  await settle();
+
+  c.net.partition(a.addr, b.addr);
+  await b.set('beta', 'only-on-b');
+  await settle();
+  c.net.heal(a.addr, b.addr);
+
+  const report = await a.checkConsistency();
+  assert.equal(report.converged, false, 'the report claims convergence over a key they hold differently');
+  const peer = report.peers[0];
+  assert.equal(peer.differences.length, 1, `named ${JSON.stringify(peer.differences)}`);
+  assert.equal(peer.differences[0].key, 'beta');
+  assert.ok(peer.differences[0].local && peer.differences[0].remote,
+    'both sides hold the key, so both versions should be named');
+  assert.notEqual(peer.differences[0].local, peer.differences[0].remote);
+  await c.stopAll();
+});
+
+// A key one replica has never seen is the divergence that matters most — a
+// write that never arrived — and it cannot be found by walking the local
+// store, which is the direction a naive diff takes.
+test('a report names a key this node has never seen', async () => {
+  const c = cluster();
+  const a = await c.make('alice');
+  const b = await c.make('bob');
+  await link(a, b);
+
+  c.net.partition(a.addr, b.addr);
+  await b.set('orphan', 'never-arrived');
+  await settle();
+  c.net.heal(a.addr, b.addr);
+
+  const peer = (await a.checkConsistency()).peers[0];
+  const found = peer.differences.find((d) => d.key === 'orphan');
+  assert.ok(found, `a key only the peer holds was not named: ${JSON.stringify(peer.differences)}`);
+  assert.equal(found.local, '', 'this node never saw the key, so its version must be empty');
+  assert.ok(found.remote, "the peer's version should be named");
+  await c.stopAll();
+});
+
+test('a report says which side holds a tombstone', async () => {
+  const c = cluster();
+  const a = await c.make('alice');
+  const b = await c.make('bob');
+  await link(a, b);
+  await a.set('doomed', 'v');
+  await settle();
+
+  c.net.partition(a.addr, b.addr);
+  await b.delete('doomed');
+  await settle();
+  c.net.heal(a.addr, b.addr);
+
+  const peer = (await a.checkConsistency()).peers[0];
+  assert.equal(peer.differences.length, 1);
+  assert.equal(peer.differences[0].localDeleted, false, 'this node holds the value');
+  assert.equal(peer.differences[0].remoteDeleted, true, 'the peer holds a tombstone and it must say so');
+  await c.stopAll();
+});
+
+test('an agreeing peer is given no differences to read', async () => {
+  const c = cluster();
+  const a = await c.make('alice');
+  const b = await c.make('bob');
+  await link(a, b);
+  await a.set('k', 'v');
+  await settle();
+
+  const report = await a.checkConsistency();
+  assert.equal(report.converged, true);
+  assert.equal(report.peers[0].differences.length, 0);
+  await c.stopAll();
+});
+
+/**
+ * Saying the same thing twice is not a duplicate to be cleaned up.
+ *
+ * The merge deduplicated on the entry itself, and nothing in a chat entry
+ * distinguishes two identical lines — same text, same sender, same second. A
+ * joiner syncing a conversation where someone said "ok" twice was handed one
+ * of them. The Go node had it worse: the second copy was deleted from a log
+ * that already held it.
+ */
+test('a line genuinely said twice survives a state sync', async () => {
+  const c = cluster();
+  const a = await c.make('alice');
+  const b = await c.make('bob');
+  await link(a, b);
+
+  await a.submit('ok');
+  await a.submit('ok'); // same text, same sender, same second
+  await settle();
+  const saidTwice = (node) => node.chatLog.filter((e) => e.text === 'ok').length;
+  assert.equal(saidTwice(a), 2, 'the writer should hold both lines');
+
+  // A joiner pulls the whole conversation and must see both.
+  const d = await c.make('carol');
+  d.addPeer(a.addr);
+  await d.requestStateFrom(a.addr);
+  await settle(100);
+  assert.equal(saidTwice(d), 2, 'the joiner was handed one copy of a line said twice');
+
+  // And syncing again adds nothing.
+  await d.requestStateFrom(a.addr);
+  await settle(100);
+  assert.equal(saidTwice(d), 2, 'a repeated snapshot duplicated the conversation');
+  await c.stopAll();
+});
+
+/**
+ * A one-way stream send must wait for the flush before closing.
+ *
+ * Found by re-running the end-to-end suite: `write()` buffers and
+ * `destroy()` discards whatever is still queued, so the stream fallback
+ * worked for every frame small enough to land in the socket buffer in one go
+ * and silently truncated the ones that did not. The receiver read a length
+ * prefix promising more than arrived and counted a stream error; the entry
+ * never replicated. 200 KB was fine, tens of megabytes were not, which is
+ * why the earlier tests all passed.
+ */
+test('a frame too large to flush in one go still arrives whole', async () => {
+  const c = cluster();
+  const a = await c.make('alice');
+  const b = await c.make('bob');
+  await link(a, b);
+
+  // Comfortably past any socket buffer, so the write cannot complete
+  // synchronously and the close has something to race.
+  const big = 'x'.repeat(4 * 1024 * 1024);
+  await a.set('big', big);
+  await settle(300);
+
+  assert.equal(b.store.get('big')?.length, big.length,
+    'the peer received a truncated value, or none');
+  assert.equal(a.metrics.streamErrors, 0, 'the send reported a stream error');
+});
+
+/**
+ * And the same for a state response, which is a whole store rather than one
+ * entry: the responder used a fixed grace period before destroying the
+ * connection, which a large reply outgrows.
+ */
+test('a large state response is not truncated by the close that follows it', async () => {
+  const c = cluster();
+  const a = await c.make('alice');
+  for (let i = 0; i < 40; i++) await a.set(`k${i}`, 'v'.repeat(100 * 1024));
+
+  const joiner = await c.make('carol');
+  joiner.addPeer(a.addr);
+  await joiner.requestStateFrom(a.addr);
+  await settle(400);
+
+  assert.equal(joiner.store.size(), 40, 'the joiner got a partial store');
+  assert.equal(joiner.metrics.streamErrors, 0, 'the joiner saw a broken stream');
 });

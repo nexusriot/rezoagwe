@@ -239,4 +239,51 @@ class DiagnosticsTest {
         assertTrue(report.contains("10.0.0.2:3137"))
         assertTrue(report.contains("checks"))
     }
+
+    /**
+     * An oversized frame and an unroutable peer are both "send error", and the
+     * advice is opposite. Blaming Wi-Fi for the first is what the live run
+     * found on the Go node: the counter said "message too long" and the prose
+     * said to go and check a route that was perfectly fine.
+     */
+    @Test
+    fun anOversizedFrameIsNotBlamedOnTheNetwork() {
+        val d = healthy().copy(
+            metrics = MetricsSnapshot(
+                sendErrors = 7,
+                lastSendError = SendFailure(
+                    addr = "10.0.0.4:3137",
+                    cause = "PacketTooLargeException",
+                    message = "packet of 200000 bytes exceeds the 65507-byte datagram payload",
+                ),
+            ),
+        )
+        val check = healthChecks(d, now).first { it.title.contains("send error") }
+
+        assertFalse("an oversized frame was blamed on Wi-Fi", check.detail.contains("Wi-Fi"))
+        for (want in listOf("too large for one datagram", "stream", "divergent")) {
+            assertTrue("detail should mention \"$want\": ${check.detail}", check.detail.contains(want))
+        }
+    }
+
+    /**
+     * With no stream listener the oversized frame had nowhere to go, and that
+     * is the actionable half: the two checks have to point at each other
+     * rather than leave the reader to join them up.
+     */
+    @Test
+    fun anOversizedFrameWithNoStreamNamesTheListener() {
+        val d = healthy().copy(
+            streamListener = false,
+            metrics = MetricsSnapshot(
+                sendErrors = 1,
+                lastSendError = SendFailure(addr = "10.0.0.4:3137", cause = "PacketTooLargeException"),
+            ),
+        )
+        val checks = healthChecks(d, now)
+
+        assertTrue(checks.first { it.title.contains("send error") }.detail.contains("no stream listener"))
+        assertTrue(checks.first { it.title.contains("No stream listener") }.detail.contains("oversized frame"))
+    }
+
 }

@@ -3,10 +3,11 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { KvStore } = require('../src/core/kvstore');
+const { KvStore, REFUSAL } = require('../src/core/kvstore');
 const { NodeEngine, DEFAULTS } = require('../src/core/node-engine');
 const { MemNetwork } = require('../src/net/mem');
 const { KVAction } = require('../src/proto/wire');
+const W = require('../src/proto/wire');
 
 /**
  * The three implementations are one protocol, so a correctness fix in the Go
@@ -199,4 +200,53 @@ test('the sweep summary describes the per-peer cursors', async () => {
   assert.match(a.sweepSummary(), /1 of 1 peer\(s\) mid-sweep/);
 
   await cl.stopAll();
+});
+
+/**
+ * A value no peer could ever receive is refused where it is written, not
+ * stored and reported as written.
+ *
+ * Found by end-to-end testing the Go node: the datagram path refuses it on
+ * size, the stream path refuses the frame, and a state sync builds that same
+ * frame — so it was accepted locally and sat on one replica forever with
+ * nothing able to repair it. Unlike maxValueBytes this is not configurable,
+ * because it is not a policy: no setting makes such a value replicate.
+ */
+test('a value too large to replicate is refused with no limit configured', () => {
+  const kv = new KvStore('n1');
+  const atTheLine = 'x'.repeat(W.MAX_REPLICABLE_VALUE_BYTES);
+  assert.equal(kv.admit('fits', atTheLine), null, 'a value exactly at the ceiling was refused');
+  assert.equal(kv.admit('over', `${atTheLine}x`), REFUSAL.UNSHIPPABLE);
+  assert.equal(kv.write('over', `${atTheLine}x`, {}), null, 'a refused value was written anyway');
+});
+
+// The ceiling is measured as the value will be written, not as it sits in
+// memory. A lone surrogate is escaped to six characters, so a string a sixth
+// of the ceiling is already at it, and a raw length check would wave it
+// through to strand itself.
+test('the replication ceiling counts escaped length, not raw length', () => {
+  const kv = new KvStore('n1');
+  const lone = '\ud800'.repeat(Math.floor(W.MAX_REPLICABLE_VALUE_BYTES / 4));
+  assert.ok(lone.length < W.MAX_REPLICABLE_VALUE_BYTES, 'the test value is not under the ceiling raw');
+  assert.equal(kv.admit('blob', lone), REFUSAL.UNSHIPPABLE,
+    'a string that sextuples on the wire slipped past the ceiling');
+});
+
+// Why a write was refused has to be answerable: "null" reads the same for a
+// lost race and a value that will never fit, and the caller owes the user
+// different answers.
+test('a refused write says which rule refused it', () => {
+  const kv = new KvStore('n1');
+  kv.setLimits({ maxValueBytes: 4, maxKeys: 1 });
+  assert.equal(kv.admit('a', 'toolong'), REFUSAL.TOO_LARGE);
+  assert.equal(kv.admit('a', 'ok'), null);
+  kv.write('a', 'ok', {});
+  assert.equal(kv.admit('b', 'ok'), REFUSAL.TOO_MANY_KEYS);
+});
+
+// The same ceiling in both implementations, or a value one accepts is one the
+// other refuses and the cluster splits along whichever wrote it.
+test('the replication ceiling is the one Go uses', () => {
+  assert.equal(W.MAX_FRAME_BYTES, 64 << 20);
+  assert.equal(W.MAX_REPLICABLE_VALUE_BYTES, (64 << 20) - (64 << 10));
 });

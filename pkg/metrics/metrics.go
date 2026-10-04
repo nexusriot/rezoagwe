@@ -4,6 +4,7 @@
 package metrics
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"sync/atomic"
 
 	pb "github.com/nexusriot/rezoagwe/pkg/proto"
+	"github.com/nexusriot/rezoagwe/pkg/transport"
 )
 
 // Metrics is a set of lock-free counters. The zero value is ready to use.
@@ -76,6 +78,12 @@ type SendError struct {
 	Kind    string `json:"kind"`
 	Message string `json:"message"`
 	At      int64  `json:"at"`
+	// Oversize marks the one failure whose cause is this node's own payload
+	// rather than the network: a frame too large for a datagram, which the
+	// stream path should have carried and did not. Told apart because the
+	// advice is opposite — nothing about the route is wrong, and checking the
+	// peer's address is time spent looking in the wrong place.
+	Oversize bool `json:"oversize,omitempty"`
 }
 
 // Gauges are the levels a counter cannot express: how much is in the store
@@ -160,7 +168,13 @@ func (m *Metrics) SendFailed(addr string, kind pb.MessageKind, err error, now in
 		msg = err.Error()
 	}
 	m.errMu.Lock()
-	m.lastError = &SendError{Addr: addr, Kind: kind.String(), Message: msg, At: now}
+	m.lastError = &SendError{
+		Addr:     addr,
+		Kind:     kind.String(),
+		Message:  msg,
+		At:       now,
+		Oversize: errors.Is(err, transport.ErrPacketTooLarge),
+	}
 	m.errMu.Unlock()
 }
 

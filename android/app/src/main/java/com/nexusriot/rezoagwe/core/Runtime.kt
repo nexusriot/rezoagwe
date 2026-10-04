@@ -63,6 +63,22 @@ data class Settings(
 
 private const val PREFS = "rezoagwe"
 
+/**
+ * Which roles the user last asked for, kept apart from [Settings] because it is
+ * intent rather than configuration — nothing on the settings screen edits it.
+ *
+ * START_STICKY brings the service back after the system reclaims the process,
+ * but the process comes back empty: a freshly built engine is stopped, the
+ * watcher sees nothing running and stops the service again, and the node the
+ * user started never returns. Observed on a tablet — the activity closed, the
+ * service restarted, and twelve seconds later Android logged
+ * "Stop FGS timeout" and froze the process, with the node gone from the
+ * cluster and nothing on screen to say so. Remembering the intent is what
+ * makes the sticky restart mean anything.
+ */
+private const val KEY_NODE_WANTED = "nodeWanted"
+private const val KEY_BOOTSTRAP_WANTED = "bootstrapWanted"
+
 object SettingsStore {
     fun load(context: Context): Settings {
         val p = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -188,13 +204,48 @@ object Runtime {
         }
     }
 
-    fun startNode(context: Context) = guard { engine(context).start() }
+    fun startNode(context: Context) = guard {
+        wantRole(context, KEY_NODE_WANTED, true)
+        engine(context).start()
+    }
 
-    fun stopNode(context: Context) = guard { engine(context).stop() }
+    fun stopNode(context: Context) = guard {
+        wantRole(context, KEY_NODE_WANTED, false)
+        engine(context).stop()
+    }
 
-    fun startBootstrap(context: Context) = guard { bootstrap(context).start() }
+    fun startBootstrap(context: Context) = guard {
+        wantRole(context, KEY_BOOTSTRAP_WANTED, true)
+        bootstrap(context).start()
+    }
 
-    fun stopBootstrap(context: Context) = guard { bootstrap(context).stop() }
+    fun stopBootstrap(context: Context) = guard {
+        wantRole(context, KEY_BOOTSTRAP_WANTED, false)
+        bootstrap(context).stop()
+    }
+
+    /** Whether the user has asked for a role that is not currently up. */
+    fun anyRoleWanted(context: Context): Boolean {
+        val p = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        return p.getBoolean(KEY_NODE_WANTED, false) || p.getBoolean(KEY_BOOTSTRAP_WANTED, false)
+    }
+
+    /**
+     * Brings back the roles the user had running, after the system reclaimed
+     * the process and START_STICKY rebuilt the service around an empty one.
+     *
+     * Binds sockets, so callers must be off the main thread.
+     */
+    fun restoreWantedRoles(context: Context) {
+        init(context)
+        val p = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        if (p.getBoolean(KEY_NODE_WANTED, false) && !engine(context).isRunning) startNode(context)
+        if (p.getBoolean(KEY_BOOTSTRAP_WANTED, false) && !bootstrap(context).isRunning) startBootstrap(context)
+    }
+
+    private fun wantRole(context: Context, key: String, wanted: Boolean) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean(key, wanted).apply()
+    }
 
     fun clearError() {
         _lastError.value = null

@@ -8,6 +8,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material3.Icon
@@ -27,6 +29,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import com.nexusriot.rezoagwe.core.NodeEngine
 import com.nexusriot.rezoagwe.proto.ChatEntry
@@ -51,6 +54,18 @@ fun ChatScreen(node: NodeEngine) {
         if (messages.isNotEmpty()) listState.animateScrollToItem(messages.size - 1)
     }
 
+    // One definition of "send", so the keyboard's send key and the button can
+    // never drift apart.
+    val send: () -> Unit = {
+        val text = draft
+        if (text.isNotBlank()) {
+            draft = ""
+            // Off the main thread: sending dials peers, and an unreachable
+            // one must never stall the UI.
+            scope.launch(Dispatchers.IO) { node.submit(text) }
+        }
+    }
+
     Column(modifier = Modifier.fillMaxSize()) {
         LazyColumn(
             state = listState,
@@ -72,16 +87,15 @@ fun ChatScreen(node: NodeEngine) {
                 modifier = Modifier.weight(1f),
                 placeholder = { Text("Message, or /help for commands") },
                 singleLine = true,
+                // Without these the keyboard offers a generic Done key that does
+                // nothing, and the only way to say anything is to aim for the
+                // arrow — while every other front end sends on Enter.
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+                keyboardActions = KeyboardActions(onSend = { send() }),
             )
             IconButton(
                 enabled = draft.isNotBlank(),
-                onClick = {
-                    val text = draft
-                    draft = ""
-                    // Off the main thread: sending dials peers, and an unreachable
-                    // one must never stall the UI.
-                    scope.launch(Dispatchers.IO) { node.submit(text) }
-                },
+                onClick = send,
             ) {
                 Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send")
             }

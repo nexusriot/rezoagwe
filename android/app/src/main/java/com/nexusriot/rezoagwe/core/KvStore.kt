@@ -6,7 +6,9 @@ import com.nexusriot.rezoagwe.proto.FingerprintReply
 import com.nexusriot.rezoagwe.proto.KVAction
 import com.nexusriot.rezoagwe.proto.KVUpdate
 import com.nexusriot.rezoagwe.proto.KeyVersion
+import com.nexusriot.rezoagwe.proto.MAX_REPLICABLE_VALUE_BYTES
 import com.nexusriot.rezoagwe.proto.Version
+import com.nexusriot.rezoagwe.proto.escapedLen
 import java.security.MessageDigest
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
@@ -70,6 +72,41 @@ data class Reconciliation(
  * wire reports that. Set the same values on every replica, or the cluster splits
  * along whichever node was configured tightest.
  */
+/**
+ * Why a write was refused. A bare "false" says only that it did not land,
+ * which reads the same for a lost compare-and-swap and a value no peer could
+ * ever receive — and those need opposite answers.
+ */
+enum class Refusal {
+    UNSHIPPABLE,
+    TOO_LARGE,
+    TOO_MANY_KEYS,
+    VERSION_MISMATCH,
+    ;
+
+    /** What to tell someone looking at the screen. */
+    fun explain(): String = when (this) {
+        UNSHIPPABLE ->
+            "too large to replicate to any peer — no setting makes a value this big travel"
+        TOO_LARGE -> "larger than this node's configured value limit"
+        TOO_MANY_KEYS -> "the store is at its configured key limit"
+        VERSION_MISMATCH -> "the key no longer holds the expected version"
+    }
+}
+
+/**
+ * Which bucket a key name folds into: the first four bytes of SHA-256(key),
+ * big endian and unsigned, modulo the bucket count — exactly what Go's
+ * binary.BigEndian.Uint32 does. The one definition, so a digest and a listing
+ * can never disagree about where a key lives.
+ */
+internal fun bucketOf(key: String, buckets: Int): Int {
+    val nameHash = MessageDigest.getInstance("SHA-256").digest(key.toByteArray())
+    var u32 = 0L
+    for (i in 0 until 4) u32 = (u32 shl 8) or (nameHash[i].toLong() and 0xff)
+    return (u32 % buckets).toInt()
+}
+
 data class Limits(
     val maxValueBytes: Int = 0,
     val maxKeys: Int = 0,
@@ -102,12 +139,63 @@ class KvStore(
      * lock. Enforced against a peer as well as a local writer: a limit the node
      * it protects is the only one that cannot fill is not a limit.
      */
-    private fun admits(key: String, value: String, now: Long): Boolean {
-        if (limits.maxValueBytes > 0 && value.toByteArray().size > limits.maxValueBytes) return false
-        if (limits.maxKeys <= 0) return true
+    private fun admits(key: String, value: String, now: Long): Boolean =
+        admitLocked(key, value, now) == null
+
+    /**
+     * Why a value may not be stored under this key, or null when it may.
+     * Callers hold the lock.
+     *
+     * The reason matters: "refused" reads the same for a lost race and a value
+     * that will never fit, and the caller owes the user different answers —
+     * and for a while owed them none at all, since a refusal was reported as
+     * success.
+     */
+    private fun admitLocked(key: String, value: String, now: Long): Refusal? {
+        // Measured as the value will be written on the wire, not as it sits in
+        // memory: an unpaired surrogate is escaped, and a raw length check
+        // would wave it through to strand itself.
+        //
+        // The cheap test first, because the exact one walks the value and
+        // almost every value is nowhere near: nothing shorter than a sixth of
+        // the ceiling can exceed it however badly it escapes. escapedLen
+        // counts the quotes, which the reserve covers, so they come off here.
+        if (value.length > MAX_REPLICABLE_VALUE_BYTES / 6 &&
+            escapedLen(value) - 2 > MAX_REPLICABLE_VALUE_BYTES
+        ) {
+            return Refusal.UNSHIPPABLE
+        }
+        if (limits.maxValueBytes > 0 && value.toByteArray().size > limits.maxValueBytes) {
+            return Refusal.TOO_LARGE
+        }
+        if (limits.maxKeys <= 0) return null
         val existing = store[key]
-        if (existing != null && existing.visible(now)) return true // an update never grows the keyspace
-        return store.count { it.value.visible(now) } < limits.maxKeys
+        if (existing != null && existing.visible(now)) return null // an update never grows the keyspace
+        return if (store.count { it.value.visible(now) } < limits.maxKeys) null else Refusal.TOO_MANY_KEYS
+    }
+
+    /** Why a write of this value would be refused, or null when it would be taken. */
+    fun admit(key: String, value: String): Refusal? =
+        synchronized(lock) { admitLocked(key, value, nowSec()) }
+
+    /**
+     * The (key, version) pairs held in the named buckets, sorted by key,
+     * tombstones included.
+     *
+     * This is the second half of a consistency check: the digests say which
+     * sixteenth of the keyspace two replicas disagree about, and this says
+     * which keys. Bounded by the buckets asked for, so naming the divergence
+     * costs a slice of the store rather than all of it.
+     */
+    fun bucketEntries(buckets: Int = FINGERPRINT_BUCKETS, want: List<Int>): List<KeyVersion> {
+        if (want.isEmpty()) return emptyList()
+        val n = if (buckets > 0) buckets else FINGERPRINT_BUCKETS
+        val wanted = want.toSet()
+        return synchronized(lock) {
+            store.entries
+                .filter { wanted.contains(bucketOf(it.key, n)) }
+                .map { KeyVersion(key = it.key, version = it.value.version, deleted = it.value.deleted) }
+        }.sortedBy { it.key }
     }
 
     fun loadState(savedClock: Long, entries: Map<String, KvEntry>) = synchronized(lock) {
@@ -282,13 +370,7 @@ class KvStore(
         for ((k, e) in store) {
             if (e.deleted) tombstones++ else if (e.visible(now)) keys++
 
-            // The bucket is the first four bytes of SHA-256(key), big endian and
-            // unsigned, modulo the bucket count — exactly what Go's
-            // binary.BigEndian.Uint32 does.
-            val nameHash = MessageDigest.getInstance("SHA-256").digest(k.toByteArray())
-            var u32 = 0L
-            for (i in 0 until 4) u32 = (u32 shl 8) or (nameHash[i].toLong() and 0xff)
-            val idx = (u32 % n).toInt()
+            val idx = bucketOf(k, n)
 
             val digest = MessageDigest.getInstance("SHA-256")
             digest.update(k.toByteArray())

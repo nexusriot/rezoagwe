@@ -78,20 +78,21 @@ func (n *Node) exchangeStream(peer string, kind pb.MessageKind, v interface{}) b
 		return false
 	}
 	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(streamTimeout))
 
 	pkt, err := n.codec.Encode(kind, v)
 	if err != nil {
 		log.Errorf("encode %s: %s", kind, err)
 		return false
 	}
-	if err := transport.WriteFrame(conn, pkt); err != nil {
+	if err := transport.WriteFrameTo(conn, streamTimeout, pkt); err != nil {
 		n.Metrics.StreamErrors.Add(1)
 		return false
 	}
 	n.Metrics.Sent(kind, len(pkt))
 
-	frame, err := transport.ReadFrame(conn)
+	// The reply to a state request is a whole store, so the read deadline has
+	// to be set from the size on the wire rather than guessed beforehand.
+	frame, err := transport.ReadFrameFrom(conn, streamTimeout)
 	if err != nil {
 		n.Metrics.StreamErrors.Add(1)
 		log.Debugf("stream read from %s: %s", peer, err)

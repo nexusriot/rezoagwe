@@ -24,6 +24,22 @@ data class Packet(val from: String, val data: ByteArray) {
 /** Largest datagram we are prepared to read; anything bigger cannot travel over UDP anyway. */
 private const val MAX_DATAGRAM = 65535
 
+/**
+ * The largest payload a datagram can carry: 65535 less the 8-byte UDP and
+ * 20-byte IPv4 headers.
+ *
+ * [UdpTransport.send] checks this itself rather than letting the OS reject the
+ * write, because the OS refusal arrives as a generic IOException the caller
+ * cannot tell from a real network failure — and the caller has to tell them
+ * apart, since the right answer here is to put the same frame on a stream, not
+ * to count a send error and drop the update.
+ */
+const val MAX_DATAGRAM_PAYLOAD = 65507
+
+/** A payload no datagram can carry: "use a stream", not "the network failed". */
+class PacketTooLargeException(size: Int) :
+    IOException("packet of $size bytes exceeds the $MAX_DATAGRAM_PAYLOAD-byte datagram payload")
+
 /** Caps a stream frame so a corrupt length prefix cannot make the app allocate wildly. */
 const val MAX_FRAME_SIZE = 64 shl 20
 
@@ -73,6 +89,7 @@ class UdpTransport(
     }
 
     fun send(addr: String, data: ByteArray) {
+        if (data.size > MAX_DATAGRAM_PAYLOAD) throw PacketTooLargeException(data.size)
         val target = parseAddr(addr) ?: return
         socket.send(DatagramPacket(data, data.size, target))
     }

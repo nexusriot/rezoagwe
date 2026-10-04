@@ -2,6 +2,8 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 
 const S = require('../renderer/shared');
 const G = require('../renderer/graph');
@@ -250,4 +252,66 @@ test('the report carries what a bug report needs, in one paste', () => {
   for (const fragment of ['rezoagwe node diagnostics', '10.0.0.1:3137', 'deadbeef', 'peers (1)', 'checks']) {
     assert.ok(report.includes(fragment), `the report should mention ${fragment}`);
   }
+});
+
+/**
+ * The chat box sends on Enter, and the Android app has to as well.
+ *
+ * Pinned on both sides after the Compose field shipped with no ImeAction: its
+ * keyboard offered a Done key that did nothing, so the same gesture worked in
+ * the terminal client and here but not on a tablet, where a keyboard is the
+ * only way to type. The assertion is cheap; the asymmetry was not obvious from
+ * either file alone.
+ */
+test('the chat composer sends on Enter, not only on the button', () => {
+  const renderer = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'renderer.js'), 'utf8');
+  assert.match(renderer, /e\.key === 'Enter'/, 'the composer must act on Enter');
+  assert.match(renderer, /onkeydown:/, 'the composer needs a key handler at all');
+});
+
+// An oversized frame and an unroutable peer are both "send error", and the
+// advice is opposite. Blaming the route for the first is what the live run
+// found: the counter said "message too long" and the prose said to go and
+// check an address that was perfectly fine.
+test('an oversized frame is not blamed on the route', () => {
+  const d = baseDiagnostics();
+  d.metrics.sendErrors = 7;
+  d.metrics.lastSendError = {
+    addr: '10.0.0.4:3137', cause: 'PacketTooLargeError', oversize: true,
+    message: 'packet of 200000 bytes exceeds the 65507-byte datagram payload',
+  };
+  const detail = find(healthChecks(d, Date.now()), 'send error').detail;
+  assert.ok(!/no longer routes/.test(detail), `blamed on the route:\n${detail}`);
+  for (const want of ['too large for one datagram', 'stream', 'divergent']) {
+    assert.match(detail, new RegExp(want), `detail should mention ${want}`);
+  }
+});
+
+test('an oversized frame with no stream listener names the listener', () => {
+  const d = baseDiagnostics({ streamListener: false });
+  d.metrics.sendErrors = 1;
+  d.metrics.lastSendError = {
+    addr: '10.0.0.4:3137', cause: 'PacketTooLargeError', oversize: true, message: 'too long',
+  };
+  const checks = healthChecks(d, Date.now());
+  assert.match(find(checks, 'send error').detail, /no stream listener/);
+  assert.match(find(checks, 'No stream listener').detail, /oversized frame/);
+});
+
+// An ordinary failure keeps the ordinary explanation: the network really is
+// the usual cause, and the oversize wording would be a wrong guess.
+test('an ordinary send error still blames the network', () => {
+  const d = baseDiagnostics();
+  d.metrics.sendErrors = 1;
+  d.metrics.lastSendError = { addr: '10.0.0.4:3137', cause: 'EHOSTUNREACH', message: 'no route to host' };
+  const detail = find(healthChecks(d, Date.now()), 'send error').detail;
+  assert.match(detail, /no longer routes/);
+  assert.ok(!/too large/.test(detail), `an ordinary failure was called oversized:\n${detail}`);
+});
+
+// The renderer is sandboxed and cannot require the protocol module, so the
+// bucket count is written out twice. Two copies of a constant drift.
+test('the renderer and the protocol agree on how many buckets there are', () => {
+  const W = require('../src/proto/wire');
+  assert.equal(S.FINGERPRINT_BUCKETS, W.FINGERPRINT_BUCKETS);
 });

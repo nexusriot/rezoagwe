@@ -4,6 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const W = require('../src/proto/wire');
+const { MAX_FRAME_SIZE } = require('../src/net/framing');
 
 /**
  * What Go actually puts on the wire.
@@ -109,4 +110,42 @@ test('every message kind has a stable name for the metrics labels', () => {
   assert.equal(W.kindName(W.Kind.KV), 'kv');
   assert.equal(W.kindName(W.Kind.BOOTSTRAP_ROSTER), 'bootstrap_roster');
   assert.equal(W.kindName(200), 'unknown');
+});
+
+/**
+ * escapedLen stands in for the encoder when a value is too big to want a
+ * second copy of, so it has to agree with it exactly — for every input, or it
+ * is not a size check but a guess.
+ *
+ * This is JSON.stringify, not Go's encoder: JavaScript does not escape `<`,
+ * `>` or `&`, and writes a lone surrogate as \udXXX. Each implementation
+ * measures its own encoder; what they share is the byte ceiling.
+ */
+test('escapedLen agrees with the encoder on every ASCII byte', () => {
+  for (let c = 0; c < 0x80; c++) {
+    const s = String.fromCharCode(c);
+    const want = Buffer.byteLength(JSON.stringify(s), 'utf8');
+    assert.equal(W.escapedLen(s), want, `byte 0x${c.toString(16)} (${JSON.stringify(s)})`);
+  }
+});
+
+test('escapedLen agrees with the encoder on arbitrary code units', () => {
+  // Random UTF-16 code units, lone surrogates and all: the case a check built
+  // from well-formed strings never reaches.
+  let seed = 12345;
+  const rand = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+  for (let round = 0; round < 3000; round++) {
+    let s = '';
+    const n = Math.floor(rand() * 12);
+    for (let i = 0; i < n; i++) s += String.fromCharCode(Math.floor(rand() * 0x11000));
+    const want = Buffer.byteLength(JSON.stringify(s), 'utf8');
+    assert.equal(W.escapedLen(s), want, `for ${JSON.stringify(s)}`);
+  }
+});
+
+test('the frame ceiling agrees with the framing layer and leaves room for the envelope', () => {
+  assert.equal(W.MAX_FRAME_BYTES, MAX_FRAME_SIZE,
+    'two copies of a constant drift; a value the store admits would be refused by the frame writer');
+  assert.ok(W.MAX_REPLICABLE_VALUE_BYTES < W.MAX_FRAME_BYTES,
+    'the ceiling leaves no room for the key, version and envelope');
 });

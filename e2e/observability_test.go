@@ -1,6 +1,7 @@
 package e2e
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -180,5 +181,167 @@ func TestConditionalReadIsNotModified(t *testing.T) {
 	code, _, _ = a.do(t, http.MethodGet, "/kv/"+key, "", map[string]string{"If-None-Match": etag})
 	if code != http.StatusOK {
 		t.Fatalf("GET after a write = %d, want 200", code)
+	}
+}
+
+// ---- refusing a write ------------------------------------------------------
+//
+// Against node-solo, which is alone in a cluster of its own with limits small
+// enough to trip in one request. Refusing a write is a gateway and store
+// property rather than a cluster one, and testing it here keeps the statuses
+// away from everything that asserts the real cluster agrees.
+
+// A write the store refused must not be reported as a write.
+//
+// Set's result was discarded in the handler, so a value over the limit came
+// back 204 with an ETag of the zero version: the client was told it had
+// succeeded and had no way to learn otherwise. Nothing in a unit test for the
+// store catches that — the store was right, the handler threw the answer away.
+func TestAValueOverTheNodeLimitIsRefused(t *testing.T) {
+	code, body := solo.putStatus(t, "too-big", strings.Repeat("x", 200))
+	if code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("a value over -max-value-bytes = %d, want 413: %s", code, body)
+	}
+	if !strings.Contains(body, "size limit") {
+		t.Errorf("the refusal does not say which rule refused it: %s", body)
+	}
+	if _, _, ok := solo.get(t, "too-big"); ok {
+		t.Error("the refused value was stored anyway")
+	}
+}
+
+// The key limit needs its own status: "try a smaller value" is the wrong
+// advice when the value was never the problem.
+func TestAWriteBeyondTheKeyLimitSaysTheStoreIsFull(t *testing.T) {
+	for i := 0; i < 3; i++ {
+		if code, body := solo.putStatus(t, fmt.Sprintf("fill-%d", i), "v"); code != http.StatusNoContent {
+			t.Fatalf("filling key %d = %d, want 204: %s", i, code, body)
+		}
+	}
+	code, body := solo.putStatus(t, "one-too-many", "v")
+	if code != http.StatusInsufficientStorage {
+		t.Fatalf("a key past -max-keys = %d, want 507: %s", code, body)
+	}
+	if !strings.Contains(body, "key limit") {
+		t.Errorf("the refusal does not say which rule refused it: %s", body)
+	}
+}
+
+// A body past the gateway's own cap is refused, not quietly shortened.
+//
+// io.LimitReader stopped at the limit and reported no error, so a PUT one byte
+// over stored the first 32 MB and answered 204 — the cluster then replicating
+// a prefix of what the client sent, with nothing anywhere saying so. The whole
+// body has to cross a real socket for this to mean anything, which is why it
+// is here rather than in a handler test.
+func TestABodyOverTheGatewayCapIsRefusedNotTruncated(t *testing.T) {
+	const cap = 32 << 20
+	code, _ := solo.putStatus(t, "over-the-cap", strings.Repeat("y", cap+1024))
+	if code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("a body over the %d-byte cap = %d, want 413", cap, code)
+	}
+	if _, _, ok := solo.get(t, "over-the-cap"); ok {
+		t.Error("a truncated body was stored anyway")
+	}
+}
+
+// A lost compare-and-swap keeps its own status: it means "someone got there
+// first", which is a different thing to tell a caller holding a lock than
+// "that will never fit".
+func TestARefusedSwapIsStillAPreconditionFailure(t *testing.T) {
+	// A key the previous test already created: the store is at its key limit
+	// by now, and an update to a key already held is always allowed, so this
+	// tests the swap rather than the limit.
+	const key = "fill-0"
+	if _, _, ok := solo.get(t, key); !ok {
+		t.Fatalf("%s should already exist from the key-limit test", key)
+	}
+	code, _ := solo.putIfMatch(t, key, "other", "1.nobody")
+	if code != http.StatusPreconditionFailed {
+		t.Fatalf("a swap against a stale version = %d, want 412", code)
+	}
+	// And the value is untouched.
+	if v, _, _ := solo.get(t, key); v != "v" {
+		t.Errorf("the refused swap changed the value to %q", v)
+	}
+}
+
+// ---- naming a divergence ---------------------------------------------------
+//
+// Last on purpose. This is the one test that deliberately leaves the cluster
+// disagreeing, so everything that asserts the replicas agree has already run.
+
+// "They differ somewhere in bucket 7" is where a report used to stop, which
+// on a store of a few hundred keys is a sixteenth of the keyspace to go and
+// read by hand. The check knows which key it is; it just never said.
+//
+// The divergence is the real one: node-limited is configured tighter than its
+// peers, so a value the others accept is one it refuses — a deliberate split
+// that nothing on the wire reports, which is exactly what the consistency
+// check is for.
+func TestAConsistencyReportNamesTheDivergingKey(t *testing.T) {
+	const key = "beyond-graces-limit"
+	// Comfortably over node-limited's ceiling and comfortably under
+	// everyone else's, so precisely one node refuses it.
+	a.put(t, key, strings.Repeat("z", 2<<20))
+
+	// Everyone but node-limited takes it.
+	for _, n := range []node{a, b, c, late, restart} {
+		n := n
+		eventually(t, n.name+" to accept the large value", converge, func() (bool, string) {
+			if _, _, ok := n.get(t, key); ok {
+				return true, ""
+			}
+			return false, n.name + " has not got it yet"
+		})
+	}
+
+	var found peerConsistency
+	eventually(t, "the report to name the key node-limited refused", converge, func() (bool, string) {
+		r := a.consistency(t)
+		if r.Converged {
+			return false, "the cluster still claims to agree"
+		}
+		for _, p := range r.Peers {
+			if !strings.HasPrefix(p.Addr, "node-limited") {
+				continue
+			}
+			if p.Agrees {
+				return false, "node-limited still claims to agree"
+			}
+			if len(p.Differences) == 0 {
+				return false, fmt.Sprintf("node-limited differs in %d bucket(s) but names no key",
+					len(p.DifferingBuckets))
+			}
+			found = p
+			return true, ""
+		}
+		return false, "node-limited is not in the report"
+	})
+
+	var named *keyDifference
+	for i := range found.Differences {
+		if found.Differences[i].Key == key {
+			named = &found.Differences[i]
+		}
+	}
+	if named == nil {
+		t.Fatalf("the report names %d key(s) but not %s: %+v", len(found.Differences), key, found.Differences)
+	}
+	// Present here, absent there — the direction that says a write never
+	// arrived, and the one a walk over the local store alone cannot find.
+	if named.Local == "" {
+		t.Errorf("%s: this node holds the key, so its version should be named", key)
+	}
+	if named.Remote != "" {
+		t.Errorf("%s: node-limited refused the value, so it should be reported absent, got %q",
+			key, named.Remote)
+	}
+
+	// And the status still carries the verdict on its own, for a script that
+	// reads nothing else.
+	code, _, _ := a.do(t, http.MethodGet, "/consistency", "", nil)
+	if code != http.StatusConflict {
+		t.Errorf("GET /consistency over a divergent cluster = %d, want 409", code)
 	}
 }

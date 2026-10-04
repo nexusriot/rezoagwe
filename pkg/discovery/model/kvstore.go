@@ -88,11 +88,20 @@ type Limits struct {
 	MaxKeys int
 }
 
-// ErrTooLarge and ErrTooManyKeys say which limit refused a write; a plain
-// "false" is indistinguishable from a failed compare-and-swap.
+// These say why a write was refused; a plain "false" is indistinguishable from
+// a failed compare-and-swap, which is how a refused write came to be reported
+// to HTTP clients as a 204.
 var (
-	ErrTooLarge    = errors.New("value exceeds the configured size limit")
-	ErrTooManyKeys = errors.New("store is at its configured key limit")
+	ErrTooLarge        = errors.New("value exceeds the configured size limit")
+	ErrTooManyKeys     = errors.New("store is at its configured key limit")
+	ErrVersionMismatch = errors.New("key does not hold the expected version")
+	// ErrUnshippable is not a configured limit but a fact about the protocol:
+	// a value this large cannot be replicated by any path. The datagram
+	// refuses it on size, the stream refuses the frame, and a state sync
+	// builds that same frame — so accepting it would mean storing it here,
+	// reporting success, and leaving it on one replica forever with nothing
+	// able to repair it. Refusing the write is the only honest answer.
+	ErrUnshippable = errors.New("value is too large to replicate to any peer")
 )
 
 // WriteOptions modifies a write. The zero value is an unconditional write with
@@ -149,6 +158,23 @@ func (kv *KVStore) Limits() Limits {
 // admitLocked reports why a value of this size for this key cannot be stored.
 // Callers hold the lock.
 func (kv *KVStore) admitLocked(key, value string, now int64) error {
+	// Measured as the value will be written on the wire, not as it sits in
+	// memory: a blob of bytes that are not valid UTF-8 sextuples when the
+	// encoder replaces each one with U+FFFD, and a raw length check would wave
+	// it through to strand itself.
+	//
+	// The cheap length test first, because the exact one walks the value and
+	// almost every value is nowhere near: nothing shorter than a sixth of the
+	// ceiling can exceed it however badly it escapes.
+	//
+	// EscapedLen counts the surrounding quotes; the ceiling is about the value
+	// itself, so that a run of plain text exactly MaxReplicableValueBytes long
+	// is accepted rather than refused for two characters it did not write.
+	// The reserve covers the quotes.
+	if len(value) > pb.MaxReplicableValueBytes/6 &&
+		pb.EscapedLen(value)-2 > pb.MaxReplicableValueBytes {
+		return ErrUnshippable
+	}
 	if kv.limits.MaxValueBytes > 0 && len(value) > kv.limits.MaxValueBytes {
 		return ErrTooLarge
 	}
@@ -242,13 +268,13 @@ func (kv *KVStore) recordLocked(key string, e kvEntry, local bool) {
 
 // Write records a local set and returns the versioned update to replicate.
 // The bool is false only when a compare-and-swap precondition failed.
-func (kv *KVStore) Write(key, value string, opt WriteOptions) (pb.KVUpdate, bool) {
+func (kv *KVStore) Write(key, value string, opt WriteOptions) (pb.KVUpdate, error) {
 	return kv.mutate(key, value, false, opt)
 }
 
 // Remove records a local tombstone and returns the versioned update to
 // replicate.
-func (kv *KVStore) Remove(key string, opt WriteOptions) (pb.KVUpdate, bool) {
+func (kv *KVStore) Remove(key string, opt WriteOptions) (pb.KVUpdate, error) {
 	return kv.mutate(key, "", true, opt)
 }
 
@@ -264,13 +290,13 @@ func (kv *KVStore) Delete(key string) pb.KVUpdate {
 	return u
 }
 
-func (kv *KVStore) mutate(key, value string, remove bool, opt WriteOptions) (pb.KVUpdate, bool) {
+func (kv *KVStore) mutate(key, value string, remove bool, opt WriteOptions) (pb.KVUpdate, error) {
 	kv.mu.Lock()
 	now := kv.now().Unix()
 	if !remove {
 		if err := kv.admitLocked(key, value, now); err != nil {
 			kv.mu.Unlock()
-			return pb.KVUpdate{}, false
+			return pb.KVUpdate{}, err
 		}
 	}
 	if opt.Expect != nil {
@@ -280,11 +306,11 @@ func (kv *KVStore) mutate(key, value string, remove bool, opt WriteOptions) (pb.
 		if !ok || !cur.visible(now) {
 			if !opt.Expect.Zero() {
 				kv.mu.Unlock()
-				return pb.KVUpdate{}, false
+				return pb.KVUpdate{}, ErrVersionMismatch
 			}
 		} else if !cur.Version.Equal(*opt.Expect) {
 			kv.mu.Unlock()
-			return pb.KVUpdate{}, false
+			return pb.KVUpdate{}, ErrVersionMismatch
 		}
 	}
 	kv.clock++
@@ -313,7 +339,7 @@ func (kv *KVStore) mutate(key, value string, remove bool, opt WriteOptions) (pb.
 		Version:   ver,
 		ExpiresAt: e.ExpiresAt,
 		DeletedAt: e.DeletedAt,
-	}, true
+	}, nil
 }
 
 // Apply merges a remote update under last-write-wins and reports whether it
@@ -569,8 +595,7 @@ func (kv *KVStore) Fingerprint(buckets int) pb.FingerprintReply {
 		} else if e.visible(now) {
 			keys++
 		}
-		nameHash := sha256.Sum256([]byte(k))
-		idx := int(binary.BigEndian.Uint32(nameHash[:4]) % uint32(buckets))
+		idx := bucketOf(k, buckets)
 
 		h := sha256.New()
 		h.Write([]byte(k))
@@ -594,6 +619,47 @@ func (kv *KVStore) Fingerprint(buckets int) pb.FingerprintReply {
 		Clock:      kv.clock,
 		Buckets:    out,
 	}
+}
+
+// bucketOf is which bucket a key name folds into. The one definition, so a
+// digest and a listing can never disagree about where a key lives.
+func bucketOf(key string, buckets int) int {
+	nameHash := sha256.Sum256([]byte(key))
+	return int(binary.BigEndian.Uint32(nameHash[:4]) % uint32(buckets))
+}
+
+// BucketEntries lists what this store holds in the named buckets, sorted by
+// key, tombstones included.
+//
+// This is the second half of a consistency check: the digests say which
+// sixteenth of the keyspace two replicas disagree about, and this says which
+// keys. Bounded by the buckets asked for, so naming the divergence costs a
+// slice of the store rather than all of it — a check that had to ship the
+// whole keyspace to be useful would not be run.
+func (kv *KVStore) BucketEntries(buckets int, want []int) []pb.KeyVersion {
+	if buckets <= 0 {
+		buckets = pb.FingerprintBuckets
+	}
+	if len(want) == 0 {
+		return nil
+	}
+	wanted := make(map[int]bool, len(want))
+	for _, b := range want {
+		wanted[b] = true
+	}
+
+	kv.mu.RLock()
+	out := make([]pb.KeyVersion, 0, 16)
+	for k, e := range kv.store {
+		if !wanted[bucketOf(k, buckets)] {
+			continue
+		}
+		out = append(out, pb.KeyVersion{Key: k, Version: e.Version, Deleted: e.Deleted})
+	}
+	kv.mu.RUnlock()
+
+	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	return out
 }
 
 // History returns the recorded versions of a key, oldest first.

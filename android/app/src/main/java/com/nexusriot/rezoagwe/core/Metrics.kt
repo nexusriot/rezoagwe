@@ -238,6 +238,15 @@ data class SendFailure(
     /** True when the send failed because it ran on Android's main thread — an app bug, not a network one. */
     val onMainThread: Boolean get() = cause == "NetworkOnMainThreadException"
 
+    /**
+     * True when the cause is this node's own payload rather than the network:
+     * a frame too large for a datagram, which the stream path should have
+     * carried and did not. Told apart because the advice is opposite —
+     * nothing about the route is wrong, and checking the peer's address is
+     * time spent looking in the wrong place.
+     */
+    val oversize: Boolean get() = cause == "PacketTooLargeException"
+
     override fun toString(): String =
         if (message.isEmpty()) "$cause to $addr" else "$cause to $addr ($message)"
 }

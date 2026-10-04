@@ -493,16 +493,28 @@ func (bn *Model) PrependChat(history []pb.ChatEntry) {
 	// A snapshot repeats history this node may already hold — a joiner that syncs
 	// from two peers is handed the same conversation twice, and asking one peer
 	// again is enough on its own. Appending it wholesale showed every line as many
-	// times as it had been synced, so merge on the entry itself and put the result
-	// back in time order rather than remote-then-local.
-	seen := make(map[pb.ChatEntry]struct{}, len(bn.chatLog)+len(history))
-	merged := make([]pb.ChatEntry, 0, len(bn.chatLog)+len(history))
-	for _, e := range append(append([]pb.ChatEntry{}, bn.chatLog...), history...) {
-		if _, dup := seen[e]; dup {
-			continue
+	// times as it had been synced, so take only what the snapshot has over what
+	// is already here and put the result back in time order rather than
+	// remote-then-local.
+	//
+	// Counted, not a set. Two identical lines are two things that were said:
+	// nothing in a chat entry distinguishes them, so a set keeps one, and
+	// saying "ok" twice in the same second used to delete one of them on the
+	// next state sync — silently, and from the persisted log.
+	held := make(map[pb.ChatEntry]int, len(bn.chatLog))
+	for _, e := range bn.chatLog {
+		held[e]++
+	}
+	offered := make(map[pb.ChatEntry]int, len(history))
+	for _, e := range history {
+		offered[e]++
+	}
+	merged := append(make([]pb.ChatEntry, 0, len(bn.chatLog)+len(history)), bn.chatLog...)
+	for _, e := range history {
+		if offered[e] > held[e] {
+			merged = append(merged, e)
+			held[e]++
 		}
-		seen[e] = struct{}{}
-		merged = append(merged, e)
 	}
 	if len(merged) == len(bn.chatLog) {
 		bn.chatMu.Unlock()

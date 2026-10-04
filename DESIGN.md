@@ -139,6 +139,17 @@ be accepted again on timestamp grounds anyway.
 Streams (TCP) carry exactly the same frames with a 4-byte length prefix,
 so a payload larger than a datagram needs no separate chunking protocol.
 
+Any frame may travel either way. A transport refuses a payload over
+65507 bytes itself rather than letting the kernel reject it — the errno
+differs per platform, and the caller has to recognise the case — and the
+sender then puts the same frame on a stream, which the receiver
+dispatches exactly as it would a datagram. Without that fallback a value
+too big for a packet was accepted locally and never replicated: every
+gossip tick retried a send that could not succeed, so anti-entropy, whose
+whole job is to repair divergence, was the thing generating it, and the
+cluster stayed split for as long as the key lived with nothing but a
+send-error counter to say so.
+
 ### 3.2 Message kinds
 
 | Kind | Name                 | Purpose                                          |
@@ -155,7 +166,7 @@ so a payload larger than a datagram needs no separate chunking protocol.
 | 9    | `KVBatch`            | several updates in one packet (repair traffic)   |
 | 10   | `DirectMessage`      | chat to one peer only                            |
 | 11   | `Fingerprint`        | "summarise your whole store"                     |
-| 12   | `FingerprintReply`   | bucket digests over the whole keyspace           |
+| 12   | `FingerprintReply`   | bucket digests, and the keys in the buckets asked for |
 | 20   | `BootstrapRegister`  | "I exist at `addr`"                              |
 | 21   | `BootstrapDiscover`  | "who is in the cluster?"                         |
 | 22   | `BootstrapRoster`    | the roster, with nicknames                       |
@@ -338,11 +349,15 @@ by default and its age must exceed the longest partition expected to heal.
 * The TUI is driven headlessly through a `tcell` simulation screen.
 * `make e2e` is the other half of that: the in-process tests cannot see anything
   that goes wrong *between* processes, so a rendezvous, three peers, a late
-  joiner, a leaver, a restarting node and two strangers run as containers on a
+  joiner, a leaver, a restarting node, a node configured tighter than its peers,
+  a node alone in its own cluster, and two strangers run as containers on a
   private network while a Go suite drives them through the HTTP gateway. It
   asserts what only exists between nodes — a write reaching a node it was never
   sent to, a stale compare-and-swap refused everywhere rather than locally, a
-  departure *announced* rather than merely timed out.
+  departure *announced* rather than merely timed out, and a value too large for
+  a datagram arriving whole rather than being retried forever as one. That last
+  is the shape of the failure this level exists for: the store merged it
+  correctly in every in-process test, and the frame never left the process.
 * The Android port carries the Go implementation's own vectors: a frame
   produced by the Go codec is decoded by the Kotlin one, and the derived
   keys are compared against fixed values. A live interop test (opt-in via
@@ -413,6 +428,37 @@ value it holds.
 | `GET`    | `/topology`      | the cluster graph (§12)                            |
 | `GET`    | `/diagnostics`   | health findings; `?format=text` for a report (§13) |
 | `GET`    | `/consistency`   | asks every peer what it holds; `409` if they differ (§14) |
+
+A write the store will not take is refused, not reported as a write. The
+result of `Set` was discarded here once, so a value over `-max-value-bytes`,
+and every key past `-max-keys`, came back `204` with an ETag of the zero
+version: the client was told it had succeeded and had no way to learn
+otherwise. The three cases need different answers, and now get them —
+`413` for a value too large (for this node's limit, or for any node: see
+below), `507` when the store is at its key limit, `412` for a
+compare-and-swap that lost its race.
+
+A request body is bounded at 32 MB and a body over it is refused rather
+than truncated. `io.LimitReader` stops at the limit and reports no error,
+so a `PUT` one byte over used to store the first 32 MB and answer `204` —
+the cluster then replicating a prefix of what the client sent.
+
+### 8.1 The ceiling no setting can raise
+
+`-max-value-bytes` is policy. Above it sits a bound that is not: a value
+whose encoded form will not fit a 64 MB stream frame cannot be replicated
+by *any* path — the datagram refuses it on size, the stream refuses the
+frame, and a state sync builds that same frame. Accepting one means storing
+it here, reporting success, and leaving it on one replica forever with
+nothing able to repair it, so the write is refused instead.
+
+It is measured as the value will be written, not as it sits in memory. A
+byte that is not valid UTF-8 becomes `U+FFFD` — six bytes once escaped —
+so a raw length check would wave a binary blob through to strand itself.
+Each implementation measures against its own encoder, whose escape sets
+differ; what they share is the byte ceiling. All three pin their counter to
+their encoder for every ASCII byte and for thousands of random inputs,
+because a size check that is merely close is a guess.
 
 ---
 
@@ -535,8 +581,9 @@ replicates through them in both directions.
 | State sync       | Pulls from one random peer, so a joiner inherits that peer's gaps  | Pull from several and merge                   |
 | Anti-entropy     | Digest is per-key, so a huge store still costs many rounds even now that each one repairs everything it covers | Merkle tree over key ranges |
 | Persistence      | A `kill -9` can lose up to 250 ms of writes, and the whole store is rewritten per flush | Append-only log + periodic snapshot |
-| Store limits     | `-max-value-bytes` / `-max-keys` refuse a peer's update, which is a deliberate divergence nothing on the wire reports | Advertise limits so peers stop sending |
-| Consistency check | Reports *that* two replicas differ and in which bucket, not which key | A per-bucket key listing on request         |
+| Store limits     | `-max-value-bytes` / `-max-keys` refuse a peer's update, which is a deliberate divergence — now named by the consistency check (§14), but still not advertised, so the peer keeps sending | Advertise limits so peers stop sending |
+| Very large values | The protocol ceiling (§8.1) is what a frame can carry, not what a node can comfortably hold. Measured on a tablet: a store of ~100 MB delayed the gossip loop past the 15 s eviction window, so the phone flapped in and out of the cluster until the large keys were deleted. Nothing warns about this; `-max-value-bytes` is the lever and it is off by default | A size gauge in the diagnostics, and a default value limit |
+| Desktop renderer  | `app:snapshot` ships every value in full to the renderer on every tick, so one 64 MB value made the window unresponsive and a 154 MB state file on disk. The keys list only ever shows a truncated preview | Send previews, fetch a full value on demand |
 | Tombstones       | GC is age-based and off by default                                 | Track cluster-wide acknowledgement            |
 | Chat             | No history beyond the ring, no attachments                         | Paged history                                 |
 | Watch            | Every consumer polls, though the engine knows exactly when a key changed | SSE on `/kv?watch=`                     |
@@ -645,6 +692,22 @@ over **streams, not datagrams**: a dropped answer would read as a peer that
 disagrees, which is exactly the wrong conclusion to draw from packet loss.
 A peer that does not answer is reported as unreachable and counted
 separately — a silent peer says nothing about whether it agrees.
+
+A bucket localises a disagreement to a sixteenth of the keyspace, which on
+a store of a few hundred keys is still a list to read by hand. So a peer
+that disagrees is asked a second time, with `Fingerprint.buckets` naming
+the buckets that differed, and answers with the `(key, version)` pairs it
+holds in them. Diffing those against the local ones turns "bucket 7" into
+the key, both versions, and which side holds a tombstone — including the
+keys only the peer has, which a walk over the local store cannot find and
+which are the ones that mean a write never arrived.
+
+The second round is skipped for peers that agree, bounded to the buckets
+that differed, and capped at 50 named keys per peer: a report is something
+a person reads, and two replicas sharing nothing would otherwise print the
+whole keyspace. A peer too old to understand `buckets` answers with no
+entries and the report falls back to the bucket indices — worse than a key
+name, much better than an error.
 
 `GET /consistency` answers `200` when every peer that replied agreed and
 `409` when any did not, so a script can branch on the status alone. `v` in

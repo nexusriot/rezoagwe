@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,6 +16,7 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	"github.com/nexusriot/rezoagwe/pkg/discovery/diagnostics"
+	"github.com/nexusriot/rezoagwe/pkg/discovery/model"
 	"github.com/nexusriot/rezoagwe/pkg/discovery/node"
 	"github.com/nexusriot/rezoagwe/pkg/discovery/topology"
 	"github.com/nexusriot/rezoagwe/pkg/discovery/view"
@@ -344,15 +346,24 @@ func (c *Controller) delete() *tcell.EventKey {
 
 func (c *Controller) store(key, value string, ttl time.Duration, cas bool, guard *pb.Version) {
 	if !cas {
-		c.node.Set(key, value, ttl)
+		// A refused write used to vanish here: the store said no, the feed
+		// said nothing, and the key simply never appeared.
+		if _, err := c.node.Set(key, value, ttl); err != nil {
+			c.notify("write to %s refused: %s", key, err)
+		}
 		return
 	}
 	expect := pb.Version{}
 	if guard != nil {
 		expect = *guard
 	}
-	if _, ok := c.node.CompareAndSet(key, value, ttl, expect); !ok {
+	_, err := c.node.CompareAndSet(key, value, ttl, expect)
+	switch {
+	case err == nil:
+	case errors.Is(err, model.ErrVersionMismatch):
 		c.notify("guarded write to %s refused: the key changed since the form opened", key)
+	default:
+		c.notify("write to %s refused: %s", key, err)
 	}
 }
 
@@ -568,8 +579,21 @@ func renderConsistency(r node.ConsistencyReport) string {
 			fmt.Fprintf(&b, "  [green]=[-] %s  [darkgray]%d keys, clock %d[-]\n", name, p.Keys, p.Clock)
 		default:
 			fmt.Fprintf(&b, "  [red]≠[-] %s  [darkgray]%d keys, clock %d[-]\n", name, p.Keys, p.Clock)
-			fmt.Fprintf(&b, "      [darkgray]differs in %d of %d key ranges[-]\n",
-				len(p.DifferingBuckets), pb.FingerprintBuckets)
+			if len(p.Differences) == 0 {
+				// No names means the peer could not be asked for them — an
+				// older node, or a second round that failed. The ranges are
+				// all there is to say.
+				fmt.Fprintf(&b, "      [darkgray]differs in %d of %d key ranges[-]\n",
+					len(p.DifferingBuckets), pb.FingerprintBuckets)
+				continue
+			}
+			for _, d := range p.Differences {
+				fmt.Fprintf(&b, "      [white]%s[-]  %s\n",
+					truncate(d.Key, 28), describeDifference(d))
+			}
+			if p.MoreDifferences > 0 {
+				fmt.Fprintf(&b, "      [darkgray]and %d more[-]\n", p.MoreDifferences)
+			}
 		}
 	}
 	if r.Unreachable > 0 {
@@ -581,6 +605,25 @@ func renderConsistency(r node.ConsistencyReport) string {
 			"persists across several checks is the one worth chasing.[-]\n")
 	}
 	return b.String()
+}
+
+// describeDifference says what the two replicas hold, in the terms that decide
+// what to do about it: a key missing on one side is a write that never
+// arrived, two versions is a race anti-entropy will settle, and a tombstone
+// against a value is a delete still travelling.
+func describeDifference(d node.KeyDifference) string {
+	side := func(version string, deleted bool) string {
+		switch {
+		case version == "":
+			return "[red]absent[-]"
+		case deleted:
+			return fmt.Sprintf("[yellow]deleted[-] %s", version)
+		default:
+			return version
+		}
+	}
+	return fmt.Sprintf("[darkgray]here[-] %s  [darkgray]there[-] %s",
+		side(d.Local, d.LocalDeleted), side(d.Remote, d.RemoteDeleted))
 }
 
 // truncate shortens a label to fit a fixed column.

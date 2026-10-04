@@ -13,9 +13,11 @@ import (
 // cannot be sent over UDP anyway.
 const maxDatagram = 65535
 
-// dialTimeout bounds a stream dial so an unreachable peer cannot stall the
+// DialTimeout bounds a stream dial so an unreachable peer cannot stall the
 // caller (state sync runs on a background goroutine, but a joiner waits on it).
-const dialTimeout = 5 * time.Second
+// Exported because it is the cost a caller pays per unreachable peer, which is
+// what the fan-out in broadcast exists to avoid paying N times over.
+const DialTimeout = 5 * time.Second
 
 // UDPTransport sends and receives datagrams on a single shared socket, and
 // accepts reliable streams on the same address over TCP.
@@ -78,6 +80,9 @@ func (t *UDPTransport) Streams() <-chan net.Conn { return t.streams }
 func (t *UDPTransport) StreamsAvailable() bool { return t.listener != nil }
 
 func (t *UDPTransport) Send(addr string, data []byte) error {
+	if len(data) > MaxDatagramPayload {
+		return ErrPacketTooLarge
+	}
 	udpAddr, err := t.resolve(addr)
 	if err != nil {
 		return err
@@ -90,7 +95,7 @@ func (t *UDPTransport) Dial(addr string) (net.Conn, error) {
 	if t.listener == nil {
 		return nil, errors.New("stream transport unavailable")
 	}
-	return net.DialTimeout("tcp", addr, dialTimeout)
+	return net.DialTimeout("tcp", addr, DialTimeout)
 }
 
 func (t *UDPTransport) Close() error {

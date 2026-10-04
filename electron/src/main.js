@@ -6,6 +6,7 @@ const fs = require('node:fs');
 
 const { Runtime } = require('./core/runtime');
 const { healthChecks, asReport } = require('./core/diagnostics');
+const { StoreRefusal } = require('./core/refusal');
 const { version, versionZero } = require('./proto/wire');
 
 let runtime;
@@ -172,13 +173,22 @@ function registerIpc() {
     // A guarded write is a compare-and-swap against the version the form was
     // opened with; a guard on a new key means "only if absent", which is the
     // zero version.
-    if (!guard) {
-      await runtime.engine.set(key, value, ttlSeconds || 0);
-      return { ok: true };
+    //
+    // A store refusal is not the same as a lost swap and must not be reported
+    // as one: "a peer changed it" is the wrong thing to tell someone whose
+    // value was simply too big, and for a while it was not reported at all.
+    try {
+      if (!guard) {
+        await runtime.engine.set(key, value, ttlSeconds || 0);
+        return { ok: true };
+      }
+      const expected = expect && !versionZero(expect) ? expect : version(0, '');
+      const written = await runtime.engine.compareAndSet(key, value, ttlSeconds || 0, expected);
+      return written ? { ok: true } : { ok: false, refused: true };
+    } catch (e) {
+      if (e instanceof StoreRefusal) return { ok: false, rejected: true, reason: e.message };
+      throw e;
     }
-    const expected = expect && !versionZero(expect) ? expect : version(0, '');
-    const written = await runtime.engine.compareAndSet(key, value, ttlSeconds || 0, expected);
-    return written ? { ok: true } : { ok: false, refused: true };
   });
 
   handle('kv:delete', async ({ key, guard, expect }) => {
@@ -202,6 +212,7 @@ function registerIpc() {
     const d = runtime.engine.diagnostics();
     return { diagnostics: d, checks: healthChecks(d, Date.now()), bootstrap: runtime.bootstrap.status() };
   });
+  handle('diag:consistency', () => runtime.engine.checkConsistency());
   handle('diag:copyReport', () => {
     copyReport();
     return { ok: true };

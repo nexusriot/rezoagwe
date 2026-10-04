@@ -14,7 +14,7 @@ func TestConsistencyReportsTwoAgreeingReplicas(t *testing.T) {
 	a, b := newPairedNodes(t, net)
 
 	for i := 0; i < 20; i++ {
-		u := a.Set(fmt.Sprintf("k%02d", i), "v", 0)
+		u, _ := a.Set(fmt.Sprintf("k%02d", i), "v", 0)
 		b.Model.Store.Apply(u)
 	}
 
@@ -37,7 +37,7 @@ func TestConsistencyFindsADivergentReplica(t *testing.T) {
 	a, b := newPairedNodes(t, net)
 
 	for i := 0; i < 20; i++ {
-		u := a.Set(fmt.Sprintf("k%02d", i), "v", 0)
+		u, _ := a.Set(fmt.Sprintf("k%02d", i), "v", 0)
 		b.Model.Store.Apply(u)
 	}
 	// One write that b never sees.
@@ -65,7 +65,7 @@ func TestConsistencyFindsAStaleValue(t *testing.T) {
 	net := transport.NewMemNet(1)
 	a, b := newPairedNodes(t, net)
 
-	u := a.Set("k", "first", 0)
+	u, _ := a.Set("k", "first", 0)
 	b.Model.Store.Apply(u)
 	a.Model.Store.Set("k", "second") // b keeps the old version
 
@@ -84,7 +84,7 @@ func TestConsistencyCountsATombstoneAsDivergence(t *testing.T) {
 	net := transport.NewMemNet(1)
 	a, b := newPairedNodes(t, net)
 
-	u := a.Set("k", "v", 0)
+	u, _ := a.Set("k", "v", 0)
 	b.Model.Store.Apply(u)
 	a.Model.Store.Delete("k")
 
@@ -123,7 +123,11 @@ func TestFingerprintIsOrderIndependent(t *testing.T) {
 	keys := []string{"alpha", "beta", "gamma", "delta", "epsilon"}
 	updates := make([]pb.KVUpdate, 0, len(keys))
 	for _, k := range keys {
-		updates = append(updates, a.Set(k, "v", 0))
+		u, err := a.Set(k, "v", 0)
+		if err != nil {
+			t.Fatalf("set %s: %v", k, err)
+		}
+		updates = append(updates, u)
 	}
 	for i := len(updates) - 1; i >= 0; i-- { // b learns them backwards
 		b.Model.Store.Apply(updates[i])
@@ -146,5 +150,156 @@ func TestEmptyStoresFingerprintIdentically(t *testing.T) {
 	}
 	if len(fa.Buckets) != pb.FingerprintBuckets {
 		t.Fatalf("bucket count = %d", len(fa.Buckets))
+	}
+}
+
+// "They differ somewhere in bucket 7" is where a report used to stop, which on
+// a store of a few hundred keys is a sixteenth of the keyspace to go and read
+// by hand. The check knows which key it is; it just never said.
+func TestAConsistencyReportNamesTheDivergingKey(t *testing.T) {
+	net := transport.NewMemNet(40)
+	a, b := newPairedNodes(t, net)
+
+	for _, k := range []string{"alpha", "beta", "gamma", "delta"} {
+		if _, err := a.Set(k, "shared", 0); err != nil {
+			t.Fatalf("set %s: %v", k, err)
+		}
+	}
+	waitFor(t, "the peer to take the writes", func() bool { return b.Model.Store.Len() == 4 })
+
+	// One key written only on b, behind a partition, so the stores diverge on
+	// exactly one name.
+	net.Partition(a.Addr(), b.Addr(), true)
+	if _, err := b.Set("beta", "only-on-b", 0); err != nil {
+		t.Fatalf("set on b: %v", err)
+	}
+	net.Partition(a.Addr(), b.Addr(), false)
+
+	report := a.CheckConsistency()
+	if report.Converged {
+		t.Fatal("the report claims convergence over a key the two hold differently")
+	}
+	peer := report.Peers[0]
+	if len(peer.Differences) != 1 {
+		t.Fatalf("named %d differences, want exactly 1: %+v", len(peer.Differences), peer.Differences)
+	}
+	d := peer.Differences[0]
+	if d.Key != "beta" {
+		t.Errorf("named %q, want beta", d.Key)
+	}
+	if d.Local == "" || d.Remote == "" || d.Local == d.Remote {
+		t.Errorf("both versions should be present and different: local=%q remote=%q", d.Local, d.Remote)
+	}
+}
+
+// A key one replica has never seen is the divergence that matters most — a
+// write that never arrived — and it cannot be found by walking the local
+// store, which is the direction a naive diff takes.
+func TestAReportNamesAKeyThisNodeHasNeverSeen(t *testing.T) {
+	net := transport.NewMemNet(41)
+	a, b := newPairedNodes(t, net)
+
+	net.Partition(a.Addr(), b.Addr(), true)
+	if _, err := b.Set("orphan", "never-arrived", 0); err != nil {
+		t.Fatalf("set on b: %v", err)
+	}
+	net.Partition(a.Addr(), b.Addr(), false)
+
+	peer := a.CheckConsistency().Peers[0]
+	var found *KeyDifference
+	for i := range peer.Differences {
+		if peer.Differences[i].Key == "orphan" {
+			found = &peer.Differences[i]
+		}
+	}
+	if found == nil {
+		t.Fatalf("a key only the peer holds was not named: %+v", peer.Differences)
+	}
+	if found.Local != "" {
+		t.Errorf("local version = %q, want empty for a key this node never saw", found.Local)
+	}
+	if found.Remote == "" {
+		t.Error("the peer's version should be named")
+	}
+}
+
+// A key deleted on one side and live on the other is a divergence the version
+// alone does not explain, so the report has to say which side holds a
+// tombstone.
+func TestAReportDistinguishesATombstoneFromAValue(t *testing.T) {
+	net := transport.NewMemNet(42)
+	a, b := newPairedNodes(t, net)
+
+	if _, err := a.Set("doomed", "v", 0); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	waitFor(t, "the peer to take the write", func() bool { _, ok := b.Get("doomed"); return ok })
+
+	net.Partition(a.Addr(), b.Addr(), true)
+	if _, err := b.Delete("doomed"); err != nil {
+		t.Fatalf("delete on b: %v", err)
+	}
+	net.Partition(a.Addr(), b.Addr(), false)
+
+	peer := a.CheckConsistency().Peers[0]
+	if len(peer.Differences) != 1 || peer.Differences[0].Key != "doomed" {
+		t.Fatalf("differences = %+v, want just doomed", peer.Differences)
+	}
+	d := peer.Differences[0]
+	if d.LocalDeleted {
+		t.Error("this node holds the value, not a tombstone")
+	}
+	if !d.RemoteDeleted {
+		t.Error("the peer holds a tombstone and the report does not say so")
+	}
+}
+
+// A report is something a person reads. Two replicas sharing nothing must not
+// print the whole keyspace.
+func TestNamedDifferencesAreCapped(t *testing.T) {
+	net := transport.NewMemNet(43)
+	a, b := newPairedNodes(t, net)
+
+	net.Partition(a.Addr(), b.Addr(), true)
+	const keys = MaxReportedDifferences + 25
+	for i := 0; i < keys; i++ {
+		if _, err := b.Set(fmt.Sprintf("k%03d", i), "v", 0); err != nil {
+			t.Fatalf("set: %v", err)
+		}
+	}
+	net.Partition(a.Addr(), b.Addr(), false)
+
+	peer := a.CheckConsistency().Peers[0]
+	if len(peer.Differences) != MaxReportedDifferences {
+		t.Fatalf("named %d keys, want the cap of %d", len(peer.Differences), MaxReportedDifferences)
+	}
+	if peer.MoreDifferences != keys-MaxReportedDifferences {
+		t.Errorf("MoreDifferences = %d, want %d", peer.MoreDifferences, keys-MaxReportedDifferences)
+	}
+	// Capped, but still sorted, so the same run twice names the same keys.
+	for i := 1; i < len(peer.Differences); i++ {
+		if peer.Differences[i-1].Key >= peer.Differences[i].Key {
+			t.Fatalf("differences are not sorted: %q then %q",
+				peer.Differences[i-1].Key, peer.Differences[i].Key)
+		}
+	}
+}
+
+// Agreement still reports nothing to look at: a check that names keys on a
+// healthy cluster is a check nobody trusts.
+func TestAConvergedReportNamesNothing(t *testing.T) {
+	net := transport.NewMemNet(44)
+	a, b := newPairedNodes(t, net)
+	if _, err := a.Set("k", "v", 0); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	waitFor(t, "the peer to take the write", func() bool { _, ok := b.Get("k"); return ok })
+
+	report := a.CheckConsistency()
+	if !report.Converged {
+		t.Fatal("a converged cluster reported as divergent")
+	}
+	if len(report.Peers[0].Differences) != 0 {
+		t.Fatalf("an agreeing peer was given differences: %+v", report.Peers[0].Differences)
 	}
 }

@@ -3,6 +3,8 @@ package node
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -350,12 +352,12 @@ func TestCompareAndSetReplicates(t *testing.T) {
 	net := transport.NewMemNet(11)
 	a, b := newPairedNodes(t, net)
 
-	if _, ok := a.CompareAndSet("lock", "a", 0, pb.Version{}); !ok {
+	if _, err := a.CompareAndSet("lock", "a", 0, pb.Version{}); err != nil {
 		t.Fatal("claiming a free key failed")
 	}
 	waitFor(t, "the claim to replicate", func() bool { _, ok := b.Get("lock"); return ok })
 
-	if _, ok := b.CompareAndSet("lock", "b", 0, pb.Version{}); ok {
+	if _, err := b.CompareAndSet("lock", "b", 0, pb.Version{}); err == nil {
 		t.Fatal("second node claimed a held lock")
 	}
 	if b.Metrics.KVCASFailures.Load() == 0 {
@@ -502,4 +504,145 @@ func mustJSON(t *testing.T, v interface{}) []byte {
 		t.Fatalf("marshal: %v", err)
 	}
 	return data
+}
+
+// A value too big for one datagram still has to reach the peer.
+//
+// Found on a live LAN cluster: a 200 KB write was accepted by the gateway,
+// returned 204, and then never replicated. Every gossip tick retried the same
+// oversized datagram, the kernel refused it with EMSGSIZE, and the node
+// counted a send error — so the one mechanism meant to repair divergence was
+// the mechanism generating it, and the cluster stayed split for as long as the
+// key existed with nothing but a counter to say so.
+func TestOversizedValueReplicatesOverStream(t *testing.T) {
+	net := transport.NewMemNet(21)
+	a, b := newPairedNodes(t, net)
+
+	big := strings.Repeat("x", transport.MaxDatagramPayload+1)
+	a.Set("big", big, 0)
+
+	waitFor(t, "the oversized value to reach the peer", func() bool {
+		v, ok := b.Get("big")
+		return ok && v == big
+	})
+	if a.Metrics.SendErrors.Load() != 0 {
+		t.Fatalf("stream fallback still counted %d send error(s)", a.Metrics.SendErrors.Load())
+	}
+}
+
+// The same write must converge through anti-entropy, not only through the
+// write path: a peer that was down for the write is repaired by the digest
+// round, which pushes entries the same way.
+func TestAntiEntropyRepairsAnOversizedValue(t *testing.T) {
+	net := transport.NewMemNet(22)
+	a, b := newPairedNodes(t, net)
+
+	big := strings.Repeat("y", transport.MaxDatagramPayload+1)
+	// A partition, not packet loss: loss only drops datagrams, and the whole
+	// point of the fix is that this write no longer travels as one.
+	net.Partition(a.Addr(), b.Addr(), true)
+	a.Set("big", big, 0)
+	time.Sleep(20 * time.Millisecond)
+	if _, ok := b.Get("big"); ok {
+		t.Fatal("write arrived across a partition")
+	}
+
+	net.Partition(a.Addr(), b.Addr(), false)
+	a.antiEntropyRound(b.Addr())
+	waitFor(t, "anti-entropy to repair the oversized value", func() bool {
+		v, ok := b.Get("big")
+		return ok && v == big
+	})
+}
+
+// Without a stream there is nowhere else to put it, and the node must say so
+// rather than report the write as sent.
+func TestOversizedValueWithoutAStreamIsASendError(t *testing.T) {
+	net := transport.NewMemNet(23)
+	a := newTestNode(t, net, "10.0.0.1:3137")
+	a.Model.AddPeer("10.0.0.9:3137") // nothing listening: Dial fails
+
+	a.Set("big", strings.Repeat("z", transport.MaxDatagramPayload+1), 0)
+	waitFor(t, "the failed send to be counted", func() bool {
+		return a.Metrics.SendErrors.Load() > 0
+	})
+}
+
+// The stream fallback must not turn one slow peer into N slow peers.
+//
+// A stream send dials, and a dial to a peer that never answers costs the whole
+// timeout. Taken in turn that is one timeout per dead peer: measured at 5s for
+// three of them against a live cluster, where a write that fitted a datagram
+// took 12ms — and it blocks the gossip loop, not only the writer. Fanned out,
+// the wait is one timeout however many peers are dead.
+//
+// Deterministic rather than timing-sensitive: these peers exist on the network
+// but nothing drains their stream channel, so every dial blocks for exactly
+// the transport's dial timeout.
+func TestAnOversizedBroadcastDoesNotSerialiseDeadPeers(t *testing.T) {
+	if testing.Short() {
+		t.Skip("waits out a dial timeout")
+	}
+	net := transport.NewMemNet(24)
+	a := newTestNode(t, net, "10.0.0.1:3137")
+
+	const stalled = 8
+	for i := 0; i < stalled; i++ {
+		addr := fmt.Sprintf("10.0.0.%d:3137", 100+i)
+		net.Node(addr) // attached, but no Node behind it to accept streams
+		a.Model.AddPeer(addr)
+	}
+
+	start := time.Now()
+	a.Set("big", strings.Repeat("x", transport.MaxDatagramPayload+1), 0)
+	elapsed := time.Since(start)
+
+	// One timeout, not eight. The bound is deliberately loose — the point is
+	// the difference between 1x and 8x, not the constant — but the gap is
+	// wide: taken in turn this is eighty seconds, overlapped it is ten.
+	if elapsed > 2*streamTimeout {
+		t.Fatalf("broadcast took %s for %d stalled peers, about %.0fx one timeout; the dials did not overlap",
+			elapsed, stalled, elapsed.Seconds()/streamTimeout.Seconds())
+	}
+	if a.Metrics.SendErrors.Load() < stalled {
+		t.Fatalf("send errors = %d, want at least %d: every peer should have been attempted",
+			a.Metrics.SendErrors.Load(), stalled)
+	}
+}
+
+// No stream path may go back to a deadline that ignores what it carries.
+//
+// The rule is mechanical, so it is checked mechanically: a bare
+// conn.SetDeadline before a frame read or write is the bug this suite exists
+// to keep out, and it reads as perfectly ordinary code.
+func TestNoStreamPathUsesAFixedDeadline(t *testing.T) {
+	roots := []string{".", "../../bootstrap/server", "../../transport"}
+	var offences []string
+	for _, root := range roots {
+		files, err := filepath.Glob(filepath.Join(root, "*.go"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, f := range files {
+			if strings.HasSuffix(f, "_test.go") {
+				continue
+			}
+			src, err := os.ReadFile(f)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i, line := range strings.Split(string(src), "\n") {
+				// transport.go defines the scaled helpers, which legitimately
+				// call SetReadDeadline/SetWriteDeadline themselves.
+				if strings.Contains(line, "conn.SetDeadline(") {
+					offences = append(offences, fmt.Sprintf("%s:%d: %s", f, i+1, strings.TrimSpace(line)))
+				}
+			}
+		}
+	}
+	if len(offences) > 0 {
+		t.Fatalf("these bound a whole transfer by a constant, so a large frame fails halfway — "+
+			"use transport.WriteFrameTo / transport.ReadFrameFrom:\n  %s",
+			strings.Join(offences, "\n  "))
+	}
 }

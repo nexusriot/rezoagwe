@@ -10,6 +10,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"time"
 )
 
 // Packet is one datagram as observed by the receiver. From is the source
@@ -27,7 +28,9 @@ type Packet struct {
 // payloads that do not fit a datagram (state sync, bootstrap rosters).
 type Transport interface {
 	// Send delivers a datagram. A nil error means "handed to the network",
-	// never "delivered".
+	// never "delivered". A payload larger than MaxDatagramPayload is refused
+	// with ErrPacketTooLarge, which asks the caller for a stream rather than
+	// reporting a network failure.
 	Send(addr string, data []byte) error
 	// Packets yields inbound datagrams until the transport is closed.
 	Packets() <-chan Packet
@@ -49,7 +52,21 @@ type Transport interface {
 // prefix cannot make a node allocate unbounded memory.
 const MaxFrameSize = 64 << 20
 
+// MaxDatagramPayload is the largest payload a datagram can carry: 65535 less
+// the 8-byte UDP and 20-byte IPv4 headers.
+//
+// Send checks this itself rather than letting the kernel reject the write,
+// because the kernel's refusal is a platform-specific errno (EMSGSIZE on Unix,
+// WSAEMSGSIZE on Windows) that the caller cannot portably recognise — and the
+// caller has to recognise it, since the right answer is to put the same frame
+// on a stream, not to count a send error and drop the update.
+const MaxDatagramPayload = 65507
+
 var ErrFrameTooLarge = errors.New("frame exceeds maximum size")
+
+// ErrPacketTooLarge reports a payload no datagram can carry. It means "use a
+// stream", not "the network failed".
+var ErrPacketTooLarge = errors.New("packet exceeds maximum datagram payload")
 
 // WriteFrame writes a length-prefixed frame. Streams carry the same
 // authenticated frames as datagrams; only the length prefix is added, so a
@@ -65,6 +82,70 @@ func WriteFrame(w io.Writer, data []byte) error {
 	}
 	_, err := w.Write(data)
 	return err
+}
+
+// MinStreamThroughput is the slowest link a stream deadline assumes, in bytes
+// per second. Deliberately pessimistic: well under a weak Wi-Fi link, so the
+// allowance is generous rather than a second guess at the network.
+const MinStreamThroughput = 1 << 20
+
+// StreamDeadline is how long one stream operation gets for a payload of n
+// bytes: a fixed base, plus an allowance at MinStreamThroughput.
+//
+// A fixed timeout is a throughput assumption in disguise. Ten seconds is
+// generous for a digest and impossible for a value of tens of megabytes, so
+// the replication ceiling promised something the deadline then refused: the
+// frame went out, the clock ran out mid-transfer, and the entry never
+// replicated — with nothing but a stream-error counter to show for it.
+// Measured on a Wi-Fi LAN, 30 MB to a tablet moved inside the fixed window
+// and 64 MB did not.
+//
+// Go is the only implementation that needed this. A Node socket timeout and a
+// Java SO_TIMEOUT both measure inactivity and reset as bytes move; only
+// SetDeadline bounds the whole transfer, which is the one meaning that gets
+// shorter as the payload grows.
+func StreamDeadline(base time.Duration, n int) time.Duration {
+	if n <= 0 {
+		return base
+	}
+	return base + time.Duration(n/MinStreamThroughput)*time.Second
+}
+
+// ReadFrameFrom reads one frame, extending the connection's deadline once the
+// length prefix says how much is coming.
+//
+// A deadline set before the size is known is a guess: a state sync carrying a
+// large store outgrows it and fails halfway, and the half that arrived is
+// indistinguishable from a peer that never answered.
+func ReadFrameFrom(conn net.Conn, base time.Duration) ([]byte, error) {
+	if err := conn.SetReadDeadline(time.Now().Add(base)); err != nil {
+		return nil, err
+	}
+	var hdr [4]byte
+	if _, err := io.ReadFull(conn, hdr[:]); err != nil {
+		return nil, err
+	}
+	n := binary.BigEndian.Uint32(hdr[:])
+	if n > MaxFrameSize {
+		return nil, ErrFrameTooLarge
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(StreamDeadline(base, int(n)))); err != nil {
+		return nil, err
+	}
+	buf := make([]byte, n)
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return nil, err
+	}
+	return buf, nil
+}
+
+// WriteFrameTo writes one frame, giving the connection a deadline in
+// proportion to what it carries.
+func WriteFrameTo(conn net.Conn, base time.Duration, data []byte) error {
+	if err := conn.SetWriteDeadline(time.Now().Add(StreamDeadline(base, len(data)))); err != nil {
+		return err
+	}
+	return WriteFrame(conn, data)
 }
 
 // ReadFrame reads one length-prefixed frame.
