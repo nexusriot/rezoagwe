@@ -315,3 +315,38 @@ test('the renderer and the protocol agree on how many buckets there are', () => 
   const W = require('../src/proto/wire');
   assert.equal(S.FINGERPRINT_BUCKETS, W.FINGERPRINT_BUCKETS);
 });
+
+/**
+ * A node whose store limits are turning peers away is the one node in a cluster
+ * that cannot gossip its way back to agreement, and it used to be the one
+ * reporting "Node looks healthy": the refusals were counted as stale
+ * rejections, which no rule looks at because staleness is normal.
+ */
+test('refused remote updates are an error, not a healthy node', () => {
+  const d = baseDiagnostics();
+  d.metrics.kvRefused = 189;
+
+  const checks = healthChecks(d, Date.now());
+  assert.notEqual(checks[0].severity, Severity.OK, 'a node refusing remote updates reported as healthy');
+
+  const found = checks.find((c) => c.title.includes('refused'));
+  assert.ok(found, `no check named the refusals: ${JSON.stringify(checks)}`);
+  assert.equal(found.severity, Severity.ERROR);
+  assert.ok(found.title.includes('189'), found.title);
+  // The point of the check is that waiting does not fix it.
+  for (const want of ['not stale', 'divergent']) {
+    assert.ok(found.detail.includes(want), `detail does not mention ${want}: ${found.detail}`);
+  }
+});
+
+/**
+ * Stale rejections stay unremarkable: they are last-write-wins working, and a
+ * rule that fired on them would cry wolf on every healthy cluster.
+ */
+test('stale rejections alone are not a finding', () => {
+  const d = baseDiagnostics();
+  d.metrics.kvRejectedStale = 5000;
+
+  const checks = healthChecks(d, Date.now());
+  assert.equal(checks[0].severity, Severity.OK, JSON.stringify(checks));
+});

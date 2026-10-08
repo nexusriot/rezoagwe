@@ -13,6 +13,7 @@ import com.nexusriot.rezoagwe.core.asReport
 import com.nexusriot.rezoagwe.core.healthChecks
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -286,4 +287,36 @@ class DiagnosticsTest {
         assertTrue(checks.first { it.title.contains("No stream listener") }.detail.contains("oversized frame"))
     }
 
+
+    /**
+     * A node whose store limits are turning peers away is the one node in a
+     * cluster that cannot gossip its way back to agreement, and it used to be
+     * the one reporting "Node looks healthy": the refusals were counted as
+     * stale rejections, which no rule looks at because staleness is normal.
+     */
+    @Test
+    fun refusedRemoteUpdatesAreAnError() {
+        val d = healthy().copy(metrics = MetricsSnapshot(kvRefused = 189))
+        val checks = healthChecks(d, now)
+        val found = checks.firstOrNull { it.title.contains("refused") }
+        assertNotNull("no check named the refusals: $checks", found)
+        assertEquals(Severity.ERROR, found!!.severity)
+        assertTrue(found.title.contains("189"))
+        assertTrue("waiting does not fix it", found.detail.contains("not stale"))
+        assertTrue(found.detail.contains("divergent"))
+    }
+
+    /**
+     * Stale rejections stay unremarkable: they are last-write-wins working,
+     * and a rule that fired on them would cry wolf on every healthy cluster.
+     */
+    @Test
+    fun staleRejectionsAreNotAFinding() {
+        val d = healthy().copy(metrics = MetricsSnapshot(kvRejectedStale = 5_000))
+        val checks = healthChecks(d, now)
+        assertTrue(
+            "stale rejections alone made the node unhealthy: $checks",
+            checks.none { it.severity == Severity.ERROR || it.severity == Severity.WARN },
+        )
+    }
 }

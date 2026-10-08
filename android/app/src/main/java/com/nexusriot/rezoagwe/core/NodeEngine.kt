@@ -694,12 +694,27 @@ class NodeEngine(
      * is invisible without the activity feed, which is when replication bugs hide.
      */
     private fun applyRemote(u: KVUpdate): Boolean {
-        if (store.apply(u)) {
+        val outcome = store.applyWithReason(u)
+        if (outcome.applied) {
             metrics.kvApplied.incrementAndGet()
             val who = writerName(u.version.node)
             if (u.deleted) logActivity("$who deleted ${u.key} (v${u.version.counter})")
             else logActivity("$who set ${u.key} = ${preview(u.value)} (v${u.version.counter})")
             return true
+        }
+        // "Stale" and "refused" are not the same event and must not share a
+        // counter. A node at its key limit used to narrate every entry it
+        // would never hold as "ignored stale", for keys it had never seen,
+        // while its diagnostics reported it healthy — the one node that could
+        // not converge was the one claiming nothing was wrong.
+        val refusal = outcome.refusal
+        if (refusal != null) {
+            metrics.kvRefused.incrementAndGet()
+            logActivity(
+                "refused ${u.action} for ${u.key} (v${u.version.counter} from " +
+                    "${writerName(u.version.node)}): ${refusal.explain()}"
+            )
+            return false
         }
         metrics.kvRejectedStale.incrementAndGet()
         logActivity("ignored stale ${u.action} for ${u.key} (v${u.version.counter} from ${writerName(u.version.node)})")
@@ -746,9 +761,14 @@ class NodeEngine(
         metrics.stateSyncIn.incrementAndGet()
         var changed = false
         for (u in resp.kv) {
-            if (store.apply(u)) {
-                metrics.kvApplied.incrementAndGet()
-                changed = true
+            val outcome = store.applyWithReason(u)
+            when {
+                outcome.applied -> {
+                    metrics.kvApplied.incrementAndGet()
+                    changed = true
+                }
+                outcome.refusal != null -> metrics.kvRefused.incrementAndGet()
+                else -> metrics.kvRejectedStale.incrementAndGet()
             }
         }
         if (resp.chat.isNotEmpty()) {

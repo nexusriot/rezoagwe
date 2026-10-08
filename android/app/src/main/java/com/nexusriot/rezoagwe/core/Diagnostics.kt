@@ -124,6 +124,22 @@ fun healthChecks(d: NodeDiagnostics, nowMs: Long): List<HealthCheck> {
         )
     }
 
+    if (m.kvRefused > 0) {
+        // The only condition here that no amount of gossip repairs: a peer
+        // holds entries this store has declined, so the two stay divergent
+        // until a limit moves. The anti-entropy sweep will offer the same
+        // entries every ten seconds for as long as the node runs.
+        checks += HealthCheck(
+            Severity.ERROR,
+            "${m.kvRefused} remote update(s) refused by this node's limits",
+            "This node refused remote updates its store would not hold — a value over the " +
+                "configured value limit, a key past the key limit, or an entry too large to " +
+                "replicate at all. They are not stale and will not arrive later: the peers that " +
+                "hold them stay divergent from this node until a limit is raised or keys are " +
+                "freed. Verify replicas names the buckets that differ.",
+        )
+    }
+
     if (m.replayDrops > 0) {
         checks += HealthCheck(
             Severity.INFO,
@@ -325,6 +341,7 @@ fun NodeDiagnostics.asReport(nowMs: Long): String = buildString {
     appendLine("store           ${store.keys} keys, ${store.tombstones} tombstones, ${store.valueBytes} value bytes, clock ${store.clock}")
     appendLine("traffic         ${metrics.packetsSent} sent / ${metrics.packetsReceived} received, ${metrics.bytesSent}B / ${metrics.bytesReceived}B")
     appendLine("drops           auth ${metrics.authFailures}, replay ${metrics.replayDrops}, skew ${metrics.skewDrops}, malformed ${metrics.malformedDrops}")
+    appendLine("replication     ${metrics.kvApplied} applied, ${metrics.kvRejectedStale} stale, ${metrics.kvRefused} refused by limits")
     appendLine("anti-entropy    ${metrics.aeRounds} rounds, ${metrics.aePushed} pushed, ${metrics.aePulled} pulled")
     appendLine()
     appendLine("peers (${peers.size})")

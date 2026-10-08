@@ -676,6 +676,7 @@ screens.activity = () => {
             metric('local writes', m.kvLocalWrites),
             metric('remote applied', m.kvApplied),
             metric('stale rejected', m.kvRejectedStale),
+            metric('refused by limits', m.kvRefused),
             metric('guarded writes refused', m.kvCasFailures),
             metric('expired', m.kvExpired),
             metric('tombstones reclaimed', m.kvGced)),

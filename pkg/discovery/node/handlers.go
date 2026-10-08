@@ -137,7 +137,8 @@ func (n *Node) unmarshal(body []byte, v interface{}) bool {
 // resolved — but it is invisible without the activity feed, which is exactly
 // when replication bugs hide.
 func (n *Node) applyRemote(u pb.KVUpdate) bool {
-	if n.Model.Store.Apply(u) {
+	applied, refused := n.Model.Store.ApplyWithReason(u)
+	if applied {
 		n.Metrics.KVApplied.Add(1)
 		who := n.Model.WriterName(u.Version.Node)
 		if u.Action == pb.KVDelete {
@@ -146,6 +147,17 @@ func (n *Node) applyRemote(u pb.KVUpdate) bool {
 			n.logActivity("%s set %s = %s (v%d)", who, u.Key, preview(u.Value), u.Version.Counter)
 		}
 		return true
+	}
+	// "Stale" and "refused" are not the same event and must not share a
+	// counter. A node at its key limit used to narrate every entry it would
+	// never hold as "ignored stale", for keys it had never seen, while its
+	// diagnostics reported it healthy — the one node in the cluster that could
+	// not converge was the one claiming nothing was wrong.
+	if refused != nil {
+		n.Metrics.KVRefused.Add(1)
+		n.logActivity("refused %s for %s (v%d from %s): %s",
+			u.Action, u.Key, u.Version.Counter, n.Model.WriterName(u.Version.Node), refused)
+		return false
 	}
 	n.Metrics.KVRejectedStale.Add(1)
 	n.logActivity("ignored stale %s for %s (v%d from %s)",
@@ -253,9 +265,15 @@ func (n *Node) mergeState(resp pb.StateResponse) {
 	n.Metrics.StateSyncIn.Add(1)
 	changed := false
 	for _, u := range resp.KV {
-		if n.Model.Store.Apply(u) {
+		applied, refused := n.Model.Store.ApplyWithReason(u)
+		switch {
+		case applied:
 			n.Metrics.KVApplied.Add(1)
 			changed = true
+		case refused != nil:
+			n.Metrics.KVRefused.Add(1)
+		default:
+			n.Metrics.KVRejectedStale.Add(1)
 		}
 	}
 	if len(resp.Chat) > 0 {

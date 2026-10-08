@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 // The graph is assembled from peer lists that only exist because gossip
@@ -344,4 +345,56 @@ func TestAConsistencyReportNamesTheDivergingKey(t *testing.T) {
 	if code != http.StatusConflict {
 		t.Errorf("GET /consistency over a divergent cluster = %d, want 409", code)
 	}
+}
+
+// A replica that will not hold what a peer sends it has to say so.
+//
+// node-limited sits in the real cluster with a value ceiling, so a large
+// enough write from node-a is one every other replica keeps and it refuses.
+// That refusal used to be counted as a stale rejection and narrated as
+// "ignored stale set for <key>" — for a key it had never held — which left the
+// one node in the cluster that could never converge reporting itself healthy.
+// Only a second process can produce this: a refusal arrives over the wire, and
+// the local write path reports it to its caller instead.
+func TestARefusedReplicationIsNotReportedAsStaleness(t *testing.T) {
+	staleBefore := limited.metric(t, `rezoagwe_kv_rejected_stale_total`)
+	refusedBefore := limited.metric(t, `rezoagwe_kv_refused_total`)
+
+	// Comfortably past node-limited's -max-value-bytes, and comfortably under
+	// the gateway's body cap, so only the replica's own limit refuses it.
+	key := "refused-by-the-limited-replica"
+	a.put(t, key, strings.Repeat("x", 1_200_000))
+
+	eventually(t, "node-limited counts the refusal", 30*time.Second, func() (bool, string) {
+		got := limited.metric(t, `rezoagwe_kv_refused_total`)
+		return got > refusedBefore, fmt.Sprintf("kv_refused_total = %v, want > %v", got, refusedBefore)
+	})
+
+	// And it did not land in the counter that means "last-write-wins resolved
+	// a conflict", which is the counter nothing ever alerts on.
+	if got := limited.metric(t, `rezoagwe_kv_rejected_stale_total`); got != staleBefore {
+		t.Fatalf("kv_rejected_stale_total moved from %v to %v: a refusal was counted as staleness",
+			staleBefore, got)
+	}
+
+	// The whole point is that the node now says it is in trouble.
+	eventually(t, "the diagnostics name the refusals", 20*time.Second, func() (bool, string) {
+		d := limited.diagnostics(t)
+		for _, c := range d.Checks {
+			if strings.Contains(c.Title, "refused") {
+				if c.Severity != "error" {
+					return false, fmt.Sprintf("severity = %q, want error", c.Severity)
+				}
+				if !strings.Contains(c.Detail, "not stale") {
+					return false, fmt.Sprintf("detail does not say waiting will not fix it: %q", c.Detail)
+				}
+				return true, ""
+			}
+		}
+		return false, fmt.Sprintf("no check mentions the refusals: %+v", d.Checks)
+	})
+
+	// The peers that did take it stay divergent from this one, which is what
+	// the error is warning about.
+	valueEverywhere(t, []node{a, b}, key, strings.Repeat("x", 1_200_000), 30*time.Second)
 }

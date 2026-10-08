@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/textproto"
 	"strconv"
 	"strings"
 	"time"
@@ -214,6 +215,26 @@ func parseVersion(s string) (pb.Version, error) {
 	return pb.Version{Counter: c, Node: node}, nil
 }
 
+// condition reads a conditional header, reporting whether the client sent it
+// at all.
+//
+// http.Header.Get cannot tell "no If-Match" from "If-Match:" with an empty
+// value, and the two mean opposite things here: no header is an unconditional
+// write, while an empty value is a condition — parseVersion reads it as the
+// zero version, i.e. "the key must not exist". Testing the value for
+// emptiness, as this used to, silently turned the second into the first, so a
+// client that built its header from the ETag of a key that did not exist yet
+// got an unconditional overwrite from the one request it wrote specifically to
+// avoid one. A malformed If-Match is already refused with 400; an empty one
+// has to fail closed too, not open.
+func condition(r *http.Request, name string) (string, bool) {
+	values, ok := r.Header[textproto.CanonicalMIMEHeaderKey(name)]
+	if !ok || len(values) == 0 {
+		return "", false
+	}
+	return values[0], true
+}
+
 // etagMatches implements the If-None-Match list form, including "*".
 //
 // Quotes are trimmed from both sides. If-Match on this same gateway goes
@@ -351,7 +372,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 
 	// If-Match turns the write into a compare-and-swap. Without it the write is
 	// unconditional, which is the behaviour a plain PUT should have.
-	if match := r.Header.Get("If-Match"); match != "" {
+	if match, sent := condition(r, "If-Match"); sent {
 		expect, err := parseVersion(match)
 		if err != nil {
 			writeErr(w, http.StatusBadRequest, "%s", err)
@@ -402,7 +423,7 @@ func writeRefusal(w http.ResponseWriter, key string, err error) {
 
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
-	if match := r.Header.Get("If-Match"); match != "" {
+	if match, sent := condition(r, "If-Match"); sent {
 		expect, err := parseVersion(match)
 		if err != nil {
 			writeErr(w, http.StatusBadRequest, "%s", err)
@@ -481,7 +502,16 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 	}
 	// mode=seed re-stamps every entry as a local write so it outranks whatever
 	// the cluster holds; the default merges by version.
-	seed := r.URL.Query().Get("mode") == "seed"
+	//
+	// An unrecognised mode is refused rather than quietly read as "merge": the
+	// two modes differ by whether the file overwrites the whole cluster, so a
+	// typo ("mode=SEED") used to answer 200 for a restore that never happened.
+	mode := r.URL.Query().Get("mode")
+	if mode != "" && mode != "merge" && mode != "seed" {
+		writeErr(w, http.StatusBadRequest, "unknown import mode %q: want \"merge\" or \"seed\"", mode)
+		return
+	}
+	seed := mode == "seed"
 	applied, err := s.node.Import(data, seed)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "import: %s", err)

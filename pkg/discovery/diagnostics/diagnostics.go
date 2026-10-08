@@ -103,6 +103,23 @@ func Checks(d Snapshot, now time.Time) []Check {
 			"Authenticated frames whose body did not parse. Usually a peer running an older or newer "+
 				"protocol version.")
 	}
+	if m.KVRefused > 0 {
+		// The only condition here that this node can never gossip its way out
+		// of: a peer holds entries this store has declined to accept, so the
+		// two stay divergent until a limit moves. It outranks the packet-level
+		// checks precisely because nothing retries its way past it — the
+		// anti-entropy sweep will offer the same entries every ten seconds for
+		// as long as the node runs.
+		detail := "This node refused remote updates its store would not hold — a value over " +
+			"-max-value-bytes, a key past -max-keys, or an entry too large to replicate at all. " +
+			"They are not stale and will not arrive later: the peers that hold them stay " +
+			"divergent from this node until a limit is raised or keys are freed. " +
+			"GET /consistency names the buckets that differ."
+		if d.Gauges.Keys > 0 {
+			detail += fmt.Sprintf(" This store currently holds %d key(s).", d.Gauges.Keys)
+		}
+		add(SeverityError, fmt.Sprintf("%d remote update(s) refused by this node's limits", m.KVRefused), detail)
+	}
 	if m.ReplayDrops > 0 {
 		add(SeverityInfo, fmt.Sprintf("%d replayed packet(s) ignored", m.ReplayDrops),
 			"The same nonce arrived twice. Duplicated datagrams are normal on a lossy network; a "+

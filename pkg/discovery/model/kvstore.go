@@ -346,6 +346,22 @@ func (kv *KVStore) mutate(key, value string, remove bool, opt WriteOptions) (pb.
 // changed local state. The Lamport clock is advanced past any counter seen so
 // this node's later writes sort after it.
 func (kv *KVStore) Apply(u pb.KVUpdate) bool {
+	applied, _ := kv.ApplyWithReason(u)
+	return applied
+}
+
+// ApplyWithReason is Apply, and additionally says why an update did not land.
+//
+// A bare bool collapses two outcomes that need opposite responses. "Not
+// newer" is the ordinary result of last-write-wins and means the cluster is
+// working; a refusal from admitLocked means this node will not hold the entry
+// at all, so it can never converge with the peer that sent it and an operator
+// has to raise a limit or free a key. Callers that reported both as "stale"
+// counted a store at its limit as healthy, which is the one state where the
+// counters most need to say otherwise.
+//
+// A nil error with applied=false is the genuinely-stale case.
+func (kv *KVStore) ApplyWithReason(u pb.KVUpdate) (bool, error) {
 	kv.mu.Lock()
 	if u.Version.Counter > kv.clock {
 		kv.clock = u.Version.Counter
@@ -353,12 +369,12 @@ func (kv *KVStore) Apply(u pb.KVUpdate) bool {
 	if u.Action != pb.KVDelete {
 		if err := kv.admitLocked(u.Key, u.Value, kv.now().Unix()); err != nil {
 			kv.mu.Unlock()
-			return false
+			return false, err
 		}
 	}
 	if cur, ok := kv.store[u.Key]; ok && !u.Version.Newer(cur.Version) {
 		kv.mu.Unlock()
-		return false
+		return false, nil
 	}
 	e := kvEntry{
 		Value:     u.Value,
@@ -377,7 +393,7 @@ func (kv *KVStore) Apply(u pb.KVUpdate) bool {
 	if cb != nil {
 		cb()
 	}
-	return true
+	return true, nil
 }
 
 func (kv *KVStore) Get(key string) (string, bool) {

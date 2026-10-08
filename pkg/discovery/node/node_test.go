@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nexusriot/rezoagwe/pkg/discovery/model"
 	pb "github.com/nexusriot/rezoagwe/pkg/proto"
 	"github.com/nexusriot/rezoagwe/pkg/transport"
 )
@@ -644,5 +645,60 @@ func TestNoStreamPathUsesAFixedDeadline(t *testing.T) {
 		t.Fatalf("these bound a whole transfer by a constant, so a large frame fails halfway — "+
 			"use transport.WriteFrameTo / transport.ReadFrameFrom:\n  %s",
 			strings.Join(offences, "\n  "))
+	}
+}
+
+// A node whose limits turn a peer's entries away has to say so. It used to
+// count them as stale rejections and narrate "ignored stale set for <key>" for
+// keys it had never held — which reads as last-write-wins doing its job on a
+// node that is in fact permanently divergent.
+func TestARefusedRemoteWriteIsNotCountedAsStale(t *testing.T) {
+	net := transport.NewMemNet(1)
+	n, err := New(Config{
+		NodeAddr:          "10.0.0.1:3137",
+		Nick:              "limited",
+		Transport:         net.Node("10.0.0.1:3137"),
+		Limits:            model.Limits{MaxValueBytes: 8},
+		GossipInterval:    idleInterval,
+		HeartbeatInterval: idleInterval,
+		EvictThreshold:    idleInterval,
+		SweepInterval:     idleInterval,
+	}, nil)
+	if err != nil {
+		t.Fatalf("new node: %v", err)
+	}
+	n.Start()
+	t.Cleanup(n.Stop)
+
+	n.applyRemote(pb.KVUpdate{
+		Action: pb.KVSet, Key: "big", Value: "far too long for this store",
+		Version: pb.Version{Counter: 7, Node: "peer"},
+	})
+
+	if got := n.Metrics.KVRefused.Load(); got != 1 {
+		t.Fatalf("KVRefused = %d, want 1", got)
+	}
+	if got := n.Metrics.KVRejectedStale.Load(); got != 0 {
+		t.Fatalf("KVRejectedStale = %d, want 0 — a refusal is not staleness", got)
+	}
+
+	activity := strings.Join(n.Activity(), "\n")
+	if !strings.Contains(activity, "refused") {
+		t.Fatalf("activity never said the write was refused:\n%s", activity)
+	}
+	if strings.Contains(activity, "stale") {
+		t.Fatalf("activity called a refusal stale:\n%s", activity)
+	}
+
+	// And a genuinely stale update still lands in the other counter.
+	n.applyRemote(pb.KVUpdate{Action: pb.KVSet, Key: "k", Value: "v",
+		Version: pb.Version{Counter: 9, Node: "peer"}})
+	n.applyRemote(pb.KVUpdate{Action: pb.KVSet, Key: "k", Value: "old",
+		Version: pb.Version{Counter: 2, Node: "peer"}})
+	if got := n.Metrics.KVRejectedStale.Load(); got != 1 {
+		t.Fatalf("KVRejectedStale = %d, want 1 after a genuinely stale update", got)
+	}
+	if got := n.Metrics.KVRefused.Load(); got != 1 {
+		t.Fatalf("KVRefused = %d, want 1 — a stale update is not a refusal", got)
 	}
 }

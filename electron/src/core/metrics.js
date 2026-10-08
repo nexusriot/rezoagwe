@@ -26,6 +26,11 @@ class Metrics {
 
     this.kvApplied = 0;
     this.kvRejectedStale = 0;
+    // Remote updates this node declined to store at all. Kept apart from
+    // kvRejectedStale because they mean opposite things: a stale rejection is
+    // last-write-wins working, a refusal is a replica that cannot converge
+    // until a limit moves.
+    this.kvRefused = 0;
     this.kvLocalWrites = 0;
     this.kvCasFailures = 0;
     this.kvExpired = 0;
@@ -160,6 +165,7 @@ class Metrics {
       malformedDrops: this.malformedDrops,
       kvApplied: this.kvApplied,
       kvRejectedStale: this.kvRejectedStale,
+      kvRefused: this.kvRefused,
       kvLocalWrites: this.kvLocalWrites,
       kvCasFailures: this.kvCasFailures,
       kvExpired: this.kvExpired,
@@ -194,6 +200,7 @@ class Metrics {
     counter('malformed_drops_total', 'Packets dropped as unparseable.', s.malformedDrops);
     counter('kv_applied_total', 'Remote updates merged into the store.', s.kvApplied);
     counter('kv_rejected_stale_total', 'Remote updates rejected as not newer.', s.kvRejectedStale);
+    counter('kv_refused_total', "Remote updates refused by this node's store limits.", s.kvRefused);
     counter('kv_local_writes_total', 'Local writes and deletes.', s.kvLocalWrites);
     counter('kv_cas_failures_total', 'Compare-and-swap writes rejected.', s.kvCasFailures);
     counter('kv_expired_total', 'Keys tombstoned by TTL expiry.', s.kvExpired);

@@ -332,3 +332,52 @@ func TestAnOrdinarySendErrorStillBlamesTheNetwork(t *testing.T) {
 		t.Errorf("an ordinary failure was described as oversized:\n%s", c.Detail)
 	}
 }
+
+// A node whose store limits are turning peers away is the one node in a
+// cluster that cannot gossip its way back to agreement, and it used to be the
+// one reporting "Node looks healthy": the refusals were counted as stale
+// rejections, which no rule looks at because staleness is normal.
+func TestRefusedRemoteUpdatesAreAnError(t *testing.T) {
+	d := healthy()
+	d.Metrics.KVRefused = 189
+	d.Gauges.Keys = 10
+
+	checks := Checks(d, now)
+	if checks[0].Severity == SeverityOK {
+		t.Fatalf("a node refusing remote updates reported as healthy: %+v", checks[0])
+	}
+	var found *Check
+	for i := range checks {
+		if strings.Contains(checks[i].Title, "refused") {
+			found = &checks[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("no check named the refusals: %+v", checks)
+	}
+	if found.Severity != SeverityError {
+		t.Fatalf("severity = %q, want error", found.Severity)
+	}
+	if !strings.Contains(found.Title, "189") {
+		t.Fatalf("title does not say how many: %q", found.Title)
+	}
+	// The point of the check is that waiting does not fix it.
+	for _, want := range []string{"not stale", "divergent", "-max-keys"} {
+		if !strings.Contains(found.Detail, want) {
+			t.Fatalf("detail does not mention %q: %q", want, found.Detail)
+		}
+	}
+}
+
+// Stale rejections stay unremarkable: they are last-write-wins working, and a
+// rule that fired on them would cry wolf on every healthy cluster.
+func TestStaleRejectionsAreNotAFinding(t *testing.T) {
+	d := healthy()
+	d.Metrics.KVRejectedStale = 5000
+
+	checks := Checks(d, now)
+	if checks[0].Severity != SeverityOK {
+		t.Fatalf("stale rejections alone made the node unhealthy: %+v", checks)
+	}
+}

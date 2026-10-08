@@ -953,12 +953,26 @@ class NodeEngine extends EventEmitter {
    * when replication bugs hide.
    */
   applyRemote(u) {
-    if (this.store.apply(u)) {
+    const { applied, refusal } = this.store.applyWithReason(u);
+    if (applied) {
       this.metrics.kvApplied++;
       const who = this.writerName(u.version.node);
       if (u.action === KVAction.DELETE) this.logActivity(`${who} deleted ${u.key} (v${u.version.counter})`);
       else this.logActivity(`${who} set ${u.key} = ${preview(u.value)} (v${u.version.counter})`);
       return true;
+    }
+    // "Stale" and "refused" are not the same event and must not share a
+    // counter. A node at its key limit used to narrate every entry it would
+    // never hold as "ignored stale", for keys it had never seen, while its
+    // diagnostics reported it healthy — the one node in the cluster that could
+    // not converge was the one claiming nothing was wrong.
+    if (refusal !== null) {
+      this.metrics.kvRefused++;
+      this.logActivity(
+        `refused ${u.action} for ${u.key} (v${u.version.counter} from ` +
+          `${this.writerName(u.version.node)}): ${StoreRefusal.explain(refusal)}`,
+      );
+      return false;
     }
     this.metrics.kvRejectedStale++;
     this.logActivity(
@@ -1009,9 +1023,14 @@ class NodeEngine extends EventEmitter {
     this.metrics.stateSyncIn++;
     let changed = false;
     for (const u of resp.kv) {
-      if (this.store.apply(u)) {
+      const { applied, refusal } = this.store.applyWithReason(u);
+      if (applied) {
         this.metrics.kvApplied++;
         changed = true;
+      } else if (refusal !== null) {
+        this.metrics.kvRefused++;
+      } else {
+        this.metrics.kvRejectedStale++;
       }
     }
     if (resp.chat.length) this.mergeChat(resp.chat);

@@ -26,6 +26,14 @@ class Metrics {
 
     val kvApplied = AtomicLong()
     val kvRejectedStale = AtomicLong()
+
+    /**
+     * Remote updates this node declined to store at all. Kept apart from
+     * [kvRejectedStale] because they mean opposite things: a stale rejection
+     * is last-write-wins working, a refusal is a replica that cannot converge
+     * until a limit moves.
+     */
+    val kvRefused = AtomicLong()
     val kvLocalWrites = AtomicLong()
     val kvCasFailures = AtomicLong()
     val kvExpired = AtomicLong()
@@ -172,6 +180,7 @@ class Metrics {
             malformedDrops = malformedDrops.get(),
             kvApplied = kvApplied.get(),
             kvRejectedStale = kvRejectedStale.get(),
+            kvRefused = kvRefused.get(),
             kvLocalWrites = kvLocalWrites.get(),
             kvCasFailures = kvCasFailures.get(),
             kvExpired = kvExpired.get(),
@@ -264,6 +273,7 @@ data class MetricsSnapshot(
     val malformedDrops: Long = 0,
     val kvApplied: Long = 0,
     val kvRejectedStale: Long = 0,
+    val kvRefused: Long = 0,
     val kvLocalWrites: Long = 0,
     val kvCasFailures: Long = 0,
     val kvExpired: Long = 0,

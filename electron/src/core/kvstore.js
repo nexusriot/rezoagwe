@@ -210,12 +210,32 @@ class KvStore {
    * later writes sort after it.
    */
   apply(u) {
+    return this.applyWithReason(u).applied;
+  }
+
+  /**
+   * apply, and additionally why an update did not land.
+   *
+   * A bare boolean collapses two outcomes that deserve opposite responses.
+   * "Not newer" is last-write-wins working; a refusal from admit means this
+   * node will not hold the entry at all, so it can never converge with the
+   * peer that sent it and someone has to raise a limit or free a key. Callers
+   * that read both as "stale" counted a store at its limit as healthy — the
+   * one state where the counters most need to say otherwise.
+   *
+   * Returns {applied, refusal}; a null refusal with applied false is the
+   * ordinary stale case.
+   */
+  applyWithReason(u) {
     if (u.version.counter > this.clock) this.clock = u.version.counter;
     // Enforced against a peer as well as a local writer: a limit that the node
     // it protects is the only one unable to fill is not a limit.
-    if (u.action !== KVAction.DELETE && !this.admits(u.key, u.value, this.nowSec())) return false;
+    if (u.action !== KVAction.DELETE) {
+      const refusal = this.admit(u.key, u.value, this.nowSec());
+      if (refusal !== null) return { applied: false, refusal };
+    }
     const current = this.store.get(u.key);
-    if (current && !versionNewer(u.version, current.version)) return false;
+    if (current && !versionNewer(u.version, current.version)) return { applied: false, refusal: null };
     const deleted = u.action === KVAction.DELETE;
     const e = {
       value: u.value || '',
@@ -227,7 +247,7 @@ class KvStore {
     this.store.set(u.key, e);
     this.record(u.key, e, false);
     this.changed();
-    return true;
+    return { applied: true, refusal: null };
   }
 
   get(key) {

@@ -415,14 +415,14 @@ value it holds.
 |----------|------------------|----------------------------------------------------|
 | `GET`    | `/kv`            | listing; `?prefix=` filters                        |
 | `GET`    | `/kv/{key}`      | value as text; `ETag` carries the version          |
-| `PUT`    | `/kv/{key}`      | body is the value; `If-Match` makes it a CAS, `X-Rezoagwe-TTL` sets an expiry |
+| `PUT`    | `/kv/{key}`      | body is the value; `If-Match` makes it a CAS (`*` or an empty value mean "must be absent"), `X-Rezoagwe-TTL` sets an expiry |
 | `DELETE` | `/kv/{key}`      | `If-Match` supported                               |
 | `GET`    | `/history/{key}` | recorded versions with their writers               |
 | `GET`    | `/peers`         | known peers                                        |
 | `GET`    | `/chat`          | chat log; `POST` sends (slash commands included)   |
 | `GET`    | `/activity`      | replication activity feed                          |
 | `GET`    | `/export`        | whole store, versions included                     |
-| `POST`   | `/import`        | merge by version; `?mode=seed` re-stamps as local  |
+| `POST`   | `/import`        | merge by version; `?mode=seed` re-stamps as local, any other mode is a 400 |
 | `GET`    | `/health`        | status                                             |
 | `GET`    | `/metrics`       | Prometheus exposition, counters and gauges         |
 | `GET`    | `/topology`      | the cluster graph (§12)                            |

@@ -1,6 +1,8 @@
 package com.nexusriot.rezoagwe
 
 import com.nexusriot.rezoagwe.core.KvStore
+import com.nexusriot.rezoagwe.core.Limits
+import com.nexusriot.rezoagwe.core.Refusal
 import com.nexusriot.rezoagwe.core.WriteOptions
 import com.nexusriot.rezoagwe.proto.Digest
 import com.nexusriot.rezoagwe.proto.KVAction
@@ -214,5 +216,39 @@ class KvStoreTest {
         assertTrue(KvStore.inDigestRange("b", "a", ""))
         assertTrue(KvStore.inDigestRange("b", "a", "c"))
         assertFalse(KvStore.inDigestRange("c", "a", "c"))
+    }
+
+    /**
+     * apply collapsed "I have something newer" and "I will not hold this at
+     * all" into one false, and every caller read the pair as staleness. They
+     * need opposite responses — one is last-write-wins working, the other is a
+     * replica that cannot converge — so the store has to say which it was.
+     */
+    @Test
+    fun applyWithReasonSeparatesRefusalFromStaleness() {
+        val kv = KvStore("n1")
+        kv.setLimits(Limits(maxValueBytes = 8, maxKeys = 2))
+
+        assertTrue(kv.applyWithReason(KVUpdate(KVAction.SET, "a", "ok", Version(1, "p"))).applied)
+
+        // Genuinely stale: the store already holds a newer version, no refusal.
+        val stale = kv.applyWithReason(KVUpdate(KVAction.SET, "a", "old", Version(0, "p")))
+        assertFalse(stale.applied)
+        assertNull("a stale update is not a refusal", stale.refusal)
+
+        val tooBig = kv.applyWithReason(
+            KVUpdate(KVAction.SET, "b", "far too long to fit", Version(9, "p")),
+        )
+        assertFalse(tooBig.applied)
+        assertEquals(Refusal.TOO_LARGE, tooBig.refusal)
+
+        assertTrue(kv.applyWithReason(KVUpdate(KVAction.SET, "b", "fits", Version(10, "p"))).applied)
+        val tooMany = kv.applyWithReason(KVUpdate(KVAction.SET, "c", "fits", Version(11, "p")))
+        assertFalse(tooMany.applied)
+        assertEquals(Refusal.TOO_MANY_KEYS, tooMany.refusal)
+
+        // apply keeps its Boolean contract for callers that only ask whether
+        // the store changed.
+        assertFalse(kv.apply(KVUpdate(KVAction.SET, "d", "fits", Version(12, "p"))))
     }
 }

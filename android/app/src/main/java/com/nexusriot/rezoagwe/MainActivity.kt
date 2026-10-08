@@ -10,6 +10,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
 import com.nexusriot.rezoagwe.core.Runtime
+import com.nexusriot.rezoagwe.service.NodeService
 import com.nexusriot.rezoagwe.ui.RezoagweApp
 import com.nexusriot.rezoagwe.ui.theme.RezoagweTheme
 
@@ -23,12 +24,29 @@ class MainActivity : ComponentActivity() {
         // here means every API level gets the same insets, which the UI pads for.
         enableEdgeToEdge()
         Runtime.init(this)
+        resumeWantedRoles()
         askForNotifications()
         setContent {
             RezoagweTheme {
                 RezoagweApp()
             }
         }
+    }
+
+    /**
+     * Brings back the roles the user left running.
+     *
+     * The intent is persisted, but the only thing that ever read it was
+     * NodeService.onStartCommand — which cannot run after a force-stop or a
+     * reboot, because those are exactly the cases where no service is left to
+     * restart. Opening the app then showed a stopped node with "Start node"
+     * offered, while shared_prefs still recorded that the user wanted it up.
+     *
+     * Starting the service is enough: its onStartCommand restores every wanted
+     * role off the main thread, and is idempotent when one is already running.
+     */
+    private fun resumeWantedRoles() {
+        if (Runtime.anyRoleWanted(this)) NodeService.ensureRunning(this)
     }
 
     /**

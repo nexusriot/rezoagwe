@@ -264,12 +264,35 @@ class KvStore(
      * changed. The Lamport clock advances past any counter seen, so this node's
      * later writes sort after it.
      */
-    fun apply(u: KVUpdate): Boolean {
+    fun apply(u: KVUpdate): Boolean = applyWithReason(u).applied
+
+    /**
+     * The outcome of [applyWithReason]: whether the store changed, and — when
+     * it did not — why.
+     *
+     * A null [refusal] with [applied] false is the ordinary stale case.
+     */
+    data class ApplyOutcome(val applied: Boolean, val refusal: Refusal? = null)
+
+    /**
+     * [apply], and additionally why an update did not land.
+     *
+     * A bare Boolean collapses two outcomes that deserve opposite responses.
+     * "Not newer" is last-write-wins working; a refusal from [admitLocked]
+     * means this node will not hold the entry at all, so it can never converge
+     * with the peer that sent it and someone has to raise a limit or free a
+     * key. Callers that read both as "stale" counted a store at its limit as
+     * healthy — the one state where the counters most need to say otherwise.
+     */
+    fun applyWithReason(u: KVUpdate): ApplyOutcome {
         synchronized(lock) {
             if (u.version.counter > clock) clock = u.version.counter
-            if (!u.deleted && !admits(u.key, u.value, nowSec())) return false
+            if (!u.deleted) {
+                val refusal = admitLocked(u.key, u.value, nowSec())
+                if (refusal != null) return ApplyOutcome(false, refusal)
+            }
             val current = store[u.key]
-            if (current != null && !u.version.newerThan(current.version)) return false
+            if (current != null && !u.version.newerThan(current.version)) return ApplyOutcome(false)
             val entry = KvEntry(
                 value = u.value,
                 version = u.version,
@@ -281,7 +304,7 @@ class KvStore(
             record(u.key, entry, local = false)
         }
         onChange?.invoke()
-        return true
+        return ApplyOutcome(true)
     }
 
     operator fun get(key: String): String? = entry(key)?.value

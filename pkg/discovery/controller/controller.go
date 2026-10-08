@@ -431,6 +431,7 @@ func (c *Controller) metrics() *tcell.EventKey {
 	row("local writes", s.KVLocalWrites)
 	row("remote applied", s.KVApplied)
 	row("stale rejected", s.KVRejectedStale)
+	row("refused by limits", s.KVRefused)
 	row("guarded writes refused", s.KVCASFailures)
 	row("expired", s.KVExpired)
 	row("tombstones reclaimed", s.KVGCed)

@@ -332,3 +332,53 @@ func TestARefusedWriteSaysWhichRuleRefusedIt(t *testing.T) {
 		t.Errorf("guarded against a stale version: %v, want ErrVersionMismatch", err)
 	}
 }
+
+// Apply collapsed "I have something newer" and "I will not hold this at all"
+// into one false, and every caller read the pair as staleness. They need
+// opposite responses — one is last-write-wins working, the other is a replica
+// that cannot converge — so the store has to say which it was.
+func TestApplyWithReasonSeparatesRefusalFromStaleness(t *testing.T) {
+	kv := NewKVStore("n1")
+	kv.SetLimits(Limits{MaxValueBytes: 8, MaxKeys: 2})
+
+	if applied, err := kv.ApplyWithReason(pb.KVUpdate{
+		Action: pb.KVSet, Key: "a", Value: "ok", Version: pb.Version{Counter: 1, Node: "p"},
+	}); !applied || err != nil {
+		t.Fatalf("first write = (%v, %v), want (true, nil)", applied, err)
+	}
+
+	// Genuinely stale: the store already holds a newer version. No error.
+	applied, err := kv.ApplyWithReason(pb.KVUpdate{
+		Action: pb.KVSet, Key: "a", Value: "old", Version: pb.Version{Counter: 0, Node: "p"},
+	})
+	if applied || err != nil {
+		t.Fatalf("stale write = (%v, %v), want (false, nil)", applied, err)
+	}
+
+	// Over the value limit: refused, and it says so.
+	applied, err = kv.ApplyWithReason(pb.KVUpdate{
+		Action: pb.KVSet, Key: "b", Value: "far too long to fit", Version: pb.Version{Counter: 9, Node: "p"},
+	})
+	if applied || !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("oversized write = (%v, %v), want (false, ErrTooLarge)", applied, err)
+	}
+
+	// Past the key limit: refused, with the other reason.
+	if applied, err := kv.ApplyWithReason(pb.KVUpdate{
+		Action: pb.KVSet, Key: "b", Value: "fits", Version: pb.Version{Counter: 10, Node: "p"},
+	}); !applied || err != nil {
+		t.Fatalf("second key = (%v, %v), want (true, nil)", applied, err)
+	}
+	applied, err = kv.ApplyWithReason(pb.KVUpdate{
+		Action: pb.KVSet, Key: "c", Value: "fits", Version: pb.Version{Counter: 11, Node: "p"},
+	})
+	if applied || !errors.Is(err, ErrTooManyKeys) {
+		t.Fatalf("over-limit write = (%v, %v), want (false, ErrTooManyKeys)", applied, err)
+	}
+
+	// Apply keeps its bool contract for every caller that only asks "did the
+	// store change?".
+	if kv.Apply(pb.KVUpdate{Action: pb.KVSet, Key: "d", Value: "fits", Version: pb.Version{Counter: 12, Node: "p"}}) {
+		t.Fatal("Apply returned true for an update the limits refused")
+	}
+}

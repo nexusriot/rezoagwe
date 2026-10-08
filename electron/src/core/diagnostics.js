@@ -45,6 +45,18 @@ function healthChecks(d, nowMs) {
       + 'version.');
   }
 
+  if (m.kvRefused > 0) {
+    // The only condition here that no amount of gossip repairs: a peer holds
+    // entries this store has declined, so the two stay divergent until a limit
+    // moves. The anti-entropy sweep will offer the same entries every ten
+    // seconds for as long as the node runs.
+    add(Severity.ERROR, `${m.kvRefused} remote update(s) refused by this node's limits`,
+      "This node refused remote updates its store would not hold \u2014 a value over the configured "
+      + 'value limit, a key past the key limit, or an entry too large to replicate at all. They are '
+      + 'not stale and will not arrive later: the peers that hold them stay divergent from this node '
+      + 'until a limit is raised or keys are freed. Verify replicas names the buckets that differ.');
+  }
+
   if (m.replayDrops > 0) {
     add(Severity.INFO, `${m.replayDrops} replayed packet(s) ignored`,
       'The same nonce arrived twice. Duplicated datagrams are normal on a lossy network; a steadily '
@@ -196,6 +208,8 @@ function asReport(d, nowMs) {
     + `${d.metrics.bytesSent}B / ${d.metrics.bytesReceived}B`);
   lines.push(`drops           auth ${d.metrics.authFailures}, replay ${d.metrics.replayDrops}, `
     + `skew ${d.metrics.skewDrops}, malformed ${d.metrics.malformedDrops}`);
+  lines.push(`replication     ${d.metrics.kvApplied} applied, ${d.metrics.kvRejectedStale} stale, `
+    + `${d.metrics.kvRefused} refused by limits`);
   lines.push(`anti-entropy    ${d.metrics.aeRounds} rounds, ${d.metrics.aePushed} pushed, `
     + `${d.metrics.aePulled} pulled`);
   lines.push('');

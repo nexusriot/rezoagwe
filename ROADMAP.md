@@ -10,11 +10,16 @@ the code it touches.
 
 ## Shipped
 
-The repository is at **0.4.1** — the version the Makefile stamps into the Go
+The repository is at **0.4.2** — the version the Makefile stamps into the Go
 binaries and their `.deb`, the desktop client's `package.json`, and the Android
 app's `versionName`; a test keeps the four in step.
 
-0.4.1 is a documentation round: the prose was in good shape because a test suite
+0.4.2 is a bug-fix round out of an end-to-end run on a physical Android tablet
+with all three implementations in one cluster. Three of the four defects it
+found were invisible to every existing test because each needed a second
+process, a second implementation, or a force-stop to show itself.
+
+0.4.1 before it was a documentation round: the prose was in good shape because a test suite
 holds it there, and the two things that suite could not see — the picture, and
 whatever the code grew that no document mentions — were both wrong.
 
@@ -25,6 +30,38 @@ the Kotlin and JavaScript ports — which had been carrying the same anti-entrop
 defect all along.
 
 Newest first.
+
+### 0.4.2 — what a hardware end-to-end run found
+
+- ✅ **A write refused by the store limits was reported as "stale"** — in all
+  three ports. `Apply` returned one bool for "I already have something newer"
+  and "I will not hold this at all", and every caller read the pair as
+  staleness. A node joined to the live cluster with `-max-keys 10` counted 189
+  refusals as stale rejections, narrated `ignored stale set for uni-quotes` for
+  a key it had never held, and reported **"Node looks healthy"** while
+  `/consistency` said it disagreed with all four peers in 9 of 16 buckets. The
+  one replica that could never converge was the one claiming nothing was wrong.
+  `ApplyWithReason` now carries the reason, a `kv_refused_total` counter stands
+  apart from `kv_rejected_stale_total`, the activity feed names the limit that
+  refused each entry, and the diagnostics raise an error saying waiting will not
+  fix it. Carried into Kotlin and JavaScript the same round.
+- ✅ **The Android node never came back when the app was relaunched** — the
+  intent was persisted as `nodeWanted`, but its only reader was
+  `NodeService.onStartCommand`, which cannot run after a force-stop or a reboot:
+  precisely the cases where the node is gone. Opening the app showed a stopped
+  node offering "Start node" while `shared_prefs` still said the user wanted it
+  up. `MainActivity` now starts the service, which restores every wanted role
+  off the main thread.
+- ✅ **An empty `If-Match` made a conditional write unconditional** — the
+  gateway guarded on `header != ""`, which cannot tell "no If-Match" from
+  "If-Match:" with an empty value. `parseVersion` defines the empty string as
+  "the key must not exist", so the one request a client writes to avoid
+  clobbering a concurrent write was the one that clobbered it. A malformed
+  `If-Match` already failed closed; an empty one now does too.
+- ✅ **`POST /import?mode=…` ignored a mode it did not recognise** — the two
+  modes differ by whether the file overwrites the whole cluster, and
+  `?mode=SEED` answered 200 for a restore that never happened. Unknown modes are
+  now a 400.
 
 ### 0.4.1 — documentation and the chart
 

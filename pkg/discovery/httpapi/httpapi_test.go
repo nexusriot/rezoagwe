@@ -407,3 +407,85 @@ func TestAFailedSwapIsStillAPreconditionFailure(t *testing.T) {
 		t.Fatalf("second claim = %d, want 412", got)
 	}
 }
+
+// An If-Match the client actually sent is a condition even when its value is
+// empty. The guard used to be `header != ""`, which cannot tell that request
+// apart from one carrying no If-Match at all, so the single request a client
+// writes to avoid clobbering a concurrent write was the one that clobbered it.
+func TestAnEmptyIfMatchIsStillACondition(t *testing.T) {
+	n, base := newGateway(t)
+
+	resp := do(t, http.MethodPut, base+"/kv/lock", "first", nil)
+	resp.Body.Close()
+
+	// Empty means the zero version, which parseVersion defines as "must be
+	// absent" — so against a key that exists it has to be refused.
+	resp = do(t, http.MethodPut, base+"/kv/lock", "clobber", map[string]string{"If-Match": ""})
+	if resp.StatusCode != http.StatusPreconditionFailed {
+		t.Fatalf("PUT with an empty If-Match = %d, want 412", resp.StatusCode)
+	}
+	resp.Body.Close()
+	if v, _ := n.Get("lock"); v != "first" {
+		t.Fatalf("value = %q, want first — the empty condition did not hold", v)
+	}
+
+	// And on a key that does not exist it is the create-if-absent it claims.
+	resp = do(t, http.MethodPut, base+"/kv/fresh", "created", map[string]string{"If-Match": ""})
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("PUT with an empty If-Match on an absent key = %d, want 204", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// DELETE shares the guard, so it shares the hazard.
+	resp = do(t, http.MethodDelete, base+"/kv/lock", "", map[string]string{"If-Match": ""})
+	if resp.StatusCode != http.StatusPreconditionFailed {
+		t.Fatalf("DELETE with an empty If-Match = %d, want 412", resp.StatusCode)
+	}
+	resp.Body.Close()
+	if _, ok := n.Get("lock"); !ok {
+		t.Fatal("the key was deleted by a condition that could not hold")
+	}
+}
+
+// A request with no If-Match at all is still the unconditional write a plain
+// PUT should be — the fix above must not turn every PUT into a CAS.
+func TestAPutWithNoIfMatchStaysUnconditional(t *testing.T) {
+	n, base := newGateway(t)
+
+	do(t, http.MethodPut, base+"/kv/k", "one", nil).Body.Close()
+	resp := do(t, http.MethodPut, base+"/kv/k", "two", nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("second unconditional PUT = %d, want 204", resp.StatusCode)
+	}
+	resp.Body.Close()
+	if v, _ := n.Get("k"); v != "two" {
+		t.Fatalf("value = %q, want two", v)
+	}
+}
+
+// The two import modes differ by whether the file overwrites the whole
+// cluster, so a mode the server does not recognise has to be refused rather
+// than read as the gentler of the two.
+func TestImportRefusesAnUnknownMode(t *testing.T) {
+	_, base := newGateway(t)
+	const file = `{"entries":[{"action":"set","key":"k","value":"v","version":{"counter":1,"node":"n"}}]}`
+
+	for _, mode := range []string{"SEED", "overwrite", "sed"} {
+		resp := do(t, http.MethodPost, base+"/import?mode="+mode, file, nil)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("import mode=%s = %d, want 400", mode, resp.StatusCode)
+		}
+		resp.Body.Close()
+	}
+	for _, mode := range []string{"", "merge", "seed"} {
+		url := base + "/import"
+		if mode != "" {
+			url += "?mode=" + mode
+		}
+		resp := do(t, http.MethodPost, url, file, nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("import mode=%q = %d, want 200", mode, resp.StatusCode)
+		}
+		resp.Body.Close()
+	}
+}

@@ -67,6 +67,7 @@ private fun MetricsCard(m: MetricsSnapshot) {
             MetricRow("local writes", m.kvLocalWrites)
             MetricRow("remote applied", m.kvApplied)
             MetricRow("stale rejected", m.kvRejectedStale)
+            MetricRow("refused by limits", m.kvRefused)
             MetricRow("guarded writes refused", m.kvCasFailures)
             MetricRow("expired", m.kvExpired)
             MetricRow("tombstones reclaimed", m.kvGced)

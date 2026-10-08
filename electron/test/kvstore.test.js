@@ -3,7 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { KvStore } = require('../src/core/kvstore');
+const { KvStore, REFUSAL } = require('../src/core/kvstore');
 const { version, KVAction, FINGERPRINT_BUCKETS } = require('../src/proto/wire');
 
 /**
@@ -320,4 +320,37 @@ test('two empty stores fingerprint identically', () => {
   const b = new KvStore('node-b').fingerprint();
   assert.deepEqual(a.buckets, b.buckets);
   assert.ok(a.buckets.every((v) => v === ZERO), 'an empty store should fold to zeroes');
+});
+
+/**
+ * apply collapsed "I have something newer" and "I will not hold this at all"
+ * into one false, and every caller read the pair as staleness. They need
+ * opposite responses — one is last-write-wins working, the other is a replica
+ * that cannot converge — so the store has to say which it was.
+ */
+test('applyWithReason separates a refusal from staleness', () => {
+  const kv = new KvStore('n1');
+  kv.setLimits({ maxValueBytes: 8, maxKeys: 2 });
+
+  assert.ok(kv.applyWithReason({ action: KVAction.SET, key: 'a', value: 'ok', version: version(1, 'p') }).applied);
+
+  // Genuinely stale: the store already holds a newer version, no refusal.
+  const stale = kv.applyWithReason({ action: KVAction.SET, key: 'a', value: 'old', version: version(0, 'p') });
+  assert.equal(stale.applied, false);
+  assert.equal(stale.refusal, null, 'a stale update is not a refusal');
+
+  const tooBig = kv.applyWithReason({
+    action: KVAction.SET, key: 'b', value: 'far too long to fit', version: version(9, 'p'),
+  });
+  assert.equal(tooBig.applied, false);
+  assert.equal(tooBig.refusal, REFUSAL.TOO_LARGE);
+
+  assert.ok(kv.applyWithReason({ action: KVAction.SET, key: 'b', value: 'fits', version: version(10, 'p') }).applied);
+  const tooMany = kv.applyWithReason({ action: KVAction.SET, key: 'c', value: 'fits', version: version(11, 'p') });
+  assert.equal(tooMany.applied, false);
+  assert.equal(tooMany.refusal, REFUSAL.TOO_MANY_KEYS);
+
+  // apply keeps its boolean contract for callers that only ask whether the
+  // store changed.
+  assert.equal(kv.apply({ action: KVAction.SET, key: 'd', value: 'fits', version: version(12, 'p') }), false);
 });

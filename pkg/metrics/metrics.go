@@ -30,10 +30,16 @@ type Metrics struct {
 
 	KVApplied       atomic.Uint64
 	KVRejectedStale atomic.Uint64
-	KVLocalWrites   atomic.Uint64
-	KVCASFailures   atomic.Uint64
-	KVExpired       atomic.Uint64
-	KVGCed          atomic.Uint64
+	// KVRefused counts remote updates this node declined to store at all —
+	// over the value limit, past the key limit, or too large to replicate.
+	// Kept apart from KVRejectedStale because they mean opposite things: a
+	// stale rejection is last-write-wins working, a refusal is a replica that
+	// cannot converge until an operator changes something.
+	KVRefused     atomic.Uint64
+	KVLocalWrites atomic.Uint64
+	KVCASFailures atomic.Uint64
+	KVExpired     atomic.Uint64
+	KVGCed        atomic.Uint64
 
 	AERounds atomic.Uint64
 	AEPushed atomic.Uint64
@@ -256,6 +262,7 @@ type Snapshot struct {
 
 	KVApplied       uint64
 	KVRejectedStale uint64
+	KVRefused       uint64
 	KVLocalWrites   uint64
 	KVCASFailures   uint64
 	KVExpired       uint64
@@ -291,6 +298,7 @@ func (m *Metrics) Snapshot() Snapshot {
 		MalformedDrops:  m.MalformedDrops.Load(),
 		KVApplied:       m.KVApplied.Load(),
 		KVRejectedStale: m.KVRejectedStale.Load(),
+		KVRefused:       m.KVRefused.Load(),
 		KVLocalWrites:   m.KVLocalWrites.Load(),
 		KVCASFailures:   m.KVCASFailures.Load(),
 		KVExpired:       m.KVExpired.Load(),
@@ -386,6 +394,7 @@ func (s Snapshot) Prometheus() string {
 	counter("malformed_drops_total", "Packets dropped as unparseable.", s.MalformedDrops)
 	counter("kv_applied_total", "Remote updates merged into the store.", s.KVApplied)
 	counter("kv_rejected_stale_total", "Remote updates rejected as not newer.", s.KVRejectedStale)
+	counter("kv_refused_total", "Remote updates refused by this node's store limits.", s.KVRefused)
 	counter("kv_local_writes_total", "Local writes and deletes.", s.KVLocalWrites)
 	counter("kv_cas_failures_total", "Compare-and-swap writes rejected.", s.KVCASFailures)
 	counter("kv_expired_total", "Keys tombstoned by TTL expiry.", s.KVExpired)
