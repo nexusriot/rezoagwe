@@ -8,7 +8,7 @@
         <mxCell id="title" value="Rezoagwe — eventually-consistent distributed KV store + embedded chat" style="text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=17;fontStyle=1" parent="1" vertex="1">
           <mxGeometry x="40" y="12" width="1260" height="28" as="geometry" />
         </mxCell>
-        <mxCell id="subtitle" value="wire v2 · every packet authenticated · UDP datagrams + TCP streams · four implementations of one protocol" style="text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=11;fontColor=#555555" parent="1" vertex="1">
+        <mxCell id="subtitle" value="wire v2 · every packet authenticated · UDP datagrams + TCP streams · three implementations of one protocol" style="text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=11;fontColor=#555555" parent="1" vertex="1">
           <mxGeometry x="40" y="40" width="1260" height="20" as="geometry" />
         </mxCell>
 
@@ -88,7 +88,7 @@
           <mxGeometry x="470" y="372" width="400" height="226" as="geometry" />
         </mxCell>
 
-        <mxCell id="ports" value="The same node, four times over" style="text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;fontSize=13;fontStyle=1" parent="1" vertex="1">
+        <mxCell id="ports" value="The same node, three times over" style="text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;fontSize=13;fontStyle=1" parent="1" vertex="1">
           <mxGeometry x="40" y="672" width="1260" height="24" as="geometry" />
         </mxCell>
 
@@ -105,7 +105,7 @@
           <mxGeometry x="997" y="704" width="303" height="92" as="geometry" />
         </mxCell>
 
-        <mxCell id="obs" value="&lt;b&gt;Seeing what the protocol is doing&lt;/b&gt;&#xa;&lt;b&gt;Cluster graph&lt;/b&gt; (g · GET /topology) — roles, links only one end claims, and the connected components that make a partition visible. Built from the peer lists gossip already carries, so the picture is exactly as complete as gossip has made it, which is itself the diagnostic.&#xa;&lt;b&gt;Diagnostics&lt;/b&gt; (D · GET /diagnostics · -doctor) — the counters turned into causes: a key or cluster-name mismatch, a clock outside the skew window, one-way UDP through a firewall, a loopback address advertised to a LAN, peers about to be evicted.&#xa;&lt;b&gt;Consistency check&lt;/b&gt; (v · GET /consistency) — asks every peer to summarise its whole store and reports who disagrees, and about which region of the keyspace. Anti-entropy repairs divergence but never reports it, so a cluster can sit split for as long as nobody looks." style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacingLeft=10;spacingTop=8;fontSize=11;fillColor=#e6f2ff;strokeColor=#0000CC;" parent="1" vertex="1">
+        <mxCell id="obs" value="&lt;b&gt;Seeing what the protocol is doing&lt;/b&gt;&#xa;&lt;b&gt;Cluster graph&lt;/b&gt; (g · GET /topology) — roles, links only one end claims, and the connected components that make a partition visible. Built from the peer lists gossip already carries, so the picture is exactly as complete as gossip has made it, which is itself the diagnostic.&#xa;&lt;b&gt;Diagnostics&lt;/b&gt; (D · GET /diagnostics · -doctor) — the counters turned into causes: a key or cluster-name mismatch, a clock outside the skew window, one-way UDP through a firewall, a loopback address advertised to a LAN, peers about to be evicted, and a replica refusing what its peers send because its own store limits will not hold it — the one condition waiting never clears.&#xa;&lt;b&gt;Consistency check&lt;/b&gt; (v · GET /consistency) — asks every peer to summarise its whole store and reports who disagrees, and about which region of the keyspace. Anti-entropy repairs divergence but never reports it, so a cluster can sit split for as long as nobody looks." style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacingLeft=10;spacingTop=8;fontSize=11;fillColor=#e6f2ff;strokeColor=#0000CC;" parent="1" vertex="1">
           <mxGeometry x="40" y="816" width="1260" height="108" as="geometry" />
         </mxCell>
 

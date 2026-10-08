@@ -191,6 +191,47 @@ field; `Settings.sanitized()` trimmed it on Apply, which is the 2026-09-06 fix
 still doing its job. The diagnostics also caught five transient
 `ENETUNREACH` send failures and named the peer and cause — Wi-Fi, not the app.
 
+### The corner-case round, with every implementation in one cluster
+
+A third run on the same tablet, this time with all three implementations in
+one cluster at once: a Go rendezvous and two Go peers on one machine, the
+Electron client as a third node, the tablet as a fourth. What that cast adds
+is cross-implementation agreement under conditions a single port cannot
+produce.
+
+Held up: 2 MB values, emoji and CJK keys, an empty key, keys containing `/`,
+`#`, `?` and `%`, and an empty value — all converged with the Kotlin, Go and
+JavaScript folds agreeing byte for byte. TTL expiry, compare-and-swap, a
+delete issued while the tablet was off the air (no resurrection on heal), and
+conflicting writes on both sides of a Wi-Fi outage all resolved identically on
+all four nodes. Two Go peers found each other through the **tablet's**
+rendezvous and replicated. The foreground service survived backgrounding, a
+swipe from recents and forced deep Doze — a key written while the tablet was
+in `deviceidle force-idle` still arrived.
+
+What it found:
+
+* **The node was never restored when the app was relaunched.** `nodeWanted` is
+  persisted, but its only reader was `NodeService.onStartCommand`, which cannot
+  run after a force-stop or a reboot — precisely the cases where the node is
+  gone. Opening the app showed `STOPPED` with *Start node* offered while
+  `shared_prefs` still said the user wanted it up; the 2.4 MB store had
+  survived, only the node had not. `MainActivity` now starts the service, and
+  `RoleRestoreTest` fails the build if it stops consulting the persisted
+  intent.
+* **A write refused by the store limits was reported as stale** — in this port
+  as much as in the other two. See [DESIGN §5.6](../DESIGN.md#56-admission-and-why-a-refusal-is-not-staleness);
+  the Diag screen now raises an error for it and the *refused by limits*
+  counter sits beside *stale rejected* on the Activity screen.
+
+Two notes for whoever drives this next. The debug APK already on a device may
+have been signed with a different debug key, in which case `adb install -r`
+fails with `INSTALL_FAILED_UPDATE_INCOMPATIBLE` — back up `shared_prefs/` and
+`files/node.json` with `run-as` before uninstalling. And in **Settings**,
+tapping a field scrolls the page under the tap, so coordinates captured from
+an earlier dump land on the wrong row: re-dump and confirm which field reports
+itself focused before typing.
+
 ## Known gaps
 
 * The battery cost of the 10 s gossip tick is still unmeasured; **Diag**

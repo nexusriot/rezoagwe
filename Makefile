@@ -32,7 +32,7 @@ BIN_DISC   := rezoagwe-discovery
 PKG_BOOT   := ./cmd/bootstrap
 PKG_DISC   := ./cmd/discovery
 GO         ?= go
-VERSION    ?= 0.4.2
+VERSION    ?= 0.4.3
 # The version is injected into both binaries: renaming the output file is not
 # the same as building a binary that knows what it is, and the two used to
 # drift apart the moment anyone passed VERSION=.

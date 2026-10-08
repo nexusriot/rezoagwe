@@ -412,6 +412,49 @@ test('the chart names every message kind and contradicts none of the protocol', 
   }
 });
 
+test('every document agrees on how many implementations there are', () => {
+  // The chart said "four implementations of one protocol" and "The same node,
+  // four times over" while drawing three boxes — and its own footer said "all
+  // three fold the same store". Nothing caught it: the kind table and the
+  // staleness regexes above both passed, because a wrong *count* contradicts no
+  // single claim. A reader who trusts a picture went looking for a fourth port.
+  const ports = ['', 'android', 'electron'].filter((dir) => (
+    dir === ''
+      ? fs.existsSync(path.join(REPO, 'cmd', 'discovery'))
+      : fs.existsSync(path.join(REPO, dir, 'src')) || fs.existsSync(path.join(REPO, dir, 'app'))
+  ));
+  assert.equal(ports.length, 3, 'the set of implementations changed — update the docs and this test');
+
+  const words = ['zero', 'one', 'two', 'three', 'four', 'five'];
+  const want = words[ports.length];
+  const wrong = words.filter((w) => w !== want && w !== 'one');
+
+  const chart = read('rezo_agwe.drawio');
+  for (const phrase of ['implementations of one protocol', 'times over']) {
+    const found = new RegExp(`(\\w+)\\s+${phrase}`, 'i').exec(chart);
+    assert.ok(found, `the chart no longer says "<n> ${phrase}"`);
+    assert.equal(
+      found[1].toLowerCase(), want,
+      `the chart says "${found[1]} ${phrase}" but the repository has ${ports.length} implementations`,
+    );
+  }
+
+  // And the prose must not drift the other way. Quoted spans are skipped:
+  // these documents routinely quote a claim they used to make wrongly ("the
+  // picture said \"four implementations\""), and a check that cannot tell a
+  // quotation from an assertion forbids describing the very mistake it exists
+  // to prevent.
+  for (const doc of ['README.md', 'DESIGN.md']) {
+    const text = read(doc).replace(/["\u201c\u201d][^"\u201c\u201d]*["\u201c\u201d]/g, '');
+    for (const bad of wrong) {
+      assert.ok(
+        !new RegExp(`${bad}\\s+implementations`, 'i').test(text),
+        `${doc} says "${bad} implementations"; there are ${ports.length}`,
+      );
+    }
+  }
+});
+
 test('the chart image was exported from the chart source', () => {
   // `make chart` is one command, but only if someone runs it. A .drawio edited
   // after the .png it produced means the README is showing the old picture.

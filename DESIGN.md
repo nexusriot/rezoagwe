@@ -321,6 +321,36 @@ delete and still holds the value will push it back once the tombstone is
 gone. Anti-entropy makes that unlikely rather than impossible, so GC is off
 by default and its age must exceed the longest partition expected to heal.
 
+### 5.6 Admission, and why a refusal is not staleness
+
+Store limits (§8, `-max-value-bytes` / `-max-keys`, and the ceiling in
+§8.1) are enforced against a **peer's** update as well as a local writer's:
+a limit that only the node it protects is unable to fill is not a limit.
+
+That makes "this update did not land" two different events, and they need
+opposite responses:
+
+* **Stale** — the store already holds something newer. Last-write-wins
+  working; nothing is wrong and nothing needs repairing.
+* **Refused** — the store will not hold this entry at all. The peer that
+  sent it stays divergent from this node *permanently*: the next
+  anti-entropy round will offer the same entry, and be refused again, for
+  as long as the node runs. Only an operator can clear it, by raising a
+  limit or freeing a key.
+
+`Apply` returning a bare bool for both is what made the second invisible.
+The store exposes `ApplyWithReason` (Go) / `applyWithReason` (Kotlin,
+JavaScript) so the caller can tell them apart, and each port keeps
+`kv_refused_total` separate from `kv_rejected_stale_total`, names the limit
+that refused each entry in the activity feed, and raises a diagnostics
+**error** (§13) — because this is the one condition in the whole system
+that waiting does not fix.
+
+A node whose limits are turning a peer away used to count every refusal as
+a stale rejection, narrate `ignored stale set for <key>` for keys it had
+never held, and report itself healthy while the consistency check said it
+disagreed with every peer in nine of sixteen buckets.
+
 ---
 
 ## 6. Concurrency model
@@ -358,11 +388,19 @@ by default and its age must exceed the longest partition expected to heal.
   a datagram arriving whole rather than being retried forever as one. That last
   is the shape of the failure this level exists for: the store merged it
   correctly in every in-process test, and the frame never left the process.
+  The same argument added a case for §5.6: a write *refused* by a replica's
+  limits can only arrive over the wire, because a local write reports its
+  refusal to the caller instead, so no in-process test could tell the two
+  outcomes apart.
 * The Android port carries the Go implementation's own vectors: a frame
   produced by the Go codec is decoded by the Kotlin one, and the derived
   keys are compared against fixed values. A live interop test (opt-in via
   `REZOAGWE_GO_BOOTSTRAP`) joins a running Go cluster and replicates
-  through it in both directions.
+  through it in both directions. Two of its suites assert source rather than
+  behaviour, because the behaviour needs a device: `UiThreadingTest` fails the
+  build on a datagram sent from a Compose callback, and `RoleRestoreTest` on an
+  activity that stops consulting the persisted "the user wants this role
+  running" intent (§9).
 * The documentation is checked too: `electron/test/docs.test.js` asserts that
   every command the docs offer exists, and that the tables a reader trusts
   instead of the source — §3.2's message kinds, §8's routes, §15's flags, the
@@ -373,14 +411,17 @@ by default and its age must exceed the longest partition expected to heal.
 * The picture is checked too, which is newer and was overdue: `rezo_agwe.png` is
   exported from `rezo_agwe.drawio` by `make chart`, and the suite asserts the
   drawing names every message kind, makes the claims about the protocol that are
-  the reason for having it, and makes none of the ones it outgrew. An image is
-  the one document that rots invisibly — the previous export said "protobuf",
-  "no auth" and "no anti-entropy" for four releases after all three stopped
-  being true, because re-exporting it meant opening a GUI.
+  the reason for having it, makes none of the ones it outgrew, and agrees with
+  the prose on how many implementations there are. An image is the one document
+  that rots invisibly — the previous export said "protobuf", "no auth" and "no
+  anti-entropy" for four releases after all three stopped being true, because
+  re-exporting it meant opening a GUI. The count check came later and found the
+  next one the same day it was written: the picture said "four implementations"
+  twice while drawing three, and its own footer said "all three".
 * `.github/workflows/ci.yml` runs five jobs on every push: the Go suite under
   the race detector with `gofmt` and `go vet`, every cross-build target and
   every `.deb`, the desktop suite, the Android unit tests and APK, and the
-  containerised end-to-end run in a job of its own. Four implementations of one
+  containerised end-to-end run in a job of its own. Three implementations of one
   protocol went a long time with nothing running any of it, and the two worst
   bugs the project has had — a Go nil slice the Kotlin decoder refused, and a
   UDP send Android silently dropped — were both drift between ports, found by
@@ -496,7 +537,16 @@ duplicated deliberately and pinned by parity tests (§7).
   build if one is not — see the end of this section for what that cost once.
 * `service/NodeService.kt` — a foreground service: a gossip node that only
   runs while its screen is open is not participating in a cluster, since
-  peers evict it seconds after the phone sleeps.
+  peers evict it seconds after the phone sleeps. It restores whichever roles
+  the user left running, from the intent `Runtime` persists, so a sticky
+  restart rebuilds a node rather than an empty process.
+* `MainActivity.kt` — starts that service whenever a role is wanted and not
+  up. The service cannot restore itself after a force-stop or a reboot,
+  because those are exactly the cases where no service is left to restart:
+  the activity is the one component Android is certain to create, so it is
+  where the persisted intent has to be read. Without it the app opened on a
+  stopped node offering *Start node* while storage still recorded that the
+  user wanted it running.
 * `ui/` — the Compose screens, one per tab, plus `Layout.kt`, which is where
   the window-size tiers below are decided.
 
@@ -581,11 +631,11 @@ replicates through them in both directions.
 | State sync       | Pulls from one random peer, so a joiner inherits that peer's gaps  | Pull from several and merge                   |
 | Anti-entropy     | Digest is per-key, so a huge store still costs many rounds even now that each one repairs everything it covers | Merkle tree over key ranges |
 | Persistence      | A `kill -9` can lose up to 250 ms of writes, and the whole store is rewritten per flush | Append-only log + periodic snapshot |
-| Store limits     | `-max-value-bytes` / `-max-keys` refuse a peer's update, which is a deliberate divergence — now named by the consistency check (§14), but still not advertised, so the peer keeps sending | Advertise limits so peers stop sending |
+| Store limits     | `-max-value-bytes` / `-max-keys` refuse a peer's update, which is a deliberate divergence. The refusing node now counts it apart from staleness, names the limit in its activity feed and raises a diagnostics error (§5.6), and the consistency check names the keys (§14) — but the limit is still not advertised, so the peer keeps sending into a refusal for as long as both run | Advertise limits in `Hello` so a peer stops sending what this node cannot take |
 | Very large values | The protocol ceiling (§8.1) is what a frame can carry, not what a node can comfortably hold. Measured on a tablet: a store of ~100 MB delayed the gossip loop past the 15 s eviction window, so the phone flapped in and out of the cluster until the large keys were deleted. Nothing warns about this; `-max-value-bytes` is the lever and it is off by default | A size gauge in the diagnostics, and a default value limit |
 | Desktop renderer  | `app:snapshot` ships every value in full to the renderer on every tick, so one 64 MB value made the window unresponsive and a 154 MB state file on disk. The keys list only ever shows a truncated preview | Send previews, fetch a full value on demand |
 | Tombstones       | GC is age-based and off by default                                 | Track cluster-wide acknowledgement            |
-| Chat             | No history beyond the ring, no attachments                         | Paged history                                 |
+| Chat             | No history beyond the ring, no attachments — and **no repair path**: a chat broadcast is one datagram per peer and nothing re-sends it, so a dropped line is gone for good while the sender's own log shows it sent. A dropped *key* heals on the next anti-entropy round; a dropped line never does, and neither end can tell | Sequence chat per sender and carry the gaps in the digest exchange; paged history |
 | Watch            | Every consumer polls, though the engine knows exactly when a key changed | SSE on `/kv?watch=`                     |
 | Android          | Runs on hardware; the battery cost of the 10 s gossip tick is still unmeasured | Measure it over a night |
 | Store limits UI  | `maxValueBytes` / `maxKeys` are constructor options in the Kotlin and JavaScript engines, but neither Settings screen exposes them; only the Go node has flags | Add the two fields to both settings screens |
@@ -648,6 +698,12 @@ What it needed that the engine did not have:
 * **A key fingerprint.** Two nodes that cannot talk usually differ in the
   psk or the cluster name, and neither is printable. `Codec.KeyFingerprint`
   is comparable at a glance and gives nothing away.
+* **A refusal counter.** Every rule here reads a counter, so a counter that
+  conflates two causes makes the matching rule unwritable. `KVRefused` is
+  kept apart from `KVRejectedStale` (§5.6) precisely so there can be a rule
+  about it: stale rejections are normal and alert on nothing, a refusal
+  means this replica can never converge. It is the only finding here that
+  no amount of waiting clears.
 
 Findings are available three ways: `GET /diagnostics` (JSON, or
 `?format=text` for something pasteable), `D` in the TUI, and
@@ -659,9 +715,12 @@ start into a red screen.
 ## 14. Consistency checking
 
 Anti-entropy repairs divergence but never reports it, so a cluster can sit
-split — or a peer can quietly refuse everything it is sent — for as long as
-nobody looks. `KindFingerprint` / `KindFingerprintReply` (§3.2) is the
-looking.
+split for as long as nobody looks. `KindFingerprint` /
+`KindFingerprintReply` (§3.2) is the looking.
+
+A peer that *refuses* what it is sent is the other half, and it is now
+reported at the node that refuses rather than only inferred from here: see
+§5.6.
 
 A reply summarises the whole store as 16 bucket digests. A key's bucket
 comes from the hash of its **name alone**; what is folded into that bucket
@@ -681,11 +740,13 @@ load-bearing:
 Tombstones are included: two replicas that disagree about whether a key is
 deleted have diverged just as much as two that disagree about its value.
 
-The digests are byte-for-byte identical across the Go and JavaScript
-stores, pinned by fixed vectors in both suites — an implementation that
-folded differently would report two converged replicas as divergent, which
-is the loudest possible false alarm from the one feature whose entire job
-is to be believed.
+The digests are byte-for-byte identical across the Go, Kotlin and
+JavaScript stores, pinned by the same fixed vectors in all three suites
+(`TestFingerprintMatchesThePublishedVectors`, `the store fingerprint
+matches the Go vectors byte for byte` in both ports) — an implementation
+that folded differently would report two converged replicas as divergent,
+which is the loudest possible false alarm from the one feature whose entire
+job is to be believed.
 
 `Node.CheckConsistency` asks every peer in parallel and compares. It goes
 over **streams, not datagrams**: a dropped answer would read as a peer that

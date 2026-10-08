@@ -10,11 +10,18 @@ the code it touches.
 
 ## Shipped
 
-The repository is at **0.4.2** — the version the Makefile stamps into the Go
+The repository is at **0.4.3** — the version the Makefile stamps into the Go
 binaries and their `.deb`, the desktop client's `package.json`, and the Android
 app's `versionName`; a test keeps the four in step.
 
-0.4.2 is a bug-fix round out of an end-to-end run on a physical Android tablet
+0.4.3 is a documentation round over 0.4.2's fixes. The automated checks were
+all green and stayed green: what they cannot see is a claim nobody thought to
+encode, and five had gone stale — including the picture saying **"four
+implementations"** twice while drawing three, with its own footer saying "all
+three". The check written to stop that recurring found the fifth, in DESIGN.md,
+the same day.
+
+0.4.2 before it was a bug-fix round out of an end-to-end run on a physical Android tablet
 with all three implementations in one cluster. Three of the four defects it
 found were invisible to every existing test because each needed a second
 process, a second implementation, or a force-stop to show itself.
@@ -30,6 +37,37 @@ the Kotlin and JavaScript ports — which had been carrying the same anti-entrop
 defect all along.
 
 Newest first.
+
+### 0.4.3 — the documentation caught up with the fixes
+
+- ✅ **A replication rule that was never written down** — DESIGN §5 lists the
+  rules all three stores must agree on, and admission was not among them even
+  though a refusal is now a distinguishable outcome with its own counter. New
+  **§5.6**, "Admission, and why a refusal is not staleness": limits apply to a
+  peer's update as well as a local writer's, a stale rejection means
+  last-write-wins is working, and a refusal means this replica can never
+  converge until someone moves a limit.
+- ✅ **The chart said "four implementations" and drew three** — twice in the
+  header and panel title, contradicting its own footer ("all three fold the
+  same store") and every other document. Nothing caught it: a wrong *count*
+  contradicts no single claim, so the existing chart checks all passed.
+  Re-exported, and `docs.test.js` now derives the number from the repository
+  and holds the chart and the prose to it. Quoted spans are skipped, so a
+  document can still describe the mistake it used to make.
+- ✅ **DESIGN.md said it too** — found by that new check within a minute of
+  writing it, in §7's note about CI.
+- ✅ **The fingerprint vectors were credited to two ports, not three** — §14
+  said "identical across the Go and JavaScript stores" while Kotlin's
+  `ParityTest` has pinned the same vectors since 0.4.0. Exactly the drift the
+  kind-table check was added for in 0.4.1, one section over.
+- ✅ **The store-limits and chat rows in §11 were stale** — the first still
+  described a refusal as something only the consistency check could notice; the
+  second did not mention that chat has **no repair path** at all, which the
+  hardware run made visible: a dropped key heals on the next anti-entropy
+  round, a dropped line never does, and the sender's own log shows it sent.
+- ✅ **The Android role restore was undocumented**, in §9 and in
+  `android/README.md`, along with the third hardware round — the one that found
+  it.
 
 ### 0.4.2 — what a hardware end-to-end run found
 

@@ -82,11 +82,16 @@ claiming something the protocol stopped doing.
   A node bound to `:3137` otherwise tells every peer to reach it at
   `:3137`, which each of them resolves to its own loopback
 - **Store limits**: `-max-value-bytes` and `-max-keys` bound what a node
-  will hold, from a local writer or a peer
+  will hold, from a local writer or a peer — and a peer's update that is
+  refused says so, by name and by reason, instead of being filed as stale
 - **Replication metrics and an activity feed**: remote applies, stale
-  rejections, refused guarded writes and repair traffic are visible rather
-  than silent — as counters, per-peer traffic in both directions, and
-  gauges for what the store holds right now
+  rejections, writes refused by this node's limits, refused guarded writes
+  and repair traffic are visible rather than silent — as counters, per-peer
+  traffic in both directions, and gauges for what the store holds right
+  now. A refusal is counted apart from a stale rejection and raised as a
+  diagnostics error, because the two mean opposite things: one is
+  last-write-wins working, the other is a replica that cannot converge
+  until a limit moves
 - **Key history**: the recorded versions of a key, and who wrote each
 - Robust join: an unreachable or lossy bootstrap can't stall startup, and
   the node keeps retrying while it knows no peers; several seeds can be
