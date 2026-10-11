@@ -9,9 +9,11 @@ import com.nexusriot.rezoagwe.net.writeFrame
 import com.nexusriot.rezoagwe.proto.BootstrapDiscover
 import com.nexusriot.rezoagwe.proto.BootstrapRegister
 import com.nexusriot.rezoagwe.proto.BootstrapRoster
+import com.nexusriot.rezoagwe.proto.ChatBacklog
 import com.nexusriot.rezoagwe.proto.ChatEntry
 import com.nexusriot.rezoagwe.proto.ChatKind
 import com.nexusriot.rezoagwe.proto.ChatMessage
+import com.nexusriot.rezoagwe.proto.ChatPull
 import com.nexusriot.rezoagwe.proto.Codec
 import com.nexusriot.rezoagwe.proto.DecodeError
 import com.nexusriot.rezoagwe.proto.DecodeException
@@ -25,6 +27,7 @@ import com.nexusriot.rezoagwe.proto.KVAction
 import com.nexusriot.rezoagwe.proto.KVBatch
 import com.nexusriot.rezoagwe.proto.KVUpdate
 import com.nexusriot.rezoagwe.proto.Kind
+import com.nexusriot.rezoagwe.proto.MAX_CHAT_PULL
 import com.nexusriot.rezoagwe.proto.PeerGossip
 import com.nexusriot.rezoagwe.proto.PullRequest
 import com.nexusriot.rezoagwe.proto.StateRequest
@@ -158,11 +161,18 @@ class NodeEngine(
 
     private val peers = LinkedHashMap<String, Peer>()
     private val idToAddr = HashMap<String, String>()
+    /** node id -> what has claimed it, for spotting two nodes sharing one identity. */
+    private val idBindings = HashMap<String, IdBinding>()
+    /** Peer addresses seen announcing this node's own id. */
+    private val impostorAddrs = LinkedHashSet<String>()
     // What each peer last told us its own peer list was. This is the only source
     // of links between two nodes that are not us, and so the only way the app can
     // draw the cluster rather than just our corner of it.
     private val gossipViews = LinkedHashMap<String, GossipView>()
     private val chatLog = mutableListOf<ChatEntry>()
+    /** This node's own broadcast counter; [chatGaps] follows everyone else's. */
+    private var chatSeq = 0L
+    private val chatGaps = ChatTracker()
     private val activityLog = mutableListOf<String>()
     private var persistGen = 0L
 
@@ -206,6 +216,11 @@ class NodeEngine(
         if (saved != null) {
             store.loadState(saved.clock, saved.entries)
             chatLog.addAll(saved.chat)
+            chatSeq = saved.chatSeq
+            // The log on disk knows how far each author had got. Without this
+            // the tracker starts blank and anything said while this node was
+            // down is lost in silence.
+            chatGaps.seed(saved.chat)
         }
         store.setOnChange(::persist)
         if (saved == null || saved.nodeId != nodeId) persist()
@@ -246,6 +261,8 @@ class NodeEngine(
             transport = null
             peers.clear()
             idToAddr.clear()
+            idBindings.clear()
+            impostorAddrs.clear()
             gossipViews.clear()
         }
         publishPeers()
@@ -338,7 +355,7 @@ class NodeEngine(
 
     private fun peerAddrs(): List<String> = synchronized(lock) { peers.keys.toList() }
 
-    private fun helloMessage() = Hello(from = addr, nick = nick, id = nodeId)
+    private fun helloMessage() = Hello(from = addr, nick = nick, id = nodeId, chatSeq = chatSeq)
 
     private fun helloAllPeers() = broadcast(Kind.HELLO, helloMessage())
 
@@ -377,6 +394,7 @@ class NodeEngine(
         synchronized(lock) {
             peers.remove(peerAddr)
             idToAddr.entries.removeAll { it.value == peerAddr }
+            idBindings.entries.removeAll { it.value.addr == peerAddr }
             // A departed peer's cursor goes with it, or a long-running node
             // accumulates one per address it has ever spoken to, and a peer that
             // returns resumes a walk from before it left.
@@ -396,6 +414,11 @@ class NodeEngine(
         if (!known) return
         val peerNick = nickOf(peerAddr)
         removePeer(peerAddr)
+        // Forgetting a peer is a deliberate "drop this node", so its chat
+        // bookkeeping goes too. Eviction deliberately does *not* do this: a
+        // peer that falls quiet for fifteen seconds and comes back is exactly
+        // the one whose outstanding gaps are still worth asking for.
+        chatGaps.forget(peerAddr)
         announceLeave(peerAddr, peerNick)
     }
 
@@ -403,6 +426,53 @@ class NodeEngine(
 
     private fun isSelf(candidate: String): Boolean =
         candidate == addr || normalizeAddr(candidate) == normalizeAddr(addr)
+
+    /**
+     * Maps a peer's stable id to its address, and notices when one id is
+     * claimed by more than one address.
+     *
+     * A node id is what every version is stamped with, so two nodes sharing
+     * one — a copied state file, a cloned image, a restored backup — write
+     * versions that compare equal while holding different values. Neither side
+     * is newer, so neither ever accepts the other and the two stay split
+     * permanently: the one divergence anti-entropy cannot repair.
+     */
+    fun setNodeId(id: String, peerAddr: String) {
+        if (id.isEmpty() || peerAddr.isEmpty()) return
+        val at = System.currentTimeMillis() / 1000
+        synchronized(lock) {
+            idToAddr[id] = peerAddr
+            // A peer announcing this node's own id is the unambiguous case: no
+            // address change explains it.
+            if (id == nodeId && !isSelf(peerAddr)) impostorAddrs.add(peerAddr)
+
+            val prev = idBindings[id]
+            if (prev == null) {
+                idBindings[id] = IdBinding(addr = peerAddr, at = at)
+                return@synchronized
+            }
+            if (prev.addr == peerAddr) return@synchronized
+            // A node that genuinely moved address rebinds once and then stays
+            // put; two nodes sharing an id rebind on every heartbeat either one
+            // sends, so the count is what tells the two apart.
+            idBindings[id] = IdBinding(
+                addr = peerAddr, other = prev.addr, flips = prev.flips + 1, at = at,
+            )
+        }
+    }
+
+    /** Every node id seen claimed by more than one address, worst first. */
+    fun idConflicts(): List<IdConflict> = synchronized(lock) {
+        idBindings.entries
+            .filter { it.value.flips > 0 && it.value.other.isNotEmpty() }
+            .map { (id, b) ->
+                IdConflict(id = id, addrs = listOf(b.other, b.addr), flips = b.flips, at = b.at)
+            }
+            .sortedWith(compareByDescending<IdConflict> { it.flips }.thenBy { it.id })
+    }
+
+    /** Peer addresses seen announcing this node's own id, sorted. */
+    fun impostors(): List<String> = synchronized(lock) { impostorAddrs.sorted() }
 
     /** Renders a version's origin as something readable. */
     fun writerName(id: String): String {
@@ -509,6 +579,10 @@ class NodeEngine(
 
     private fun sendChatMessage(text: String, action: Boolean) {
         val ts = System.currentTimeMillis() / 1000
+        val seq = synchronized(lock) { ++chatSeq }
+        // The sequence goes into the log as well as onto the wire: this node is
+        // the only one that can answer a pull for its own seq 7, and it answers
+        // it out of here.
         appendChat(
             ChatEntry(
                 ts = ts,
@@ -516,9 +590,140 @@ class NodeEngine(
                 nick = nick,
                 text = text,
                 kind = if (action) ChatKind.ACTION else ChatKind.MESSAGE,
+                seq = seq,
+                node = nodeId,
             )
         )
-        broadcast(Kind.CHAT, ChatMessage(sender = addr, nick = nick, text = text, ts = ts, action = action))
+        broadcast(
+            Kind.CHAT,
+            ChatMessage(
+                sender = addr, nick = nick, text = text, ts = ts,
+                action = action, seq = seq, node = nodeId,
+            ),
+        )
+    }
+
+    /**
+     * Asks each author for the lines of its own that never arrived.
+     *
+     * Rides the gossip tick rather than firing on the gap itself: a missing
+     * sequence is most often a reordering that resolves within milliseconds,
+     * and asking immediately would turn every reorder into a round trip.
+     */
+    fun pullChatGaps() {
+        for (plan in chatGaps.pullPlans()) {
+            metrics.chatPullsSent.incrementAndGet()
+            send(plan.addr, Kind.CHAT_PULL, ChatPull(from = addr, seqs = plan.seqs))
+        }
+    }
+
+    /** What each author's stream looks like from here, for the diagnostics. */
+    fun chatGapStats(): List<ChatGapStat> =
+        chatGaps.stats().map { it.copy(nick = nickOf(it.addr)) }
+
+    /**
+     * Runs one broadcast past the sequence tracker and appends it if it is new,
+     * reporting whether it was.
+     *
+     * A duplicate is dropped rather than appended. That matters more than it
+     * used to: re-delivering a line is exactly what the repair path does, so
+     * without this the cure would put a second copy of every recovered line on
+     * screen.
+     */
+    private fun acceptChat(m: ChatMessage): Boolean {
+        // Nothing legitimate delivers this node its own broadcast: it appends
+        // its own lines on send, and no peer echoes them back. Taking one is
+        // how a single bad line spreads — it lands in *our* log, is handed out
+        // in every state snapshot afterwards, and every node that syncs seeds
+        // its high-water mark for us from it. One forged sequence then
+        // silences this node across the whole cluster.
+        val selfAuthored = (m.node.isNotEmpty() && m.node == nodeId) ||
+            (m.node.isEmpty() && m.sender.isNotEmpty() && m.sender == addr)
+        if (selfAuthored) {
+            metrics.chatSelfAttributed.incrementAndGet()
+            return false
+        }
+        val before = chatGaps.outstanding()
+        var recovered = false
+        when (chatGaps.observe(m)) {
+            ChatOutcome.DUPLICATE -> {
+                metrics.chatDuplicates.incrementAndGet()
+                return false
+            }
+            ChatOutcome.FILLED_GAP -> {
+                metrics.chatRecovered.incrementAndGet()
+                recovered = true
+            }
+            ChatOutcome.ACCEPT -> {
+                val grew = chatGaps.outstanding() - before
+                if (grew > 0) metrics.chatGapsFound.addAndGet(grew.toLong())
+            }
+        }
+        val entry = ChatEntry(
+            ts = m.ts,
+            sender = m.sender,
+            nick = m.nick,
+            text = m.text,
+            kind = if (m.action) ChatKind.ACTION else ChatKind.MESSAGE,
+            seq = m.seq,
+            node = m.node,
+        )
+        // A repaired line is older than everything that followed it, so it goes
+        // back where it was said rather than at the bottom.
+        if (recovered) insertChat(entry) else appendChat(entry)
+        return true
+    }
+
+    /**
+     * Answers a peer asking for lines of ours it never received.
+     *
+     * Only our own broadcasts are served. A third party's copy of someone
+     * else's seq 7 is hearsay — it would propagate whatever that node happened
+     * to hold, including nothing.
+     */
+    private fun handleChatPull(req: ChatPull) {
+        if (req.from.isEmpty() || req.seqs.isEmpty()) return
+        val wanted = req.seqs.take(MAX_CHAT_PULL)
+        val mine = synchronized(lock) {
+            chatLog.filter { it.seq != 0L && it.sender == addr }.associateBy { it.seq }
+        }
+        val messages = mutableListOf<ChatMessage>()
+        val gone = mutableListOf<Long>()
+        for (s in wanted) {
+            val e = mine[s]
+            if (e == null) {
+                gone += s
+            } else {
+                messages += ChatMessage(
+                    sender = e.sender, nick = e.nick, text = e.text, ts = e.ts,
+                    action = e.kind == ChatKind.ACTION, seq = e.seq, node = nodeId,
+                )
+            }
+        }
+        metrics.chatPullsServed.incrementAndGet()
+        send(req.from, Kind.CHAT_BACKLOG, ChatBacklog(from = addr, messages = messages, unavailable = gone))
+    }
+
+    /** Folds a backlog into the log, and records what the author cannot supply. */
+    private fun handleChatBacklog(reply: ChatBacklog) {
+        for (m in reply.messages) {
+            // A repair repairs; it never introduces. See ChatTracker.expecting
+            // for what accepting an unasked-for line costs.
+            val author = m.node.ifEmpty { m.sender }
+            if (!chatGaps.expecting(author, reply.from, m.seq)) {
+                metrics.chatUnsolicited.incrementAndGet()
+                logActivity("ignored an unasked-for chat line in a backlog from ${nickOf(reply.from)}")
+                continue
+            }
+            acceptChat(m)
+        }
+        if (reply.unavailable.isNotEmpty()) {
+            chatGaps.markUnavailable(reply.from, reply.unavailable)
+            metrics.chatLost.addAndGet(reply.unavailable.size.toLong())
+            logActivity(
+                "${nickOf(reply.from)} can no longer supply ${reply.unavailable.size} chat line(s) this node missed"
+            )
+        }
     }
 
     fun sendDirect(target: String, text: String): Boolean {
@@ -608,6 +813,33 @@ class NodeEngine(
     fun system(text: String) =
         appendChat(ChatEntry(ts = System.currentTimeMillis() / 1000, text = text, kind = ChatKind.SYSTEM))
 
+    /**
+     * Places a line that arrived out of order where it belongs, rather than at
+     * the bottom.
+     *
+     * A recovered line is by definition older than what is already on screen —
+     * appending it would answer "which line did I miss?" by putting the answer
+     * after the lines that followed it, which reads as a new message rather
+     * than a repair. Timestamps are per second, so two lines in the same
+     * second from one author are separated by their sequence.
+     */
+    private fun insertChat(entry: ChatEntry) {
+        synchronized(lock) {
+            var i = chatLog.size
+            while (i > 0) {
+                val prev = chatLog[i - 1]
+                val older = prev.ts < entry.ts ||
+                    (prev.ts == entry.ts && !(prev.sender == entry.sender && prev.seq > entry.seq))
+                if (older) break
+                i--
+            }
+            chatLog.add(i, entry)
+            while (chatLog.size > CHAT_RING) chatLog.removeAt(0)
+        }
+        persist()
+        publishChat()
+    }
+
     private fun appendChat(entry: ChatEntry) {
         synchronized(lock) {
             chatLog.add(entry)
@@ -680,6 +912,8 @@ class NodeEngine(
                 // datagram reply needs accepting but not correlating.
                 Kind.FINGERPRINT_REPLY ->
                     touchPeer(WireJson.decodeFromString<FingerprintReply>(body).from)
+                Kind.CHAT_PULL -> handleChatPull(WireJson.decodeFromString<ChatPull>(body))
+                Kind.CHAT_BACKLOG -> handleChatBacklog(WireJson.decodeFromString<ChatBacklog>(body))
                 Kind.BOOTSTRAP_ROSTER -> applyRoster(WireJson.decodeFromString<BootstrapRoster>(body))
                 else -> metrics.malformedDrops.incrementAndGet()
             }
@@ -728,15 +962,7 @@ class NodeEngine(
     private fun handleChat(m: ChatMessage) {
         touchPeer(m.sender)
         if (m.nick.isNotEmpty()) setNick(m.sender, m.nick)
-        appendChat(
-            ChatEntry(
-                ts = m.ts,
-                sender = m.sender,
-                nick = m.nick,
-                text = m.text,
-                kind = if (m.action) ChatKind.ACTION else ChatKind.MESSAGE,
-            )
-        )
+        if (!acceptChat(m)) return
         if (addPeer(m.sender)) {
             announceJoin(m.sender, m.nick)
             send(m.sender, Kind.HELLO, helloMessage())
@@ -800,6 +1026,10 @@ class NodeEngine(
                 chatLog.addAll(ordered.takeLast(CHAT_RING))
                 true
             }
+            // A snapshot delivers history in bulk rather than line by line, so
+            // the tracker has to be told what it holds — otherwise this node
+            // keeps asking the author for lines it now has.
+            chatGaps.seed(resp.chat)
             if (grew) {
                 persist()
                 publishChat()
@@ -814,7 +1044,7 @@ class NodeEngine(
     private fun handleGossip(g: PeerGossip) {
         touchPeer(g.from)
         if (g.nick.isNotEmpty()) setNick(g.from, g.nick)
-        if (g.id.isNotEmpty()) synchronized(lock) { idToAddr[g.id] = g.from }
+        if (g.id.isNotEmpty()) setNodeId(g.id, g.from)
         recordView(g.from, g.peers)
         if (addPeer(g.from)) {
             announceJoin(g.from, g.nick)
@@ -831,7 +1061,13 @@ class NodeEngine(
     private fun handleHello(h: Hello) {
         touchPeer(h.from)
         if (h.nick.isNotEmpty()) setNick(h.from, h.nick)
-        if (h.id.isNotEmpty()) synchronized(lock) { idToAddr[h.id] = h.from }
+        if (h.id.isNotEmpty()) setNodeId(h.id, h.from)
+        // The heartbeat says how far this author's own numbering has got,
+        // which is how a quiet peer's lines become recoverable at all.
+        val before = chatGaps.outstanding()
+        chatGaps.announce(h.id.ifEmpty { h.from }, h.from, h.chatSeq)
+        val grew = chatGaps.outstanding() - before
+        if (grew > 0) metrics.chatGapsFound.addAndGet(grew.toLong())
         if (addPeer(h.from)) announceJoin(h.from, h.nick)
     }
 
@@ -1003,6 +1239,12 @@ class NodeEngine(
         /** Whether that side holds a tombstone rather than a value: same key, different fix. */
         val localDeleted: Boolean = false,
         val remoteDeleted: Boolean = false,
+        /**
+         * The one difference replication cannot repair: both replicas hold this
+         * key at the identical version but different values, so neither side is
+         * newer. It always means two nodes are writing under one node id.
+         */
+        val sameVersion: Boolean = false,
     )
 
     /**
@@ -1094,7 +1336,15 @@ class NodeEngine(
         for (l in local) {
             seen.add(l.key)
             val r = remote[l.key]
-            if (r != null && r.version == l.version && r.deleted == l.deleted) continue
+            val agreed = r != null && r.version == l.version && r.deleted == l.deleted
+            // Equal versions holding different values is divergence, not
+            // agreement: neither side is newer, so replication will never
+            // resolve it. A peer too old to send a hash sends an empty one,
+            // which cannot be compared and so is not treated as a difference.
+            val sameVersion = agreed && r != null &&
+                r.valueHash.isNotEmpty() && l.valueHash.isNotEmpty() &&
+                r.valueHash != l.valueHash
+            if (agreed && !sameVersion) continue
             diffs.add(
                 KeyDifference(
                     key = l.key,
@@ -1102,6 +1352,7 @@ class NodeEngine(
                     localDeleted = l.deleted,
                     remote = r?.let { formatVersion(it.version) } ?: "",
                     remoteDeleted = r?.deleted ?: false,
+                    sameVersion = sameVersion,
                 ),
             )
         }
@@ -1269,6 +1520,8 @@ class NodeEngine(
         if (target.isEmpty()) return
         send(target, Kind.PEER_GOSSIP, PeerGossip(from = addr, nick = nick, id = nodeId, peers = peerAddrs()))
         antiEntropyRound(target)
+        // And the same for chat, which has no digest of its own.
+        pullChatGaps()
     }
 
     private suspend fun heartbeatLoop() {
@@ -1337,7 +1590,13 @@ class NodeEngine(
             persistGen++
             gen = persistGen
             val (clock, entries) = store.snapshotState()
-            state = PersistState(nodeId = nodeId, clock = clock, entries = entries, chat = chatLog.toList())
+            state = PersistState(
+                nodeId = nodeId,
+                clock = clock,
+                entries = entries,
+                chat = chatLog.toList(),
+                chatSeq = chatSeq,
+            )
         }
         p.save(gen, state)
     }
@@ -1474,6 +1733,9 @@ class NodeEngine(
             seeds = config.seeds,
             peers = peerRows,
             strangers = strangers,
+            chatGaps = chatGapStats(),
+            idConflicts = idConflicts(),
+            impostors = impostors(),
             store = store.stats().copy(digestCursor = sweepSummary()),
             metrics = snapshot,
             topology = _topology.value,

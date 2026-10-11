@@ -74,10 +74,14 @@ claiming something the protocol stopped doing.
   evicted — each named, with what to do about it
 - **Consistency check** (`v`, `GET /consistency`, *Verify replicas* on
   Android): asks every peer to summarise its whole store and reports who
-  disagrees, and about which region of the keyspace. Anti-entropy repairs
-  divergence but never reports it, so a cluster can sit split for as long as
-  nobody looks. All three implementations answer and all three can ask; their
-  bucket digests are pinned to each other byte for byte
+  disagrees, about which region of the keyspace, and which keys. Anti-entropy
+  repairs divergence but never reports it, so a cluster can sit split for as
+  long as nobody looks. The summary covers each entry's key, version, whether
+  it is deleted **and a hash of its value**, so two replicas holding different
+  data at the same version — what two nodes started from a copied state file
+  produce, and the one split replication can never repair — are reported rather
+  than mistaken for agreement. All three implementations answer and all three
+  can ask; their bucket digests are pinned to each other byte for byte
 - **`-advertise`**: what peers are told, separate from what the node binds.
   A node bound to `:3137` otherwise tells every peer to reach it at
   `:3137`, which each of them resolves to its own loopback
@@ -100,6 +104,17 @@ claiming something the protocol stopped doing.
   quit, and stale-peer eviction
 - Built-in chat with nicknames, `/me` emotes, direct messages, per-sender
   colours and slash commands shared by every front end
+- **Chat delivery you can check**: every broadcast carries its author's own
+  sequence number, and every heartbeat says where that author's numbering
+  stands — so a line that never arrived is *named* rather than silently
+  absent, even from a peer that has since gone quiet. It is then asked for
+  from the author, re-inserted where it was said, and recognised as a
+  re-delivery instead of shown twice; a line the author can no longer supply
+  is reported as lost rather than pending forever. The repair channel can only
+  ever *fill a gap that was asked for*, never introduce a line. Chat has no
+  digest behind it the way the store does, so before this a dropped line was
+  not quiet, it was invisible: the sender's log said sent and no counter
+  anywhere moved
 - Per-node TUI on `tview`/`tcell`: keys list with filter and expiry
   markers, details, peer list, a feed pane that toggles between chat and
   replication activity, modals for history, metrics, help and

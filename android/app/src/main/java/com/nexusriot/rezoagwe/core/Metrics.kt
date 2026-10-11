@@ -25,6 +25,23 @@ class Metrics {
     val malformedDrops = AtomicLong()
 
     val kvApplied = AtomicLong()
+
+    /**
+     * Chat has no digest to repair it, so these are the only evidence that a
+     * line went missing at all.
+     */
+    val chatGapsFound = AtomicLong()
+    val chatRecovered = AtomicLong()
+    val chatLost = AtomicLong()
+    val chatPullsSent = AtomicLong()
+    val chatPullsServed = AtomicLong()
+    val chatDuplicates = AtomicLong()
+
+    /** Backlog lines dropped because nothing asked for them. */
+    val chatUnsolicited = AtomicLong()
+
+    /** Inbound chat claiming to be written by this node. Nothing legitimate does. */
+    val chatSelfAttributed = AtomicLong()
     val kvRejectedStale = AtomicLong()
 
     /**
@@ -179,6 +196,14 @@ class Metrics {
             skewDrops = skewDrops.get(),
             malformedDrops = malformedDrops.get(),
             kvApplied = kvApplied.get(),
+            chatGapsFound = chatGapsFound.get(),
+            chatRecovered = chatRecovered.get(),
+            chatLost = chatLost.get(),
+            chatPullsSent = chatPullsSent.get(),
+            chatPullsServed = chatPullsServed.get(),
+            chatDuplicates = chatDuplicates.get(),
+            chatUnsolicited = chatUnsolicited.get(),
+            chatSelfAttributed = chatSelfAttributed.get(),
             kvRejectedStale = kvRejectedStale.get(),
             kvRefused = kvRefused.get(),
             kvLocalWrites = kvLocalWrites.get(),
@@ -272,6 +297,14 @@ data class MetricsSnapshot(
     val skewDrops: Long = 0,
     val malformedDrops: Long = 0,
     val kvApplied: Long = 0,
+    val chatGapsFound: Long = 0,
+    val chatRecovered: Long = 0,
+    val chatLost: Long = 0,
+    val chatPullsSent: Long = 0,
+    val chatPullsServed: Long = 0,
+    val chatDuplicates: Long = 0,
+    val chatUnsolicited: Long = 0,
+    val chatSelfAttributed: Long = 0,
     val kvRejectedStale: Long = 0,
     val kvRefused: Long = 0,
     val kvLocalWrites: Long = 0,

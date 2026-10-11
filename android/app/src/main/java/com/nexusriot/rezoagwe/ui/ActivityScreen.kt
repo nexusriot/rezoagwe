@@ -72,6 +72,14 @@ private fun MetricsCard(m: MetricsSnapshot) {
             MetricRow("expired", m.kvExpired)
             MetricRow("tombstones reclaimed", m.kvGced)
 
+            Text("Chat delivery", fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 8.dp))
+            MetricRow("gaps found", m.chatGapsFound)
+            MetricRow("recovered", m.chatRecovered)
+            MetricRow("lost", m.chatLost)
+            MetricRow("duplicates dropped", m.chatDuplicates)
+            MetricRow("unasked-for, refused", m.chatUnsolicited)
+            MetricRow("claimed to be ours", m.chatSelfAttributed)
+
             Text("Anti-entropy", fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 8.dp))
             MetricRow("digests sent", m.aeRounds)
             MetricRow("entries pushed", m.aePushed)

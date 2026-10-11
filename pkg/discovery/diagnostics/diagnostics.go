@@ -51,6 +51,37 @@ type Stranger struct {
 	Rejected  uint64 `json:"rejected"`
 }
 
+// ChatGap is one author's chat delivery record: lines still being asked for,
+// lines given up on, and lines a backlog pull actually recovered.
+type ChatGap struct {
+	Addr        string `json:"addr"`
+	Nick        string `json:"nick,omitempty"`
+	Outstanding int    `json:"outstanding"`
+	Lost        uint64 `json:"lost"`
+	Recovered   uint64 `json:"recovered"`
+}
+
+// IDConflictFlips is how often one node id must change hands before it is
+// reported. A node that genuinely moved address rebinds once and stays; two
+// nodes sharing an identity rebind on every heartbeat either one sends.
+const IDConflictFlips = 3
+
+// shortID abbreviates a node id for a one-line title.
+func shortID(id string) string {
+	if len(id) <= 8 {
+		return id
+	}
+	return id[:8]
+}
+
+// IDConflict is one node id claimed by two different addresses.
+type IDConflict struct {
+	ID    string   `json:"id"`
+	Addrs []string `json:"addrs"`
+	Flips uint64   `json:"flips"`
+	At    int64    `json:"at"`
+}
+
 // Snapshot is everything the rules read. It is a plain struct so a test can
 // fabricate any cluster condition without running one.
 type Snapshot struct {
@@ -68,7 +99,12 @@ type Snapshot struct {
 	StreamListener bool             `json:"stream_listener"`
 	Seeds          []string         `json:"seeds"`
 	Peers          []Peer           `json:"peers"`
+	ChatGaps       []ChatGap        `json:"chat_gaps,omitempty"`
 	Strangers      []Stranger       `json:"strangers"`
+	// IDConflicts are node ids seen claimed by more than one address, and
+	// Impostors peer addresses seen claiming this node's own id.
+	IDConflicts []IDConflict `json:"id_conflicts,omitempty"`
+	Impostors   []string     `json:"impostors,omitempty"`
 	Metrics        metrics.Snapshot `json:"-"`
 	Gauges         metrics.Gauges   `json:"gauges"`
 	Topology       topology.Graph   `json:"topology"`
@@ -92,6 +128,27 @@ func Checks(d Snapshot, now time.Time) []Check {
 			fmt.Sprintf("Something on this network frames packets with a different key. Check that every "+
 				"node shares the pre-shared key and the cluster name %q (key fingerprint %s).",
 				d.Cluster, d.KeyFingerprint))
+	}
+	for _, addr := range d.Impostors {
+		add(SeverityError, fmt.Sprintf("%s is using this node's identity", addr),
+			fmt.Sprintf("That peer announces node id %s, which is this node's. A node generates its "+
+				"id once and keeps it, so the two are running from copies of one state file. Every "+
+				"version both write is stamped with the same id, so their writes to a shared key "+
+				"compare equal, neither replica accepts the other, and the values stay different "+
+				"for good. Stop one and delete its state file so it starts with a fresh identity.",
+				d.NodeID))
+	}
+	for _, c := range d.IDConflicts {
+		if c.Flips < IDConflictFlips {
+			// One rebinding is what a node changing address looks like.
+			continue
+		}
+		add(SeverityError,
+			fmt.Sprintf("node id %s is claimed by %s and %s", shortID(c.ID), c.Addrs[0], c.Addrs[1]),
+			fmt.Sprintf("The claim has moved between those addresses %d times. A node that changed "+
+				"address would rebind once; repeated rebinding means both are live and sharing one "+
+				"identity, so their writes compare equal and any key they both set stays split "+
+				"permanently. Stop one and delete its state file.", c.Flips))
 	}
 	if m.SkewDrops > 0 {
 		add(SeverityError, fmt.Sprintf("%d packet(s) dropped for clock skew", m.SkewDrops),
@@ -119,6 +176,56 @@ func Checks(d Snapshot, now time.Time) []Check {
 			detail += fmt.Sprintf(" This store currently holds %d key(s).", d.Gauges.Keys)
 		}
 		add(SeverityError, fmt.Sprintf("%d remote update(s) refused by this node's limits", m.KVRefused), detail)
+	}
+	if m.ChatUnsolicited > 0 || m.ChatSelfAttributed > 0 {
+		// Both are refusals, so nothing is broken here — but neither has a
+		// legitimate cause. A backlog only ever answers a request this node
+		// made, and no peer ever echoes this node its own lines, so a peer
+		// doing either is running something that does not match the protocol.
+		// Worth saying out loud: left unchecked these are exactly the frames
+		// that used to raise an author's sequence out of reach and silence
+		// them here for good.
+		add(SeverityWarn, fmt.Sprintf("%d chat frame(s) refused as malformed repair",
+			m.ChatUnsolicited+m.ChatSelfAttributed),
+			fmt.Sprintf("%d backlog line(s) nobody asked for and %d line(s) claiming to be "+
+				"written by this node. Both were dropped, and neither has a legitimate "+
+				"cause: a backlog only answers a request this node made, and no peer echoes "+
+				"a node its own lines. Some peer is running something that does not match "+
+				"the protocol.", m.ChatUnsolicited, m.ChatSelfAttributed))
+	}
+	if len(d.ChatGaps) > 0 {
+		// Chat is the one payload with no digest behind it, so a line that
+		// never arrived leaves no trace in the store to compare. Before the
+		// sequence existed this was not a quiet failure, it was an invisible
+		// one: the author's log said sent, every receiver simply never had it,
+		// and no counter moved at either end.
+		var lost, outstanding uint64
+		var worst string
+		for _, g := range d.ChatGaps {
+			lost += g.Lost
+			outstanding += uint64(g.Outstanding)
+			if g.Lost > 0 && worst == "" {
+				worst = g.Nick
+				if worst == "" {
+					worst = g.Addr
+				}
+			}
+		}
+		switch {
+		case lost > 0:
+			detail := fmt.Sprintf("%d chat line(s) will not arrive: the author no longer holds "+
+				"them, or never answered a request for them. Unlike a key, a chat line has no "+
+				"digest to repair it from a third party — only its author can re-send it, and "+
+				"only while it is still in that node's ring.", lost)
+			if worst != "" {
+				detail += fmt.Sprintf(" The earliest were from %s.", worst)
+			}
+			add(SeverityWarn, fmt.Sprintf("%d chat line(s) lost", lost), detail)
+		case outstanding > 0:
+			add(SeverityInfo, fmt.Sprintf("%d chat line(s) not yet arrived", outstanding),
+				"A gap in an author's sequence. Most are a reordering that closes on its own; "+
+					"the rest are asked for on the next gossip tick.")
+		}
 	}
 	if m.ReplayDrops > 0 {
 		add(SeverityInfo, fmt.Sprintf("%d replayed packet(s) ignored", m.ReplayDrops),

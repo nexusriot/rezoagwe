@@ -38,6 +38,9 @@ const (
 	preJoinKey  = "pre-join/secret-of-the-mountain"
 	preJoinVal  = "written before dave arrived"
 	preJoinChat = "this was said before dave arrived"
+	// Said by the node that restarts, before it restarts, so there is a
+	// sequence for the second process to continue from.
+	restartChatBefore = "frank said this before going down"
 
 	// Larger than any datagram, so it can only reach a peer over a stream.
 	// Seeded with the rest so the late joiner and the restarted node have to
@@ -90,6 +93,16 @@ func seed() error {
 	}
 	if err := post("POST", a.url+"/chat", preJoinChat); err != nil {
 		return fmt.Errorf("seeding the chat log: %w", err)
+	}
+	// Best effort, and deliberately not fatal: this only has to land before
+	// node-restart's first process is killed, and a slow start could put it
+	// after. The test that reads it says so if it is missing rather than
+	// failing the whole suite here.
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); {
+		if err := post("POST", restart.url+"/chat", restartChatBefore); err == nil {
+			break
+		}
+		time.Sleep(250 * time.Millisecond)
 	}
 	// Twice, deliberately, and close enough together to share a timestamp.
 	for i := 0; i < 2; i++ {
@@ -426,7 +439,7 @@ func keySet(entries []entry) map[string]string {
 func TestARestartedNodeKeepsItsStoreWithoutRelivingTheConversation(t *testing.T) {
 	// Not "is it answering" — it was answering before it went down. The uptime
 	// going backwards is what says the process behind the address is a new one.
-	waitRestarted(t, restart, envSeconds("E2E_RESTART_SEC", 30)+settle)
+	ensureRestarted(t, restart, envSeconds("E2E_RESTART_SEC", 30)+settle)
 	eventually(t, "the restarted node to rejoin", settle, func() (bool, string) {
 		if h := restart.health(t); !h.Connected {
 			return false, fmt.Sprintf("peers = %d", h.Peers)

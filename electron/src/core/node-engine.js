@@ -11,6 +11,7 @@ const { StoreRefusal } = require('./refusal');
 const { writeFrame, readFrame, frameWithLength } = require('../net/framing');
 const { normalizeAddr, validPeerAddr, localIpv4 } = require('../net/addr');
 const { KvStore } = require('./kvstore');
+const { ChatTracker, ChatOutcome } = require('./chatseq');
 const { Metrics } = require('./metrics');
 const { Persister } = require('./persistence');
 const { buildTopology, placeGraph } = require('./topology');
@@ -110,6 +111,10 @@ class NodeEngine extends EventEmitter {
     this.timers = [];
     this.peers = new Map();
     this.idToAddr = new Map();
+    /** node id -> {addr, other, flips, at}, for spotting two nodes sharing one identity. */
+    this.idBindings = new Map();
+    /** Peer addresses seen announcing this node's own id. */
+    this.impostors = new Set();
     // What each peer last told us its own peer list was. This is the only source
     // of links between two nodes that are not us, and so the only way the app can
     // draw the cluster rather than just our corner of it.
@@ -121,6 +126,9 @@ class NodeEngine extends EventEmitter {
     // peers the random target happened to pick, so covering the whole store
     // against any single peer took as many wraps as there were peers.
     this.aeCursors = new Map();
+    // This node's own broadcast counter; chatGaps follows everyone else's.
+    this.chatSeq = 0;
+    this.chatGaps = new ChatTracker();
     this.startedAtMs = 0;
     this.nick = this.config.nick;
 
@@ -133,6 +141,14 @@ class NodeEngine extends EventEmitter {
           // one unreadable line is not worth discarding the conversation
         }
       }
+      // Persisted for the same reason the node id is: a restart that began
+      // counting again at 1 would make every peer read the whole conversation
+      // as a gap.
+      this.chatSeq = Number(saved.chat_seq) || 0;
+      // The log on disk knows how far each author had got. Without this the
+      // tracker starts blank and anything said while this node was down is
+      // lost in silence.
+      this.chatGaps.seed(this.chatLog);
     }
     this.store.setOnChange(() => this.persist());
     // A freshly generated identity has to reach disk even before the first
@@ -200,6 +216,8 @@ class NodeEngine extends EventEmitter {
     await transport.close();
     this.peers.clear();
     this.idToAddr.clear();
+    this.idBindings.clear();
+    this.impostors.clear();
     this.gossipViews.clear();
     if (this.persister) await this.persister.flush();
     this.publishPeers();
@@ -308,7 +326,7 @@ class NodeEngine extends EventEmitter {
   }
 
   helloMessage() {
-    return W.encodeHello({ from: this.addr, nick: this.nick, id: this.nodeId });
+    return W.encodeHello({ from: this.addr, nick: this.nick, id: this.nodeId, chatSeq: this.chatSeq });
   }
 
   helloAllPeers() {
@@ -351,6 +369,7 @@ class NodeEngine extends EventEmitter {
   removePeer(addr) {
     this.peers.delete(addr);
     for (const [id, mapped] of [...this.idToAddr]) if (mapped === addr) this.idToAddr.delete(id);
+    for (const [id, b] of [...this.idBindings]) if (b.addr === addr) this.idBindings.delete(id);
     this.publishPeers();
     // A departed peer's cursor goes with it, or a long-running node accumulates
     // one per address it has ever spoken to, and a peer that returns resumes a
@@ -368,6 +387,11 @@ class NodeEngine extends EventEmitter {
     if (!this.peers.has(addr)) return false;
     const nick = this.nickOf(addr);
     this.removePeer(addr);
+    // Forgetting a peer is a deliberate "drop this node", so its chat
+    // bookkeeping goes too. Eviction deliberately does *not* do this: a peer
+    // that falls quiet for fifteen seconds and comes back is exactly the one
+    // whose outstanding gaps are still worth asking for.
+    this.chatGaps.forget(addr);
     this.announceLeave(addr, nick);
     return true;
   }
@@ -379,6 +403,46 @@ class NodeEngine extends EventEmitter {
 
   isSelf(candidate) {
     return candidate === this.addr || normalizeAddr(candidate) === normalizeAddr(this.addr);
+  }
+
+  /**
+   * Maps a peer's stable id to its address, and notices when one id is claimed
+   * by more than one address.
+   *
+   * A node id is what every version is stamped with, so two nodes sharing one
+   * — a copied state file, a cloned image, a restored backup — write versions
+   * that compare equal while holding different values. Neither side is newer,
+   * so neither ever accepts the other and the two stay split permanently: the
+   * one divergence anti-entropy cannot repair.
+   */
+  setNodeId(id, addr) {
+    if (!id || !addr) return;
+    this.idToAddr.set(id, addr);
+    // A peer announcing this node's own id is the unambiguous case: no address
+    // change explains it.
+    if (id === this.nodeId && !this.isSelf(addr)) this.impostors.add(addr);
+
+    const prev = this.idBindings.get(id);
+    const at = Math.floor(Date.now() / 1000);
+    if (!prev) {
+      this.idBindings.set(id, { addr, other: '', flips: 0, at });
+      return;
+    }
+    if (prev.addr === addr) return;
+    // A node that genuinely moved address rebinds once and then stays put; two
+    // nodes sharing an id rebind on every heartbeat either one sends, so the
+    // count is what tells the two apart.
+    this.idBindings.set(id, { addr, other: prev.addr, flips: prev.flips + 1, at });
+  }
+
+  /** Every node id seen claimed by more than one address, worst first. */
+  idConflicts() {
+    const out = [];
+    for (const [id, b] of this.idBindings) {
+      if (!b.flips || !b.other) continue;
+      out.push({ id, addrs: [b.other, b.addr], flips: b.flips, at: b.at });
+    }
+    return out.sort((a, b) => b.flips - a.flips || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
   }
 
   /** Renders a version's origin as something a human can read. */
@@ -519,6 +583,10 @@ class NodeEngine extends EventEmitter {
 
   async sendChatMessage(text, action) {
     const ts = Math.floor(this.now() / 1000);
+    const seq = ++this.chatSeq;
+    // The sequence goes into the log as well as onto the wire: this node is
+    // the only one that can answer a pull for its own seq 7, and it answers it
+    // out of here.
     this.appendChat({
       ts,
       sender: this.addr,
@@ -526,10 +594,164 @@ class NodeEngine extends EventEmitter {
       text,
       kind: action ? ChatKind.ACTION : ChatKind.MESSAGE,
       to: '',
+      seq,
+      node: this.nodeId,
     });
     await this.broadcast(Kind.CHAT, W.encodeChatMessage({
-      sender: this.addr, nick: this.nick, text, ts, action,
+      sender: this.addr, nick: this.nick, text, ts, action, seq, node: this.nodeId,
     }));
+  }
+
+  /**
+   * Asks each author for the lines of its own that never arrived.
+   *
+   * Rides the gossip tick rather than firing on the gap itself: a missing
+   * sequence is most often a reordering that resolves within milliseconds, and
+   * asking immediately would turn every reorder into a round trip.
+   */
+  async pullChatGaps() {
+    for (const plan of this.chatGaps.pullPlans()) {
+      this.metrics.chatPullsSent++;
+      await this.send(plan.addr, Kind.CHAT_PULL,
+        W.encodeChatPull({ from: this.addr, seqs: plan.seqs }));
+    }
+  }
+
+  /** What each author's stream looks like from here, for the diagnostics. */
+  chatGapStats() {
+    return this.chatGaps.stats().map((g) => ({ ...g, nick: this.nickOf(g.addr) }));
+  }
+
+  /**
+   * Runs one broadcast past the sequence tracker and appends it if it is new,
+   * reporting whether it was.
+   *
+   * A duplicate is dropped rather than appended. That matters more than it
+   * used to: re-delivering a line is exactly what the repair path does, so
+   * without this the cure would put a second copy of every recovered line on
+   * screen.
+   */
+  acceptChat(m) {
+    // Nothing legitimate delivers this node its own broadcast: it appends its
+    // own lines on send, and no peer echoes them back. Taking one is how a
+    // single bad line spreads — it lands in *our* log, is handed out in every
+    // state snapshot afterwards, and every node that syncs seeds its
+    // high-water mark for us from it. One forged sequence then silences this
+    // node across the whole cluster.
+    const selfAuthored = (m.node && m.node === this.nodeId)
+      || (!m.node && m.sender && m.sender === this.addr);
+    if (selfAuthored) {
+      this.metrics.chatSelfAttributed++;
+      return false;
+    }
+    const before = this.chatGaps.outstanding();
+    let recovered = false;
+    const outcome = this.chatGaps.observe(m);
+    if (outcome === ChatOutcome.DUPLICATE) {
+      this.metrics.chatDuplicates++;
+      return false;
+    }
+    if (outcome === ChatOutcome.FILLED_GAP) {
+      this.metrics.chatRecovered++;
+      recovered = true;
+    } else {
+      const grew = this.chatGaps.outstanding() - before;
+      if (grew > 0) this.metrics.chatGapsFound += grew;
+    }
+    const entry = {
+      ts: m.ts,
+      sender: m.sender,
+      nick: m.nick,
+      text: m.text,
+      kind: m.action ? ChatKind.ACTION : ChatKind.MESSAGE,
+      to: '',
+      seq: m.seq,
+      node: m.node,
+    };
+    // A repaired line is older than everything that followed it, so it goes
+    // back where it was said rather than at the bottom.
+    if (recovered) this.insertChat(entry);
+    else this.appendChat(entry);
+    return true;
+  }
+
+  /**
+   * Answers a peer asking for lines of ours it never received.
+   *
+   * Only our own broadcasts are served. A third party's copy of someone else's
+   * seq 7 is hearsay — it would propagate whatever that node happened to hold,
+   * including nothing.
+   */
+  async handleChatPull(req) {
+    if (!req.from || req.seqs.length === 0) return;
+    const wanted = req.seqs.slice(0, W.MAX_CHAT_PULL);
+    const mine = new Map();
+    for (const e of this.chatLog) {
+      if (e.seq && e.sender === this.addr) mine.set(e.seq, e);
+    }
+    const messages = [];
+    const unavailable = [];
+    for (const s of wanted) {
+      const e = mine.get(s);
+      if (!e) unavailable.push(s);
+      else {
+        messages.push({
+          sender: e.sender, nick: e.nick, text: e.text, ts: e.ts,
+          action: e.kind === ChatKind.ACTION, seq: e.seq, node: this.nodeId,
+        });
+      }
+    }
+    this.metrics.chatPullsServed++;
+    await this.send(req.from, Kind.CHAT_BACKLOG,
+      W.encodeChatBacklog({ from: this.addr, messages, unavailable }));
+  }
+
+  /** Folds a backlog into the log, and records what the author cannot supply. */
+  handleChatBacklog(reply) {
+    for (const m of reply.messages) {
+      // A repair repairs; it never introduces. See ChatTracker.expecting for
+      // what accepting an unasked-for line costs.
+      if (!this.chatGaps.expecting(m.node || m.sender, reply.from, m.seq)) {
+        this.metrics.chatUnsolicited++;
+        this.logActivity(
+          `ignored an unasked-for chat line in a backlog from ${this.nickOf(reply.from)}`,
+        );
+        continue;
+      }
+      this.acceptChat(m);
+    }
+    if (reply.unavailable.length) {
+      this.chatGaps.markUnavailable(reply.from, reply.unavailable);
+      this.metrics.chatLost += reply.unavailable.length;
+      this.logActivity(
+        `${this.nickOf(reply.from)} can no longer supply ${reply.unavailable.length} chat line(s) this node missed`,
+      );
+    }
+  }
+
+  /**
+   * Places a line that arrived out of order where it belongs, rather than at
+   * the bottom.
+   *
+   * A recovered line is by definition older than what is already on screen —
+   * appending it would answer "which line did I miss?" by putting the answer
+   * after the lines that followed it, which reads as a new message rather than
+   * a repair. Timestamps are per second, so two lines in the same second from
+   * one author are separated by their sequence.
+   */
+  insertChat(entry) {
+    let i = this.chatLog.length;
+    while (i > 0) {
+      const prev = this.chatLog[i - 1];
+      const older = prev.ts < entry.ts
+        || (prev.ts === entry.ts && !(prev.sender === entry.sender && (prev.seq || 0) > (entry.seq || 0)));
+      if (older) break;
+      i--;
+    }
+    this.chatLog.splice(i, 0, entry);
+    while (this.chatLog.length > CHAT_RING) this.chatLog.shift();
+    this.persist();
+    this.publishChat();
   }
 
   /** Delivers a message to one peer only, addressed by nickname or address. */
@@ -753,6 +975,12 @@ class NodeEngine extends EventEmitter {
         case Kind.FINGERPRINT:
           await this.handleFingerprint(W.decodeFingerprint(body));
           break;
+        case Kind.CHAT_PULL:
+          await this.handleChatPull(W.decodeChatPull(body));
+          break;
+        case Kind.CHAT_BACKLOG:
+          this.handleChatBacklog(W.decodeChatBacklog(body));
+          break;
         case Kind.FINGERPRINT_REPLY:
           // The checker reads its answers off the stream it asked over, so a
           // datagram reply needs accepting but not correlating.
@@ -863,13 +1091,20 @@ class NodeEngine extends EventEmitter {
     for (const l of local) {
       seen.add(l.key);
       const r = remote.get(l.key);
-      if (r && versionEqual(r.version, l.version) && !!r.deleted === !!l.deleted) continue;
+      const agreed = !!r && versionEqual(r.version, l.version) && !!r.deleted === !!l.deleted;
+      // Equal versions holding different values is divergence, not agreement:
+      // neither side is newer, so replication will never resolve it. A peer too
+      // old to send a hash sends an empty one, which cannot be compared and so
+      // is not treated as a difference.
+      const sameVersion = agreed && !!r.vhash && !!l.vhash && r.vhash !== l.vhash;
+      if (agreed && !sameVersion) continue;
       diffs.push({
         key: l.key,
         local: formatVersion(l.version),
         localDeleted: !!l.deleted,
         remote: r ? formatVersion(r.version) : '',
         remoteDeleted: r ? !!r.deleted : false,
+        sameVersion,
       });
     }
     // Keys the peer holds and this node has never seen: the direction a
@@ -880,6 +1115,7 @@ class NodeEngine extends EventEmitter {
       diffs.push({
         key: r.key, local: '', localDeleted: false,
         remote: formatVersion(r.version), remoteDeleted: !!r.deleted,
+        sameVersion: false,
       });
     }
     diffs.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
@@ -984,14 +1220,7 @@ class NodeEngine extends EventEmitter {
   async handleChat(m) {
     this.touchPeer(m.sender);
     if (m.nick) this.setPeerNick(m.sender, m.nick);
-    this.appendChat({
-      ts: m.ts,
-      sender: m.sender,
-      nick: m.nick,
-      text: m.text,
-      kind: m.action ? ChatKind.ACTION : ChatKind.MESSAGE,
-      to: '',
-    });
+    if (!this.acceptChat(m)) return;
     // Learn about a chat sender we did not know as a peer.
     if (this.addPeer(m.sender)) {
       this.announceJoin(m.sender, m.nick);
@@ -1033,7 +1262,13 @@ class NodeEngine extends EventEmitter {
         this.metrics.kvRejectedStale++;
       }
     }
-    if (resp.chat.length) this.mergeChat(resp.chat);
+    if (resp.chat.length) {
+      this.mergeChat(resp.chat);
+      // A snapshot delivers history in bulk rather than line by line, so the
+      // tracker has to be told what it holds — otherwise this node keeps
+      // asking the author for lines it now has.
+      this.chatGaps.seed(resp.chat);
+    }
     if (changed) {
       this.logActivity(`state sync merged ${resp.kv.length} entries`);
       this.publishEntries();
@@ -1082,7 +1317,7 @@ class NodeEngine extends EventEmitter {
   async handleGossip(g) {
     this.touchPeer(g.from);
     if (g.nick) this.setPeerNick(g.from, g.nick);
-    if (g.id) this.idToAddr.set(g.id, g.from);
+    if (g.id) this.setNodeId(g.id, g.from);
     this.recordView(g.from, g.peers);
     if (this.addPeer(g.from)) {
       this.announceJoin(g.from, g.nick);
@@ -1099,7 +1334,13 @@ class NodeEngine extends EventEmitter {
   handleHello(h) {
     this.touchPeer(h.from);
     if (h.nick) this.setPeerNick(h.from, h.nick);
-    if (h.id) this.idToAddr.set(h.id, h.from);
+    if (h.id) this.setNodeId(h.id, h.from);
+    // The heartbeat says how far this author's own numbering has got, which
+    // is how a quiet peer's lines become recoverable at all.
+    const before = this.chatGaps.outstanding();
+    this.chatGaps.announce(h.id || h.from, h.from, h.chatSeq);
+    const grew = this.chatGaps.outstanding() - before;
+    if (grew > 0) this.metrics.chatGapsFound += grew;
     if (this.addPeer(h.from)) this.announceJoin(h.from, h.nick);
   }
 
@@ -1369,6 +1610,8 @@ class NodeEngine extends EventEmitter {
       from: this.addr, nick: this.nick, id: this.nodeId, peers: this.peerAddrs(),
     }));
     await this.antiEntropyRound(target);
+    // And the same for chat, which has no digest of its own.
+    await this.pullChatGaps();
   }
 
   async heartbeatTick() {
@@ -1431,6 +1674,7 @@ class NodeEngine extends EventEmitter {
       clock,
       entries,
       chat: this.chatLog.map(W.encodeChatEntry),
+      chat_seq: this.chatSeq,
     });
   }
 
@@ -1592,6 +1836,9 @@ class NodeEngine extends EventEmitter {
       seeds: this.config.seeds,
       peers,
       strangers,
+      idConflicts: this.idConflicts(),
+      impostors: [...this.impostors].sort(),
+      chatGaps: this.chatGapStats(),
       store: { ...this.store.stats(), digestCursor: this.sweepSummary() },
       metrics: snapshot,
       topology: this.topology(),

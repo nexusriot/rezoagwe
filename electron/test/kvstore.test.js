@@ -259,8 +259,8 @@ test('stats describe the shape of the store for the diagnostics screen', () => {
 //
 // These are the digests the Go KVStore.Fingerprint emits for the entries below.
 const GO_FINGERPRINT = {
-  7: 'a2026aaa5ddb78cb47d1db8e5973b787420dafb7fc1ad30cca5944a5495f9898',
-  13: '5afa98b8cab4abc9294acac825fad1b3f02d6125ec2f5b0def0456acb56e3abc',
+  7: '2b28e2ab4fe49de1ac3292835d3f89a2d896a3349a7cba255bfb32eefce76ffd',
+  13: '80c5334e9dffd54e9791a5080260534d255246b82b94077e9537e2ef01c05fd3',
 };
 const ZERO = '0'.repeat(64);
 
@@ -353,4 +353,50 @@ test('applyWithReason separates a refusal from staleness', () => {
   // apply keeps its boolean contract for callers that only ask whether the
   // store changed.
   assert.equal(kv.apply({ action: KVAction.SET, key: 'd', value: 'fits', version: version(12, 'p') }), false);
+});
+
+/**
+ * The case the fingerprint was blind to.
+ *
+ * Two nodes started from copies of one state file share a node id, so their
+ * writes to a shared key carry the *same* version. Neither is newer, so
+ * neither replica ever accepts the other and the values stay different for
+ * good — and the fingerprint, which folded the version but not the value,
+ * reported the two as identical. Measured on a live six-node cluster: 45
+ * seconds of anti-entropy, both sides still split, `converged: true`.
+ */
+test('two values at one version do not fingerprint the same', () => {
+  const ver = { counter: 100, node: '00000000-dead-beef' };
+  const a = new KvStore('node-a');
+  a.apply({ action: KVAction.SET, key: 'race', value: 'written-by-A', version: ver, expiresAt: 0, deletedAt: 0 });
+  const b = new KvStore('node-b');
+  b.apply({ action: KVAction.SET, key: 'race', value: 'written-by-B', version: ver, expiresAt: 0, deletedAt: 0 });
+
+  assert.notDeepEqual(a.fingerprint().buckets, b.fingerprint().buckets,
+    'two replicas holding different values at one version fingerprinted identically');
+
+  // And the second round names the key rather than reporting a bucket it
+  // cannot explain.
+  const bucket = a.fingerprint().buckets.findIndex((d, i) => d !== b.fingerprint().buckets[i]);
+  const [ea] = a.bucketEntries(FINGERPRINT_BUCKETS, [bucket]);
+  const [eb] = b.bucketEntries(FINGERPRINT_BUCKETS, [bucket]);
+  assert.equal(ea.key, 'race');
+  assert.deepEqual(ea.version, eb.version, 'the test is not reproducing the equal-version case');
+  assert.ok(ea.vhash && ea.vhash !== eb.vhash, 'the value hashes did not distinguish the two');
+});
+
+/**
+ * Applying a remote update stores whatever value rides along with a delete,
+ * and nothing on the wire guarantees that field is cleared. Folding it in
+ * would make two replicas holding the same tombstone report as divergent.
+ */
+test('a value carried by a tombstone is not fingerprinted', () => {
+  const ver = { counter: 4, node: 'node-a' };
+  const clean = new KvStore('node-a');
+  clean.apply({ action: KVAction.DELETE, key: 'gone', value: '', version: ver, expiresAt: 0, deletedAt: 1700000000 });
+  const noisy = new KvStore('node-b');
+  noisy.apply({ action: KVAction.DELETE, key: 'gone', value: 'left over', version: ver, expiresAt: 0, deletedAt: 1700000000 });
+
+  assert.deepEqual(clean.fingerprint().buckets, noisy.fingerprint().buckets,
+    'a value carried by a delete made two identical tombstones look divergent');
 });

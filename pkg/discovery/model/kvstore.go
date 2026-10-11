@@ -41,6 +41,21 @@ func (e kvEntry) visible(now int64) bool {
 	return !e.Deleted && !e.expired(now)
 }
 
+// valueHash summarises the value for the consistency check, which compares
+// replicas without shipping what they hold.
+//
+// A tombstone always hashes as empty. Apply stores whatever Value rides along
+// with a remote delete, and nothing on the wire guarantees that field is
+// cleared, so folding it in would let a harmless difference in an unused field
+// read as divergence. What a tombstone means is carried by Deleted.
+func (e kvEntry) valueHash() string {
+	if e.Deleted || e.Value == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(e.Value))
+	return hex.EncodeToString(sum[:])
+}
+
 // PersistState is the on-disk form of a node: its identity, the Lamport clock,
 // every entry (tombstones included) and the chat ring, so versions, write
 // ordering and conversation all survive a restart.
@@ -49,6 +64,10 @@ type PersistState struct {
 	Clock   uint64             `json:"clock"`
 	Entries map[string]kvEntry `json:"entries"`
 	Chat    pb.ChatLog         `json:"chat,omitempty"`
+	// ChatSeq is how many chat broadcasts this node has sent. It is persisted
+	// for the same reason the node id is: a restart that began counting again
+	// at 1 would make every peer read the whole conversation as a gap.
+	ChatSeq uint64 `json:"chat_seq,omitempty"`
 }
 
 // Entry is the exported view of a stored key.
@@ -617,6 +636,8 @@ func (kv *KVStore) Fingerprint(buckets int) pb.FingerprintReply {
 		h.Write([]byte(k))
 		h.Write([]byte{0})
 		fmt.Fprintf(h, "%d/%s/%t", e.Version.Counter, e.Version.Node, e.Deleted)
+		h.Write([]byte{0})
+		h.Write([]byte(e.valueHash()))
 		var sum [sha256.Size]byte
 		copy(sum[:], h.Sum(nil))
 
@@ -670,7 +691,9 @@ func (kv *KVStore) BucketEntries(buckets int, want []int) []pb.KeyVersion {
 		if !wanted[bucketOf(k, buckets)] {
 			continue
 		}
-		out = append(out, pb.KeyVersion{Key: k, Version: e.Version, Deleted: e.Deleted})
+		out = append(out, pb.KeyVersion{
+			Key: k, Version: e.Version, Deleted: e.Deleted, ValueHash: e.valueHash(),
+		})
 	}
 	kv.mu.RUnlock()
 

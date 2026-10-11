@@ -27,6 +27,22 @@ data class KvEntry(
 ) {
     fun expired(nowSec: Long): Boolean = expiresAt != 0L && nowSec >= expiresAt
     fun visible(nowSec: Long): Boolean = !deleted && !expired(nowSec)
+
+    /**
+     * Summarises the value for the consistency check, which compares replicas
+     * without shipping what they hold.
+     *
+     * A tombstone always hashes as empty. Applying a remote update stores
+     * whatever value rides along with a delete, and nothing on the wire
+     * guarantees that field is cleared, so folding it in would let a harmless
+     * difference in an unused field read as divergence. What a tombstone means
+     * is carried by [deleted].
+     */
+    fun valueHash(): String {
+        if (deleted || value.isEmpty()) return ""
+        return MessageDigest.getInstance("SHA-256").digest(value.toByteArray())
+            .joinToString("") { "%02x".format(it) }
+    }
 }
 
 /** The exported view of a live key. */
@@ -194,7 +210,14 @@ class KvStore(
         return synchronized(lock) {
             store.entries
                 .filter { wanted.contains(bucketOf(it.key, n)) }
-                .map { KeyVersion(key = it.key, version = it.value.version, deleted = it.value.deleted) }
+                .map {
+                    KeyVersion(
+                        key = it.key,
+                        version = it.value.version,
+                        deleted = it.value.deleted,
+                        valueHash = it.value.valueHash(),
+                    )
+                }
         }.sortedBy { it.key }
     }
 
@@ -399,6 +422,8 @@ class KvStore(
             digest.update(k.toByteArray())
             digest.update(byteArrayOf(0))
             digest.update("${e.version.counter}/${e.version.node}/${e.deleted}".toByteArray())
+            digest.update(byteArrayOf(0))
+            digest.update(e.valueHash().toByteArray())
             val sum = digest.digest()
 
             val fold = folds[idx]

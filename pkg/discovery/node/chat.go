@@ -58,13 +58,43 @@ func (n *Node) sendChatMessage(text string, action bool) {
 		Text:   text,
 		TS:     time.Now().Unix(),
 		Action: action,
+		Seq:    n.Model.NextChatSeq(),
+		Node:   n.Model.NodeID,
 	}
 	kind := pb.ChatMsg
 	if action {
 		kind = pb.ChatAction
 	}
-	n.appendChat(pb.ChatEntry{TS: m.TS, Sender: m.Sender, Nick: m.Nick, Text: text, Kind: kind})
+	// The sequence goes into the log as well as onto the wire: this node is
+	// the only one that can answer a ChatPull for its own Seq 7, and it
+	// answers it out of here.
+	n.appendChat(pb.ChatEntry{
+		TS: m.TS, Sender: m.Sender, Nick: m.Nick, Text: text, Kind: kind, Seq: m.Seq, Node: m.Node,
+	})
 	n.broadcast(pb.KindChat, m)
+}
+
+// pullChatGaps asks each author for the lines of its own that never arrived.
+//
+// It rides the gossip tick rather than firing on the gap itself: a missing
+// sequence is most often a reordering that resolves on its own within
+// milliseconds, and asking immediately would turn every reorder into a
+// round trip.
+func (n *Node) pullChatGaps() {
+	for _, plan := range n.chatGaps.PullPlans() {
+		n.Metrics.ChatPullsSent.Add(1)
+		n.send(plan.Addr, pb.KindChatPull, pb.ChatPull{From: n.cfg.AdvertiseAddr, Seqs: plan.Seqs})
+	}
+}
+
+// ChatGaps reports what each author's stream looks like from here: lines still
+// being asked for, lines given up on, and lines a pull recovered.
+func (n *Node) ChatGaps() []ChatGapStat {
+	stats := n.chatGaps.Stats()
+	for i := range stats {
+		stats[i].Nick = n.Model.NickOf(stats[i].Addr)
+	}
+	return stats
 }
 
 // SendDM delivers a message to one peer only, addressed by nickname or

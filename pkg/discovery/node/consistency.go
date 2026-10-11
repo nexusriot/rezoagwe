@@ -62,6 +62,11 @@ type KeyDifference struct {
 	// than a value: same key, same disagreement, different fix.
 	LocalDeleted  bool `json:"local_deleted,omitempty"`
 	RemoteDeleted bool `json:"remote_deleted,omitempty"`
+	// SameVersion marks the one difference replication cannot repair: both
+	// replicas hold this key at the identical version but different values,
+	// so neither side's write is newer and anti-entropy will leave them split
+	// forever. It means two nodes are writing under one node id.
+	SameVersion bool `json:"same_version,omitempty"`
 }
 
 // ConsistencyReport is the answer to the question anti-entropy never asks out
@@ -199,10 +204,20 @@ func (n *Node) namedDifferences(addr string, buckets []int) ([]KeyDifference, in
 	for _, l := range local {
 		seen[l.Key] = true
 		r, ok := remote[l.Key]
-		if ok && r.Version.Equal(l.Version) && r.Deleted == l.Deleted {
+		agreed := ok && r.Version.Equal(l.Version) && r.Deleted == l.Deleted
+		// Equal versions holding different values is divergence, not agreement.
+		// A peer too old to send a hash sends an empty one, which cannot be
+		// compared and so is not treated as a difference.
+		sameVersion := agreed && r.ValueHash != l.ValueHash &&
+			r.ValueHash != "" && l.ValueHash != ""
+		if agreed && !sameVersion {
 			continue
 		}
-		d := KeyDifference{Key: l.Key, Local: formatVersion(l.Version), LocalDeleted: l.Deleted}
+		d := KeyDifference{
+			Key:   l.Key,
+			Local: formatVersion(l.Version), LocalDeleted: l.Deleted,
+			SameVersion: sameVersion,
+		}
 		if ok {
 			d.Remote = formatVersion(r.Version)
 			d.RemoteDeleted = r.Deleted

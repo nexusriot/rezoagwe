@@ -232,6 +232,92 @@ tapping a field scrolls the page under the tap, so coordinates captured from
 an earlier dump land on the wrong row: re-dump and confirm which field reports
 itself focused before typing.
 
+### The chat-sequencing round, on the same tablet
+
+A fourth run, driving the chat sequence over a real radio for the first time:
+two Go peers and the desktop client on one machine, the tablet as the fourth
+node.
+
+What it confirmed, none of which a simulated network can:
+
+* **A line lost to a genuine Wi-Fi outage is named, asked for and recovered.**
+  One line dropped by turning the radio off reported `gaps found 1`, was pulled
+  from its author and re-inserted where it was said. An eighty-line outage
+  recovered all eighty in order, over four pull rounds — the sixty-four-per-
+  request bound doing its job.
+* **The sequence survives a force-stop**: 4 → 5 across a restart, with zero
+  duplicates, so peers that still remember the old process accept the new one's
+  lines instead of discarding them as ones they already hold.
+* **Both halves work in both ports.** The tablet asking a Go peer, and a
+  headless JavaScript engine making *the tablet* serve a backlog — including
+  the "I no longer hold that" answer, which stops the asking.
+* `/me` is sequenced; `/msg` deliberately is not and consumes no broadcast
+  number.
+* **Every line is either delivered or named.** Flooding an author's own
+  five-hundred-line ring past a line the tablet still needed left
+  468 recovered + 101 reported lost = 569, the author's whole sequence, with
+  Diag reading *"101 chat line(s) lost … only while it is still in that node's
+  ring. The earliest were from alice."*
+
+What it found, all three fixed in the same round and described in
+[DESIGN §5.7](../DESIGN.md#57-chat-delivery-and-the-gap-that-used-to-be-invisible):
+a backlog could **introduce** a line nobody asked for, which raised an author's
+sequence out of reach and silenced them at that node permanently; a node would
+accept a line claiming to be its own, which put it in the log every snapshot is
+built from and spread the silence; and a **quiet author's** lines were
+unrecoverable, because the baseline waited for them to speak rather than being
+set when the two nodes met.
+
+### The split-identity round, with six nodes and a copied state file
+
+A fifth run on the same tablet, with the cast turned up: a Go rendezvous and
+four Go peers, the Electron client, and the tablet, all in one cluster.
+
+Held up: pathological keys (empty, 8000 characters, embedded NUL and newline,
+`..`, nested `a/b/c`) all written, read back, listed and deleted through the
+gateway and replicated identically to every node. A token-protected read-only
+gateway refused every mutating route with `403` and every unauthenticated
+one — `/health` and `/metrics` included — with `401`. A node whose first seed
+was dead joined through the second and synced all 107 keys. Six rapid
+*Stop node* / *Start node* toggles with no settling time left one socket, six
+peers and no crash. Airplane mode on and off recovered five chat lines through
+the repair path and the key written while the tablet was away through
+anti-entropy; `am force-stop` followed by a relaunch restored the node by
+itself and recovered four more, all nine landing in the persisted log with the
+right per-author sequence numbers.
+
+What it found:
+
+* **Two nodes sharing a node id diverge permanently, and the consistency check
+  called the cluster converged.** Started two peers from copies of one state
+  file and raced a write at both: they landed on the identical version, so
+  neither was newer, neither replica ever accepted the other, and 45 seconds of
+  anti-entropy left them split — while `/consistency` reported `converged:
+  true`, every peer agreeing, and Diag said the node looked healthy. The
+  fingerprint folded the version and not the value, so two replicas holding
+  different data at one version were indistinguishable to the one tool built to
+  find divergence. The fold now covers a hash of the value in all three ports
+  (a protocol change — see [DESIGN §14](../DESIGN.md#14-consistency-checking)),
+  the report names the key and flags it `same_version`, and the duplicate
+  identity itself is reported: each twin names the other, and a third party
+  counts how often the id changes hands — 58 flips against 1 for a node that
+  genuinely moved address ([DESIGN §14.1](../DESIGN.md#141-two-nodes-under-one-identity)).
+* **This port recommended tombstone GC without the warning that makes it
+  safe.** Demonstrated on an isolated pair: with a 15 s age, a node stopped
+  before a delete came back still holding the value and the delete was undone
+  on both nodes, with `/consistency` reporting them converged. That is inherent
+  to GC in a last-write-wins store and is documented in
+  [DESIGN §5.5](../DESIGN.md#55-tombstone-gc), but the advice here — and in the
+  Electron client — said only *"Set one in Settings if deletes are frequent"*,
+  dropping the clause the Go port carries about the age having to exceed the
+  longest outage. The two ports that expose the setting as a field a non-expert
+  can change were the two not warning them.
+
+One note for whoever drives this next. The store fingerprint is a protocol
+constant: a device on an older build reports `agrees: false` against every
+rebuilt node until its APK is replaced, which looks exactly like real
+divergence. Upgrade every node before trusting a report that spans them.
+
 ## Known gaps
 
 * The battery cost of the 10 s gossip tick is still unmeasured; **Diag**

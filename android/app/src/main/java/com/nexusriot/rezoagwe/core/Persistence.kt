@@ -19,6 +19,12 @@ data class PersistState(
     val clock: Long = 0,
     val entries: Map<String, KvEntry> = emptyMap(),
     val chat: List<ChatEntry> = emptyList(),
+    /**
+     * How many chat broadcasts this node has sent, persisted for the same
+     * reason the node id is: a restart that began counting again at 1 would
+     * make every peer read the whole conversation as a gap.
+     */
+    @SerialName("chat_seq") val chatSeq: Long = 0,
 )
 
 /**

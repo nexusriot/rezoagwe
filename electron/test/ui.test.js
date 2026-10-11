@@ -350,3 +350,81 @@ test('stale rejections alone are not a finding', () => {
   const checks = healthChecks(d, Date.now());
   assert.equal(checks[0].severity, Severity.OK, JSON.stringify(checks));
 });
+
+/**
+ * Both guards refuse the frame, so nothing is broken — but neither has a
+ * legitimate cause, and these are exactly the frames that used to raise an
+ * author's sequence out of reach and silence them for good.
+ */
+test('malformed chat repair is reported', () => {
+  const d = baseDiagnostics();
+  d.metrics.chatUnsolicited = 3;
+  d.metrics.chatSelfAttributed = 1;
+
+  const checks = healthChecks(d, Date.now());
+  const found = checks.find((c) => c.title.includes('malformed repair'));
+  assert.ok(found, `no check named the refused frames: ${JSON.stringify(checks)}`);
+  assert.equal(found.severity, Severity.WARN);
+  assert.ok(found.title.includes('4'), found.title);
+  for (const want of ['nobody asked for', 'claiming to be']) {
+    assert.ok(found.detail.includes(want), `detail does not separate the causes: ${found.detail}`);
+  }
+});
+
+test('a clean cluster reports no malformed repair', () => {
+  const checks = healthChecks(baseDiagnostics(), Date.now());
+  assert.ok(!checks.some((c) => c.title.includes('malformed repair')));
+});
+
+/**
+ * Two nodes sharing an identity is the one divergence replication cannot
+ * repair, so it has to be said out loud. Measured on a live cluster: the two
+ * stayed split on a shared key for as long as they ran, and every tool
+ * reported the node healthy.
+ */
+test('a peer using this node\'s identity is an error that names it', () => {
+  const checks = healthChecks(baseDiagnostics({ impostors: ['192.168.18.79:3142'] }), Date.now());
+  const check = find(checks, "using this node's identity");
+  assert.ok(check, 'a peer announcing this node\'s own id was not reported');
+  assert.equal(check.severity, Severity.ERROR);
+  assert.match(check.title, /192\.168\.18\.79:3142/);
+  assert.match(check.detail, /state file/);
+});
+
+test('a single address change is not reported as a shared identity', () => {
+  const checks = healthChecks(baseDiagnostics({
+    idConflicts: [{ id: 'peer-id', addrs: ['a:1', 'b:1'], flips: 1, at: 0 }],
+  }), Date.now());
+  assert.ok(!find(checks, 'is claimed by'), 'a node changing address was reported as a conflict');
+});
+
+test('one id claimed by two live addresses is an error naming both', () => {
+  const checks = healthChecks(baseDiagnostics({
+    idConflicts: [{
+      id: '00000000-dead-beef', addrs: ['192.168.18.79:3141', '192.168.18.79:3142'], flips: 12, at: 0,
+    }],
+  }), Date.now());
+  const check = find(checks, 'is claimed by');
+  assert.ok(check, 'one id claimed by two addresses was not reported');
+  assert.equal(check.severity, Severity.ERROR);
+  assert.match(check.title, /3141/);
+  assert.match(check.title, /3142/);
+});
+
+/**
+ * Tombstone GC is the one setting that can silently undo a delete: a node away
+ * longer than the age comes back still holding the value and pushes it back
+ * (DESIGN.md §5.5). Demonstrated on a live pair — the delete was undone on
+ * both nodes and the consistency check reported them converged.
+ *
+ * This port exposes the age as a field in Settings, so recommending it without
+ * saying what bounds it is telling a user to lose deletes. The caveat was
+ * present in the Go port and missing from both GUI ports.
+ */
+test('the tombstone advice says what bounds the GC age, not only the benefit', () => {
+  const base = baseDiagnostics();
+  const checks = healthChecks({ ...base, store: { ...base.store, tombstones: 7 } }, Date.now());
+  const check = find(checks, 'tombstone(s) kept forever');
+  assert.ok(check, 'the tombstone advice was not produced');
+  assert.match(check.detail, /longest/, 'the advice does not say what the age must exceed');
+});

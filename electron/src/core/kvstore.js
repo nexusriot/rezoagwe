@@ -142,7 +142,7 @@ class KvStore {
     const out = [];
     for (const [k, e] of this.store) {
       if (!wanted.has(bucketOf(k, buckets))) continue;
-      out.push({ key: k, version: e.version, deleted: e.deleted });
+      out.push({ key: k, version: e.version, deleted: e.deleted, vhash: KvStore.valueHash(e) });
     }
     out.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
     return out;
@@ -150,6 +150,21 @@ class KvStore {
 
   static expired(e, nowSec) {
     return e.expiresAt !== 0 && nowSec >= e.expiresAt;
+  }
+
+  /**
+   * Summarises an entry's value for the consistency check, which compares
+   * replicas without shipping what they hold.
+   *
+   * A tombstone always hashes as empty. Applying a remote update stores
+   * whatever value rides along with a delete, and nothing on the wire
+   * guarantees that field is cleared, so folding it in would let a harmless
+   * difference in an unused field read as divergence. What a tombstone means
+   * is carried by `deleted`.
+   */
+  static valueHash(e) {
+    if (e.deleted || !e.value) return '';
+    return createHash('sha256').update(e.value, 'utf8').digest('hex');
   }
 
   static visible(e, nowSec) {
@@ -396,6 +411,8 @@ class KvStore {
         .update(k, 'utf8')
         .update(Buffer.from([0]))
         .update(`${e.version.counter}/${e.version.node}/${e.deleted ? 'true' : 'false'}`, 'utf8')
+        .update(Buffer.from([0]))
+        .update(KvStore.valueHash(e), 'utf8')
         .digest();
       const fold = folds[idx];
       for (let i = 0; i < 32; i++) fold[i] ^= sum[i];

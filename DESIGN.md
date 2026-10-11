@@ -167,6 +167,8 @@ send-error counter to say so.
 | 10   | `DirectMessage`      | chat to one peer only                            |
 | 11   | `Fingerprint`        | "summarise your whole store"                     |
 | 12   | `FingerprintReply`   | bucket digests, and the keys in the buckets asked for |
+| 13   | `ChatPull`           | "re-send these of your own chat lines"           |
+| 14   | `ChatBacklog`        | the lines asked for, and the ones gone for good  |
 | 20   | `BootstrapRegister`  | "I exist at `addr`"                              |
 | 21   | `BootstrapDiscover`  | "who is in the cluster?"                         |
 | 22   | `BootstrapRoster`    | the roster, with nicknames                       |
@@ -350,6 +352,126 @@ A node whose limits are turning a peer away used to count every refusal as
 a stale rejection, narrate `ignored stale set for <key>` for keys it had
 never held, and report itself healthy while the consistency check said it
 disagreed with every peer in nine of sixteen buckets.
+
+---
+
+### 5.7 Chat delivery, and the gap that used to be invisible
+
+A chat broadcast is one datagram per peer and nothing re-sends it. The KV
+store is repaired because every entry carries a version a digest can
+compare; a chat line carried nothing, so a dropped one was not merely
+unrecoverable — it was **undetectable**. The author's log said sent, every
+receiver's log simply never had it, and no counter at either end moved. A
+hardware run lost exactly one line this way and the only reason anyone
+noticed was that a human was reading both screens.
+
+Every broadcast now carries `Seq`, the author's own counter from 1, and
+`Node`, the author's persistent id. Keying the sequence on the id rather
+than the address is the same choice a KV version makes: a node that moves
+ports is still one author, and a node that restarts with no state file
+gets a fresh id and reads as a new one rather than appearing to rewind its
+whole conversation.
+
+That gives a receiver three outcomes instead of one:
+
+* **next in sequence** — append it;
+* **ahead of the sequence** — the lines in between are missing. They are
+  recorded, not reported: most gaps are a reordering that closes within
+  milliseconds, so the ask rides the next gossip tick;
+* **at or below the high-water mark** — either a gap being filled, or a
+  line already held. A duplicate is **dropped**, which matters more than it
+  did: re-delivering a line is exactly what the repair path does, so
+  without this the cure would put a second copy of every recovered line on
+  screen.
+
+Repair is `ChatPull` / `ChatBacklog` (§3.2), addressed **to the author**.
+Only the author can be sure what its own `Seq 7` was; asking a third party
+would propagate whatever that node happened to hold, including nothing. The
+answer carries both the lines it still has and the ones it does not —
+saying so is the point, because it turns "still waiting" into "gone", and a
+receiver that is never told keeps asking forever. An author that does not
+answer at all is given up on after a bounded number of attempts.
+
+A recovered line is inserted at its place in the conversation rather than
+appended. It is by definition older than everything that followed it, and
+appending it would answer "which line did I miss?" by putting the answer
+after the lines that came next.
+
+**Where a baseline comes from.** Three places, and the difference between
+them is the whole of this.
+
+A line *heard* advances it. The stored log at startup and a state-sync
+snapshot on join **seed** it, because both put lines into the log without
+them arriving one at a time and would otherwise go straight past the
+tracker. And every `Hello` **announces** the sender's own position.
+
+Seeding matters most at a restart, which is precisely when a line is most
+likely to have been missed: a node holding alice's lines 1–5 restarts,
+alice says 6 while it is down, and a blank tracker reads 7 as the first
+line it has ever seen from her — line 6 lost in silence. Each stored entry
+therefore records its author's id beside its sequence, the same way a KV
+entry records its writer, or the log could not say whose numbering a
+stored line belonged to.
+
+Announcing covers what seeding cannot: an author nobody has heard speak.
+Setting the baseline from the first line an author is *heard* to say
+conflates a node that was not there when the earlier lines were said, which
+has nothing to report, with one that was there the whole time and simply
+did not hear them, which has lost them. Measured on a real cluster before
+the heartbeat carried it — a peer that had never spoken said three lines
+while one node was off the air, and that node reported nothing.
+
+Neither seeding nor the first announcement ever *invents* a gap. A snapshot
+is a bounded slice of someone else's ring, so what it omits is not evidence
+of loss; and a first announcement only sets the mark, `0` included, so
+meeting a peer claims nothing about the conversation it was never part of.
+Both only close gaps and raise the high-water mark.
+
+**A node's own counter is persisted too**, for the opposite reason. If a
+restarted node began numbering again at 1, its peers — which still hold its
+earlier lines under the same node id — would read its first lines as
+duplicates they already have and **drop them**. The mechanism built to stop
+chat going missing would be the thing making it go missing, silently, on
+every restart. `TestARestartedNodeContinuesItsChatSequence` is that case,
+and it fails by the line simply never arriving.
+
+**A repair repairs; it never introduces.** A `ChatBacklog` is accepted only
+for a gap this node is already waiting for, from the author that answered.
+Without that guard one datagram carrying a line attributed to someone else,
+numbered far ahead, raised that author's high-water mark so far that every
+genuine line they sent afterwards sorted below it and was dropped as a
+duplicate — silencing them at that node permanently, through the mechanism
+built to stop chat going missing. Measured, then fixed, then re-measured.
+
+**Nothing claiming to be ours is taken.** A node appends its own lines on
+send and no peer echoes them back, so an inbound line attributed to this node
+is a bug or a forgery. Taking one put it in *our* log, which is what every
+state snapshot is built from, so one bad line spread to every node that synced
+and silenced us across the cluster. `chat_self_attributed_total` counts them.
+
+Neither guard is a security boundary — the frame is authenticated, and §11
+notes that one shared psk means any member can impersonate any other. They are
+there because a repair channel that can introduce state is a worse failure than
+the loss it repairs, and because a buggy peer needs no malice to cause it.
+
+**What it accumulates is bounded, in both directions.** The gaps waited on
+per author are capped, and so is the number of authors followed — the second
+was the one that mattered, because an author entry is created by every
+heartbeat, not only by a line, and a node restarted without a state file comes
+back with a new id. Cluster churn therefore added entries that nothing
+removed. The least recently active author is dropped, which is safe: one heard
+from again is simply met anew, and meeting claims nothing. Eviction on the
+fifteen-second timeout deliberately does *not* drop the bookkeeping — a peer
+that falls quiet and comes back is exactly the one whose outstanding gaps are
+still worth asking for — but the explicit *forget this peer* action does.
+
+Three things this deliberately is not. It is not ordering: lines from
+different authors are still interleaved by arrival. It is not a guarantee —
+a line is recoverable only while the author still holds it in its ring, and
+`ChatBacklog.Unavailable` is how a receiver finds out it never will be. And
+it is not retroactive: a peer that predates the field sends `Seq 0`, which
+is never gap-checked, because claiming a gap against a sender that does not
+number its lines would invent losses on every hop.
 
 ---
 
@@ -635,7 +757,7 @@ replicates through them in both directions.
 | Very large values | The protocol ceiling (§8.1) is what a frame can carry, not what a node can comfortably hold. Measured on a tablet: a store of ~100 MB delayed the gossip loop past the 15 s eviction window, so the phone flapped in and out of the cluster until the large keys were deleted. Nothing warns about this; `-max-value-bytes` is the lever and it is off by default | A size gauge in the diagnostics, and a default value limit |
 | Desktop renderer  | `app:snapshot` ships every value in full to the renderer on every tick, so one 64 MB value made the window unresponsive and a 154 MB state file on disk. The keys list only ever shows a truncated preview | Send previews, fetch a full value on demand |
 | Tombstones       | GC is age-based and off by default                                 | Track cluster-wide acknowledgement            |
-| Chat             | No history beyond the ring, no attachments — and **no repair path**: a chat broadcast is one datagram per peer and nothing re-sends it, so a dropped line is gone for good while the sender's own log shows it sent. A dropped *key* heals on the next anti-entropy round; a dropped line never does, and neither end can tell | Sequence chat per sender and carry the gaps in the digest exchange; paged history |
+| Chat             | A dropped line is named and asked for (§5.7), but only the **author** can answer it, and only while the line is still in that node's ring — so a line lost while its author is away for longer than the ring is gone for good, and reported as such. No history beyond that ring, and no attachments | Persist chat beyond the ring; paged history |
 | Watch            | Every consumer polls, though the engine knows exactly when a key changed | SSE on `/kv?watch=`                     |
 | Android          | Runs on hardware; the battery cost of the 10 s gossip tick is still unmeasured | Measure it over a night |
 | Store limits UI  | `maxValueBytes` / `maxKeys` are constructor options in the Kotlin and JavaScript engines, but neither Settings screen exposes them; only the Go node has flags | Add the two fields to both settings screens |
@@ -724,8 +846,8 @@ reported at the node that refuses rather than only inferred from here: see
 
 A reply summarises the whole store as 16 bucket digests. A key's bucket
 comes from the hash of its **name alone**; what is folded into that bucket
-is the hash of the whole entry (key, version, deleted). Both halves are
-load-bearing:
+is the hash of the whole entry (key, version, deleted, and a hash of the
+value). Both halves are load-bearing:
 
 * Bucketing on the name keeps a key in one bucket however its value
   changes, so a differing bucket names a stable region of the keyspace —
@@ -740,6 +862,21 @@ load-bearing:
 Tombstones are included: two replicas that disagree about whether a key is
 deleted have diverged just as much as two that disagree about its value.
 
+The **value** is included for the same reason, and it was not always. A
+digest over the version alone assumes that equal versions imply equal
+values, which holds only while every node has its own id — and two nodes
+started from a copied state file do not. Their writes to one key are
+stamped with the same counter *and* the same id, so neither is newer,
+neither replica ever accepts the other, and the two stay split for good:
+the one divergence anti-entropy cannot repair. Measured on a six-node
+cluster before this was fixed: 45 seconds of anti-entropy, both sides still
+holding different values, and the check reporting `converged: true` with
+every peer agreeing. The folded value is `sha256(value)`, and it is **empty
+for a tombstone**, because `Apply` stores whatever value rides along with a
+remote delete and nothing on the wire guarantees that field is cleared;
+what a tombstone means is carried by `deleted`. Two nodes sharing an
+identity are also reported directly — see §14.1.
+
 The digests are byte-for-byte identical across the Go, Kotlin and
 JavaScript stores, pinned by the same fixed vectors in all three suites
 (`TestFingerprintMatchesThePublishedVectors`, `the store fingerprint
@@ -747,6 +884,14 @@ matches the Go vectors byte for byte` in both ports) — an implementation
 that folded differently would report two converged replicas as divergent,
 which is the loudest possible false alarm from the one feature whose entire
 job is to be believed.
+
+Because they are a protocol constant, changing what is folded is a breaking
+change for *reporting*: a node on the old fold and one on the new disagree
+on every bucket and each reports the other as divergent, while replication
+itself carries on correctly. Observed during the upgrade that added the
+value to the fold — a tablet still on the previous build reported
+`agrees: false` against every rebuilt node until it was upgraded. Roll the
+fold out to every node before trusting a report that spans them.
 
 `Node.CheckConsistency` asks every peer in parallel and compares. It goes
 over **streams, not datagrams**: a dropped answer would read as a peer that
@@ -757,11 +902,17 @@ separately — a silent peer says nothing about whether it agrees.
 A bucket localises a disagreement to a sixteenth of the keyspace, which on
 a store of a few hundred keys is still a list to read by hand. So a peer
 that disagrees is asked a second time, with `Fingerprint.buckets` naming
-the buckets that differed, and answers with the `(key, version)` pairs it
-holds in them. Diffing those against the local ones turns "bucket 7" into
-the key, both versions, and which side holds a tombstone — including the
-keys only the peer has, which a walk over the local store cannot find and
-which are the ones that mean a write never arrived.
+the buckets that differed, and answers with the `(key, version, value hash)`
+triples it holds in them. Diffing those against the local ones turns
+"bucket 7" into the key, both versions, and which side holds a tombstone —
+including the keys only the peer has, which a walk over the local store
+cannot find and which are the ones that mean a write never arrived. A key
+both sides hold at the *identical* version but with different values is
+reported too, flagged `same_version`: it is the only difference in the
+report that replication will never repair on its own, and it always means
+two nodes are writing under one id. A peer too old to send a value hash
+sends an empty one, which reads as "cannot compare" rather than as a
+difference.
 
 The second round is skipped for peers that agree, bounded to the buckets
 that differed, and capped at 50 named keys per peer: a report is something
@@ -781,6 +932,34 @@ one, and all three initiate: `Node.CheckConsistency` in Go,
 digests are pinned to each other by fixed vectors in all three suites, and
 the pairing was exercised on hardware — a Kotlin fold and a Go fold agreeing
 byte for byte across a Wi-Fi LAN.
+
+### 14.1 Two nodes under one identity
+
+A node id is generated once and persisted. Every version is stamped with
+it, so the id is what makes two writers' versions comparable — and copying
+a state file, cloning an image or restoring a backup produces two nodes
+that are *not* comparable while looking as though they are. The damage is
+described in §14; this is the detection, and it is cheap enough that all
+three ports do it in `SetNodeID` / `setNodeId` as ids are learned from
+gossip and heartbeats.
+
+Two signals, because they have different false-positive profiles:
+
+* **A peer announcing this node's own id.** Unambiguous — no address
+  change explains it, and a node never hears its own id from anyone else.
+  Reported as an error naming the peer.
+* **One id claimed by two addresses.** Ambiguous on its own, because a
+  node that changes address rebinds its id legitimately. The discriminator
+  is *how often*: a move rebinds once and stays, while two live nodes
+  rebind on every heartbeat either one sends. The binding counts flips and
+  the rule fires at three. Measured on a live cluster, the twins reached 58
+  flips while a genuine move stays at 1.
+
+Neither is a security boundary — a shared PSK means any member can claim
+any id — and neither repairs anything. They exist because the failure is
+otherwise silent, permanent, and invisible to the one tool built to find
+it. The remedy is in the message: stop one node and delete its state file
+so it starts with a fresh identity.
 
 ## 15. Command-line reference
 

@@ -282,8 +282,17 @@ test('DESIGN.md sections are numbered in order and its own links resolve', () =>
   // GitHub lowercases, drops anything but letters, digits, spaces and hyphens,
   // then turns each remaining space into a hyphen — so "A & B" keeps the gap the
   // "&" left behind and anchors as "a--b".
-  const anchors = new Set(headings.map((h) => `#${h[1]}-${h[2].toLowerCase()
-    .replace(/[^a-z0-9 -]/g, '').replace(/ /g, '-')}`));
+  const slug = (num, title) => `#${num.replace(/\./g, '')}-${title.toLowerCase()
+    .replace(/[^a-z0-9 -]/g, '').replace(/ /g, '-')}`;
+  // Subsections count. Collecting only "## N." meant every link to a "### N.M"
+  // heading failed the moment one was written, however correct it was — the
+  // check could only ever say "not a heading there" about a heading that was
+  // right in front of it.
+  const subsections = [...design.matchAll(/^### (\d+\.\d+) (.+)$/gm)];
+  const anchors = new Set([
+    ...headings.map((h) => slug(h[1], h[2])),
+    ...subsections.map((h) => slug(h[1], h[2])),
+  ]);
   for (const doc of DOCS) {
     for (const m of read(doc).matchAll(/\]\((?:DESIGN\.md)?(#[\w-]+)\)/g)) {
       if (!m[0].includes('DESIGN.md')) continue;

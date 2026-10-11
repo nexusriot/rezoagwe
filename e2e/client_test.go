@@ -36,6 +36,10 @@ var (
 	// request. Refusing a write is a gateway and store property, not a cluster
 	// one, so it is tested where it cannot disturb anything.
 	solo = node{"node-solo", env("E2E_NODE_SOLO", "http://node-solo:8080")}
+	// Two nodes started from copies of one state file, in a cluster of their
+	// own so their permanent split cannot fail the rest of the suite.
+	twinA = node{"node-twin-a", env("E2E_NODE_TWIN_A", "http://node-twin-a:8080")}
+	twinB = node{"node-twin-b", env("E2E_NODE_TWIN_B", "http://node-twin-b:8080")}
 
 	// The whole cluster as the suite expects it to settle, leaver excluded: it
 	// is gone by the end and the tests that care name it explicitly.
@@ -100,6 +104,11 @@ type chatEntry struct {
 	Text   string `json:"text"`
 	Kind   string `json:"kind,omitempty"`
 	To     string `json:"to,omitempty"`
+	// Seq is the author's own broadcast counter, and Node the author it counts
+	// against. Both are only observable from outside through this log, which is
+	// what makes "did the numbering continue across a restart?" answerable.
+	Seq  uint64 `json:"seq,omitempty"`
+	Node string `json:"node,omitempty"`
 }
 
 type graphNode struct {
@@ -141,6 +150,9 @@ type keyDifference struct {
 	Remote        string `json:"remote,omitempty"`
 	LocalDeleted  bool   `json:"local_deleted,omitempty"`
 	RemoteDeleted bool   `json:"remote_deleted,omitempty"`
+	// SameVersion marks the one difference replication cannot repair: both
+	// sides at the identical version holding different values.
+	SameVersion bool `json:"same_version,omitempty"`
 }
 
 type peerConsistency struct {
@@ -239,6 +251,22 @@ func waitReady(t *testing.T, n node, timeout time.Duration) {
 // unambiguous sign that the process behind the address was replaced. Waiting on
 // a clock instead would mean agreeing with the container on when it started,
 // and the suite and the container do not start together.
+// restartSeen makes waiting for the restart idempotent. The event happens
+// once, so a second caller polling for the uptime to go backwards would wait
+// out its whole timeout and fail on a cluster that is behaving perfectly.
+var restartSeen bool
+
+// ensureRestarted waits for the restart the first time it is asked, and is a
+// no-op afterwards.
+func ensureRestarted(t *testing.T, n node, timeout time.Duration) {
+	t.Helper()
+	if restartSeen {
+		return
+	}
+	waitRestarted(t, n, timeout)
+	restartSeen = true
+}
+
 func waitRestarted(t *testing.T, n node, timeout time.Duration) {
 	t.Helper()
 	var highest int64 = -1

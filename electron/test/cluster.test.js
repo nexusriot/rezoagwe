@@ -4,6 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const { NodeEngine } = require('../src/core/node-engine');
+const { ID_CONFLICT_FLIPS } = require('../src/core/diagnostics');
 const { BootstrapServer } = require('../src/core/bootstrap-server');
 const { MemNetwork } = require('../src/net/mem');
 const { MAX_DATAGRAM_PAYLOAD } = require('../src/net/udp');
@@ -730,4 +731,309 @@ test('a large state response is not truncated by the close that follows it', asy
 
   assert.equal(joiner.store.size(), 40, 'the joiner got a partial store');
   assert.equal(joiner.metrics.streamErrors, 0, 'the joiner saw a broken stream');
+});
+
+/**
+ * The whole feature, between two nodes over a network that drops a packet.
+ *
+ * Before the sequence, the dropped line was gone and nothing anywhere said so:
+ * the author's log showed it sent, the receiver's simply never had it, and no
+ * counter moved at either end.
+ */
+test('a dropped chat line is detected and repaired', async () => {
+  const c = cluster();
+  const a = await c.make('alice');
+  const b = await c.make('bob');
+  await link(a, b);
+
+  await a.sendChat('first');
+  await settle();
+
+  // Exactly one line lost — the case that used to be invisible at both ends.
+  c.net.partition(a.addr, b.addr);
+  await a.sendChat('the line that never arrives');
+  await settle();
+  c.net.heal(a.addr, b.addr);
+
+  await a.sendChat('third');
+  await settle();
+
+  assert.equal(b.metrics.chatGapsFound, 1, 'the loss was still invisible');
+  assert.equal(b.chatGapStats()[0].outstanding, 1);
+
+  // The repair: b asks the author, which is the only node that can answer.
+  await b.pullChatGaps();
+  await settle();
+  await settle();
+
+  assert.equal(b.metrics.chatRecovered, 1);
+  assert.equal(b.chatGapStats()[0].outstanding, 0);
+
+  // And it is back where it was said, not after the line that followed it.
+  const said = b.chat().filter((e) => e.sender === a.addr && e.kind === '').map((e) => e.text);
+  assert.deepEqual(said, ['first', 'the line that never arrives', 'third']);
+  await c.stopAll();
+});
+
+/**
+ * The repair and the original can both land — a late datagram and a backlog
+ * racing — and the user must still see the line once.
+ */
+test('a repaired line is not delivered twice', async () => {
+  const c = cluster();
+  const a = await c.make('alice');
+  const b = await c.make('bob');
+  await link(a, b);
+
+  await a.sendChat('first');
+  await settle();
+  c.net.partition(a.addr, b.addr);
+  await a.sendChat('only once');
+  await settle();
+  c.net.heal(a.addr, b.addr);
+  await a.sendChat('third');
+  await settle();
+
+  await b.pullChatGaps();
+  await settle();
+  await settle();
+  assert.equal(b.metrics.chatRecovered, 1, 'the backlog did not fill the gap');
+
+  // And now the original turns up anyway, as a late datagram would.
+  await a.handleChat({
+    sender: a.addr, node: a.nodeId, nick: 'alice', text: 'only once',
+    ts: Math.floor(Date.now() / 1000), seq: 2, action: false, to: '',
+  });
+  await b.handleChat({
+    sender: a.addr, node: a.nodeId, nick: 'alice', text: 'only once',
+    ts: Math.floor(Date.now() / 1000), seq: 2, action: false, to: '',
+  });
+  assert.ok(b.metrics.chatDuplicates > 0, 'the late original was not recognised');
+  assert.equal(b.chat().filter((e) => e.text === 'only once').length, 1);
+  await c.stopAll();
+});
+
+/**
+ * A backlog may only fill a gap this node is already waiting for.
+ *
+ * Found on hardware: one backlog carrying a line attributed to another peer,
+ * with a large sequence, was accepted — which raised that author's high-water
+ * mark so far that every genuine line it sent afterwards sorted below it and
+ * was dropped as a duplicate. One datagram silenced an author at that node
+ * permanently, through the mechanism built to stop chat going missing.
+ */
+test('a backlog cannot introduce a line nobody asked for', async () => {
+  const c = cluster();
+  const a = await c.make('alice');
+  const b = await c.make('bob');
+  await link(a, b);
+
+  await a.sendChat('genuine one');
+  await settle();
+
+  b.handleChatBacklog({
+    from: a.addr,
+    messages: [{
+      sender: '10.0.0.9:3137', node: 'a-third-party', nick: 'mallory',
+      text: 'UNASKED', ts: Math.floor(Date.now() / 1000), seq: 900001, action: false, to: '',
+    }],
+    unavailable: [],
+  });
+
+  assert.ok(b.metrics.chatUnsolicited > 0, 'the unasked-for line was not refused');
+  assert.equal(b.chat().filter((e) => e.text === 'UNASKED').length, 0,
+    'a backlog introduced a line nobody asked for');
+
+  // And the author it was attributed to is not silenced.
+  await a.sendChat('genuine two');
+  await settle();
+  assert.equal(b.chat().filter((e) => e.text === 'genuine two').length, 1);
+  await c.stopAll();
+});
+
+/**
+ * The same guard refuses a line this node does want, offered by someone other
+ * than its author — only the author can be sure what its own seq 7 was.
+ */
+test('a backlog from the wrong peer is refused', async () => {
+  const c = cluster();
+  const a = await c.make('alice');
+  const b = await c.make('bob');
+  const third = await c.make('carol');
+  await link(a, b);
+  await link(b, third);
+
+  await a.sendChat('first');
+  await settle();
+  c.net.partition(a.addr, b.addr);
+  await a.sendChat('the missing one');
+  await settle();
+  c.net.heal(a.addr, b.addr);
+  await a.sendChat('third');
+  await settle();
+  assert.equal(b.chatGapStats()[0].outstanding, 1, 'no gap to offer hearsay for');
+
+  b.handleChatBacklog({
+    from: third.addr,
+    messages: [{
+      sender: a.addr, node: a.nodeId, nick: 'alice', text: 'HEARSAY',
+      ts: Math.floor(Date.now() / 1000), seq: 2, action: false, to: '',
+    }],
+    unavailable: [],
+  });
+  assert.ok(b.metrics.chatUnsolicited > 0, 'took one peer\'s word for another peer\'s line');
+  assert.equal(b.chat().filter((e) => e.text === 'HEARSAY').length, 0);
+
+  // The real author can still answer it.
+  await b.pullChatGaps();
+  await settle();
+  await settle();
+  assert.equal(b.chat().filter((e) => e.text === 'the missing one').length, 1);
+  await c.stopAll();
+});
+
+/**
+ * An author that has rotated the line out of its ring says so, so the receiver
+ * stops asking and reports it lost rather than pending forever.
+ */
+test('an author says when a line is beyond recovery', async () => {
+  const c = cluster();
+  const a = await c.make('alice');
+  const b = await c.make('bob');
+  await link(a, b);
+
+  await a.sendChat('one');
+  await settle();
+
+  // Seq 2 was never sent, so a cannot supply it: the same answer it would give
+  // for a line that has aged out of its ring.
+  b.chatGaps.observe({ sender: a.addr, node: a.nodeId, seq: 3, text: 'later' });
+  await b.pullChatGaps();
+  await settle();
+  await settle();
+
+  assert.ok(b.metrics.chatLost > 0, 'the author never said the line was gone');
+  const stat = b.chatGapStats()[0];
+  assert.equal(stat.outstanding, 0);
+  assert.equal(stat.lost, 1);
+  await c.stopAll();
+});
+
+/**
+ * A node never receives its own broadcast: it appends its own lines on send,
+ * and no peer echoes them back. Taking one is how a single bad line spreads —
+ * it lands in this node's log, is handed out in every state snapshot
+ * afterwards, and every node that syncs seeds its high-water mark for this
+ * author from it. Measured on hardware: one forged sequence and three peers
+ * stopped hearing the author entirely.
+ */
+test('a chat line attributed to ourself is refused', async () => {
+  const c = cluster();
+  const a = await c.make('alice');
+  const b = await c.make('bob');
+  await link(a, b);
+
+  await a.sendChat('said by a');
+  await settle();
+
+  await a.handleChat({
+    sender: a.addr, node: a.nodeId, nick: 'alice', text: 'NOT-SAID-BY-A',
+    ts: Math.floor(Date.now() / 1000), seq: 900001, action: false, to: '',
+  });
+  assert.ok(a.metrics.chatSelfAttributed > 0, 'took a line claiming to be our own');
+  assert.equal(a.chat().filter((e) => e.text === 'NOT-SAID-BY-A').length, 0);
+
+  // The log is what every snapshot is built from, so keeping it out is what
+  // stops one forged sequence spreading to everyone who syncs from here.
+  assert.equal(a.chat().filter((e) => e.seq === 900001).length, 0);
+
+  // And our own numbering is untouched.
+  await a.sendChat('still audible');
+  await settle();
+  const mine = a.chat().find((e) => e.text === 'still audible');
+  assert.equal(mine.seq, 2, 'the forgery moved our own counter');
+  assert.equal(b.chat().filter((e) => e.text === 'still audible').length, 1);
+  await c.stopAll();
+});
+
+/**
+ * A node id is what every version is stamped with, so two nodes sharing one
+ * write versions that compare equal while holding different values. Neither
+ * side is newer, so neither accepts the other and the two stay split for good.
+ * The engine cannot repair that; it has to notice it.
+ */
+test('a node that moved address rebinds its id once', async (t) => {
+  const c = cluster();
+  t.after(() => c.stopAll());
+  const a = await c.make('a');
+
+  a.setNodeId('peer-id', '127.0.0.1:3138');
+  a.setNodeId('peer-id', '127.0.0.1:4000');
+  a.setNodeId('peer-id', '127.0.0.1:4000');
+
+  assert.equal(a.idToAddr.get('peer-id'), '127.0.0.1:4000');
+  const conflicts = a.idConflicts();
+  assert.equal(conflicts.length, 1);
+  assert.equal(conflicts[0].flips, 1, 'a single move must not look like two live nodes');
+});
+
+test('two addresses claiming one id keep flipping', async (t) => {
+  const c = cluster();
+  t.after(() => c.stopAll());
+  const a = await c.make('a');
+
+  for (let i = 0; i < 6; i++) {
+    a.setNodeId('shared-id', '127.0.0.1:3141');
+    a.setNodeId('shared-id', '127.0.0.1:3142');
+  }
+
+  const [conflict] = a.idConflicts();
+  assert.ok(conflict.flips >= ID_CONFLICT_FLIPS, `twins flipped only ${conflict.flips} times`);
+  assert.notEqual(conflict.addrs[0], conflict.addrs[1]);
+  assert.ok(a.diagnostics().idConflicts.length === 1, 'the conflict never reached the diagnostics');
+});
+
+// The unambiguous case: nothing legitimate makes a peer announce *our* id.
+test('a peer claiming our own id is named, and we never accuse ourselves', async (t) => {
+  const c = cluster();
+  t.after(() => c.stopAll());
+  const a = await c.make('a');
+
+  a.setNodeId(a.nodeId, a.addr);
+  assert.deepEqual([...a.impostors], [], 'the node accused itself');
+
+  a.setNodeId(a.nodeId, '127.0.0.1:3142');
+  assert.deepEqual(a.diagnostics().impostors, ['127.0.0.1:3142']);
+});
+
+/**
+ * Two nodes started from copies of one state file share a node id, so their
+ * writes to one key carry the identical version. Neither is newer, so neither
+ * replica ever accepts the other and the split is permanent — the one
+ * divergence anti-entropy cannot repair.
+ *
+ * The check used to report it as convergence, because the fingerprint folded
+ * the version and not the value. Measured on a six-node cluster before the
+ * fix: 45 seconds of anti-entropy, both sides still holding different values,
+ * `converged: true`.
+ */
+test('a key held at one version with two values is reported, not hidden', async () => {
+  const c = cluster();
+  const a = await c.make('alice');
+  const b = await c.make('bob');
+  await link(a, b);
+
+  const version = { counter: 100, node: '00000000-dead-beef' };
+  a.store.apply({ action: 'set', key: 'split', value: 'written-by-a', version, expiresAt: 0, deletedAt: 0 });
+  b.store.apply({ action: 'set', key: 'split', value: 'written-by-b', version, expiresAt: 0, deletedAt: 0 });
+  await settle();
+
+  const report = await a.checkConsistency();
+  assert.equal(report.converged, false, 'a permanently split key was reported as converged');
+
+  const diff = report.peers[0].differences.find((d) => d.key === 'split');
+  assert.ok(diff, `the diverging key was not named: ${JSON.stringify(report.peers[0])}`);
+  assert.equal(diff.sameVersion, true, 'the difference was not marked as one replication cannot repair');
+  assert.equal(diff.local, diff.remote, 'both sides should report the identical version');
+  await c.stopAll();
 });

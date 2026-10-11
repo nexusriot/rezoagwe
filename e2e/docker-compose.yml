@@ -158,6 +158,51 @@ services:
       - -max-value-bytes=64
       - -max-keys=3
 
+  # Two nodes started from copies of one state file, in a cluster of their own
+  # so their divergence cannot make the rest of the suite's assertions fail.
+  #
+  # A node id is what every version is stamped with, so twins write versions
+  # that compare equal while holding different values: neither is newer,
+  # neither replica ever accepts the other, and the split is permanent. The
+  # split is seeded into the state files rather than raced for at runtime,
+  # because that is the state a copied file plus one write on each side
+  # reaches, and seeding it makes the test deterministic instead of a race
+  # that usually resolves.
+  # The twins need a rendezvous of their own: the wire key is derived from the
+  # cluster name, so the e2e rendezvous cannot serve a different one — which is
+  # precisely what stranger-cluster asserts.
+  bootstrap-twins:
+    build:
+      context: ..
+      dockerfile: e2e/Dockerfile
+    entrypoint: ["rezoagwe-bootstrap"]
+    command:
+      - -headless
+      - -port=9999
+      - -psk=e2e-secret
+      - -cluster=twins
+      - -data=-
+
+  node-twin-a:
+    <<: *node
+    depends_on: [bootstrap-twins]
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        printf '%s' '{"node_id":"00000000-dead-beef-0000-000000000001","clock":5,"entries":{"split-brain":{"value":"written-by-a","version":{"counter":5,"node":"00000000-dead-beef-0000-000000000001"}}}}' > /tmp/twin.json;
+        exec rezoagwe-discovery -headless -node=node-twin-a:3137 -bootstrap=bootstrap-twins:9999
+        -psk=e2e-secret -cluster=twins -nick=twin-a -http=:8080 -data=/tmp/twin.json
+
+  node-twin-b:
+    <<: *node
+    depends_on: [bootstrap-twins]
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        printf '%s' '{"node_id":"00000000-dead-beef-0000-000000000001","clock":5,"entries":{"split-brain":{"value":"written-by-b","version":{"counter":5,"node":"00000000-dead-beef-0000-000000000001"}}}}' > /tmp/twin.json;
+        exec rezoagwe-discovery -headless -node=node-twin-b:3137 -bootstrap=bootstrap-twins:9999
+        -psk=e2e-secret -cluster=twins -nick=twin-b -http=:8080 -data=/tmp/twin.json
+
   # Right cluster, wrong key. It knows the rendezvous address and shares the
   # network, so only the key is keeping it out.
   stranger-key:
@@ -202,6 +247,8 @@ services:
       node-restart: {condition: service_started}
       node-limited: {condition: service_healthy}
       node-solo: {condition: service_healthy}
+      node-twin-a: {condition: service_healthy}
+      node-twin-b: {condition: service_healthy}
     environment:
       E2E_NODE_A: "http://node-a:8080"
       E2E_NODE_B: "http://node-b:8080"
@@ -213,6 +260,8 @@ services:
       E2E_STRANGER_CLUSTER: "http://stranger-cluster:8080"
       E2E_NODE_LIMITED: "http://node-limited:8080"
       E2E_NODE_SOLO: "http://node-solo:8080"
+      E2E_NODE_TWIN_A: "http://node-twin-a:8080"
+      E2E_NODE_TWIN_B: "http://node-twin-b:8080"
       E2E_LATE_JOIN_SEC: "${E2E_LATE_JOIN_SEC:-25}"
       E2E_LEAVE_SEC: "${E2E_LEAVE_SEC:-45}"
       E2E_RESTART_SEC: "${E2E_RESTART_SEC:-30}"

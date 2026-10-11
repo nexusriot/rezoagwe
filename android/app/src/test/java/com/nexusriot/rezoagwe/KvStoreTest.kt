@@ -13,6 +13,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -250,5 +251,69 @@ class KvStoreTest {
         // apply keeps its Boolean contract for callers that only ask whether
         // the store changed.
         assertFalse(kv.apply(KVUpdate(KVAction.SET, "d", "fits", Version(12, "p"))))
+    }
+
+    /**
+     * The case the fingerprint was blind to.
+     *
+     * Two nodes started from copies of one state file share a node id, so
+     * their writes to a shared key carry the *same* version. Neither is newer,
+     * so neither replica ever accepts the other and the values stay different
+     * for good — and the fingerprint, which folded the version but not the
+     * value, reported the two as identical. Measured on a live six-node
+     * cluster: 45 seconds of anti-entropy, both sides still split,
+     * `converged: true`.
+     */
+    @Test
+    fun `two values at one version do not fingerprint the same`() {
+        val ver = Version(100, "00000000-dead-beef")
+        val a = KvStore("node-a")
+        a.apply(KVUpdate(action = KVAction.SET, key = "race", value = "written-by-A", version = ver))
+        val b = KvStore("node-b")
+        b.apply(KVUpdate(action = KVAction.SET, key = "race", value = "written-by-B", version = ver))
+
+        assertNotEquals(
+            "two replicas holding different values at one version fingerprinted identically",
+            a.fingerprint().buckets,
+            b.fingerprint().buckets,
+        )
+
+        // And the second round names the key rather than reporting a bucket it
+        // cannot explain.
+        val idx = a.fingerprint().buckets.indices.first {
+            a.fingerprint().buckets[it] != b.fingerprint().buckets[it]
+        }
+        val ea = a.bucketEntries(want = listOf(idx)).single()
+        val eb = b.bucketEntries(want = listOf(idx)).single()
+        assertEquals("race", ea.key)
+        assertEquals("the test is not reproducing the equal-version case", ea.version, eb.version)
+        assertTrue(ea.valueHash.isNotEmpty())
+        assertNotEquals("the value hashes did not distinguish the two", ea.valueHash, eb.valueHash)
+    }
+
+    /**
+     * Applying a remote update stores whatever value rides along with a
+     * delete, and nothing on the wire guarantees that field is cleared.
+     * Folding it in would make two replicas holding the same tombstone report
+     * as divergent.
+     */
+    @Test
+    fun `a value carried by a tombstone is not fingerprinted`() {
+        val ver = Version(4, "node-a")
+        val clean = KvStore("node-a")
+        clean.apply(KVUpdate(action = KVAction.DELETE, key = "gone", version = ver, deletedAt = 1700000000))
+        val noisy = KvStore("node-b")
+        noisy.apply(
+            KVUpdate(
+                action = KVAction.DELETE, key = "gone", value = "left over",
+                version = ver, deletedAt = 1700000000,
+            ),
+        )
+
+        assertEquals(
+            "a value carried by a delete made two identical tombstones look divergent",
+            clean.fingerprint().buckets,
+            noisy.fingerprint().buckets,
+        )
     }
 }

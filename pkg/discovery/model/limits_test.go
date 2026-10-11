@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -237,8 +238,8 @@ func TestFingerprintMatchesThePublishedVectors(t *testing.T) {
 
 	const zero = "0000000000000000000000000000000000000000000000000000000000000000"
 	want := map[int]string{
-		7:  "a2026aaa5ddb78cb47d1db8e5973b787420dafb7fc1ad30cca5944a5495f9898",
-		13: "5afa98b8cab4abc9294acac825fad1b3f02d6125ec2f5b0def0456acb56e3abc",
+		7:  "2b28e2ab4fe49de1ac3292835d3f89a2d896a3349a7cba255bfb32eefce76ffd",
+		13: "80c5334e9dffd54e9791a5080260534d255246b82b94077e9537e2ef01c05fd3",
 	}
 
 	f := kv.Fingerprint(pb.FingerprintBuckets)
@@ -380,5 +381,60 @@ func TestApplyWithReasonSeparatesRefusalFromStaleness(t *testing.T) {
 	// store change?".
 	if kv.Apply(pb.KVUpdate{Action: pb.KVSet, Key: "d", Value: "fits", Version: pb.Version{Counter: 12, Node: "p"}}) {
 		t.Fatal("Apply returned true for an update the limits refused")
+	}
+}
+
+// The case the fingerprint was blind to.
+//
+// Found by end-to-end testing: two nodes started from copies of one state file
+// share a node id, so their writes to a shared key carry the *same* version.
+// Neither version is newer, so neither replica ever accepts the other and the
+// values stay different for good — and the fingerprint, which folded the
+// version but not the value, reported the two as identical. The one tool whose
+// job is to detect divergence called the split cluster converged.
+func TestFingerprintSeesTwoValuesAtOneVersion(t *testing.T) {
+	ver := pb.Version{Counter: 100, Node: "shared-id"}
+
+	a := NewKVStore("node-a")
+	a.Apply(pb.KVUpdate{Action: pb.KVSet, Key: "race", Value: "written-by-A", Version: ver})
+	b := NewKVStore("node-b")
+	b.Apply(pb.KVUpdate{Action: pb.KVSet, Key: "race", Value: "written-by-B", Version: ver})
+
+	fa := a.Fingerprint(pb.FingerprintBuckets)
+	fb := b.Fingerprint(pb.FingerprintBuckets)
+	if reflect.DeepEqual(fa.Buckets, fb.Buckets) {
+		t.Fatal("two replicas holding different values at one version fingerprinted identically")
+	}
+
+	// And the second round names the key, rather than reporting a bucket it
+	// cannot explain.
+	ea := a.BucketEntries(pb.FingerprintBuckets, []int{bucketOf("race", pb.FingerprintBuckets)})
+	eb := b.BucketEntries(pb.FingerprintBuckets, []int{bucketOf("race", pb.FingerprintBuckets)})
+	if len(ea) != 1 || len(eb) != 1 {
+		t.Fatalf("bucket listings = %d and %d entries, want 1 each", len(ea), len(eb))
+	}
+	if ea[0].ValueHash == "" || ea[0].ValueHash == eb[0].ValueHash {
+		t.Fatalf("value hashes did not distinguish the two: %q vs %q", ea[0].ValueHash, eb[0].ValueHash)
+	}
+	if !ea[0].Version.Equal(eb[0].Version) {
+		t.Fatal("the versions were supposed to be identical; the test is not reproducing the case")
+	}
+}
+
+// Apply stores whatever value rides along with a remote delete, and nothing on
+// the wire guarantees that field is cleared. Folding it in would make two
+// replicas holding the same tombstone report as divergent.
+func TestFingerprintIgnoresAValueCarriedByATombstone(t *testing.T) {
+	ver := pb.Version{Counter: 4, Node: "node-a"}
+
+	clean := NewKVStore("node-a")
+	clean.Apply(pb.KVUpdate{Action: pb.KVDelete, Key: "gone", Version: ver, DeletedAt: 1700000000})
+	noisy := NewKVStore("node-b")
+	noisy.Apply(pb.KVUpdate{Action: pb.KVDelete, Key: "gone", Value: "left over",
+		Version: ver, DeletedAt: 1700000000})
+
+	if !reflect.DeepEqual(clean.Fingerprint(pb.FingerprintBuckets).Buckets,
+		noisy.Fingerprint(pb.FingerprintBuckets).Buckets) {
+		t.Fatal("a value carried by a delete made two identical tombstones look divergent")
 	}
 }

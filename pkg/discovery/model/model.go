@@ -53,7 +53,9 @@ type Model struct {
 	// address a datagram *came from* is O(1). Peers are stored under the
 	// address they advertise, which is rarely the same string.
 	normalized     sync.Map // NormalizeAddr(address) -> address
-	ids            sync.Map // node id -> address (attributes a version to a peer)
+	ids            sync.Map // node id -> idBinding (attributes a version to a peer)
+	// impostors is the set of addresses seen announcing this node's own id.
+	impostors sync.Map // address -> bool
 	BootstrapAddrs []string
 	NodeAddr       string
 	AdvertiseAddr  string
@@ -65,6 +67,9 @@ type Model struct {
 
 	chatMu  sync.Mutex
 	chatLog []pb.ChatEntry
+	// chatSeq is how many broadcasts this node has sent, persisted alongside
+	// the identity it counts against.
+	chatSeq uint64
 
 	persistMu  sync.Mutex
 	persistGen uint64
@@ -120,6 +125,7 @@ func NewModel(cfg Config) *Model {
 	if found {
 		m.Store.LoadState(state)
 		m.chatLog = append(m.chatLog, state.Chat...)
+		m.chatSeq = state.ChatSeq
 		log.Debugf("loaded %d entries (clock=%d) and %d chat lines from %s",
 			len(state.Entries), state.Clock, len(state.Chat), cfg.DataPath)
 	}
@@ -231,6 +237,7 @@ func (bn *Model) writeState() {
 	state := bn.Store.State()
 	state.NodeID = bn.NodeID
 	state.Chat = bn.ChatLog()
+	state.ChatSeq = bn.ChatSeq()
 	bn.persistMu.Unlock()
 	bn.persister.Save(gen, state)
 }
@@ -334,7 +341,7 @@ func (bn *Model) RemovePeer(addr string) {
 	bn.views.Delete(addr)
 	bn.normalized.Delete(NormalizeAddr(addr))
 	bn.ids.Range(func(key, value interface{}) bool {
-		if value.(string) == addr {
+		if value.(idBinding).Addr == addr {
 			bn.ids.Delete(key)
 		}
 		return true
@@ -390,19 +397,101 @@ func (bn *Model) NickOf(addr string) string {
 
 // SetNodeID maps a peer's stable id to its address, so a version stamped with
 // that id can be attributed to a nickname.
+//
+// It also notices when one id is claimed by more than one address. A node id
+// is what every version is stamped with, so two nodes sharing one — a copied
+// state file, a cloned image, a restored backup — write versions that compare
+// equal while holding different values. Neither side is newer, so neither ever
+// accepts the other and the two stay split permanently, which is the one
+// divergence anti-entropy cannot repair.
 func (bn *Model) SetNodeID(id, addr string) {
 	if id == "" || addr == "" {
 		return
 	}
-	bn.ids.Store(id, addr)
+	// A peer announcing this node's own id is the unambiguous case: no
+	// address change explains it, so one of the two is running on a copy of
+	// this node's identity.
+	if id == bn.NodeID && addr != bn.AdvertiseAddr && addr != bn.NodeAddr {
+		bn.impostors.Store(addr, true)
+	}
+	now := time.Now().Unix()
+	prev, ok := bn.ids.Load(id)
+	if !ok {
+		bn.ids.Store(id, idBinding{Addr: addr, At: now})
+		return
+	}
+	b := prev.(idBinding)
+	if b.Addr == addr {
+		return
+	}
+	// A node that genuinely moved address rebinds once and then stays put;
+	// two nodes sharing an id rebind on every heartbeat either one sends, so
+	// the count is what tells the two apart.
+	bn.ids.Store(id, idBinding{Addr: addr, Other: b.Addr, Flips: b.Flips + 1, At: now})
 }
 
 // AddrOfID resolves a version's node id back to a peer address.
 func (bn *Model) AddrOfID(id string) string {
 	if v, ok := bn.ids.Load(id); ok {
-		return v.(string)
+		return v.(idBinding).Addr
 	}
 	return ""
+}
+
+// idBinding is what this node has seen claim one node id.
+type idBinding struct {
+	// Addr is the address that claimed it most recently, and Other the one
+	// before, where they differ.
+	Addr  string
+	Other string
+	// Flips counts how often the claim moved between addresses.
+	Flips uint64
+	At    int64
+}
+
+// IDConflict is one node id claimed by two different addresses.
+type IDConflict struct {
+	ID    string   `json:"id"`
+	Addrs []string `json:"addrs"`
+	Flips uint64   `json:"flips"`
+	At    int64    `json:"at"`
+}
+
+// Impostors lists every peer address seen announcing this node's own node id,
+// sorted. Nothing legitimate produces one: a node generates its id once and
+// keeps it, so another address claiming it means a state file was copied.
+func (bn *Model) Impostors() []string {
+	out := make([]string, 0)
+	bn.impostors.Range(func(key, _ interface{}) bool {
+		out = append(out, key.(string))
+		return true
+	})
+	sort.Strings(out)
+	return out
+}
+
+// IDConflicts lists every node id this node has seen claimed by more than one
+// address, worst first. A single flip is reported too: it is how a legitimate
+// address change looks, and the rule that reads this decides what to say.
+func (bn *Model) IDConflicts() []IDConflict {
+	out := make([]IDConflict, 0)
+	bn.ids.Range(func(key, value interface{}) bool {
+		b := value.(idBinding)
+		if b.Flips == 0 || b.Other == "" {
+			return true
+		}
+		out = append(out, IDConflict{
+			ID: key.(string), Addrs: []string{b.Other, b.Addr}, Flips: b.Flips, At: b.At,
+		})
+		return true
+	})
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Flips != out[j].Flips {
+			return out[i].Flips > out[j].Flips
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out
 }
 
 // WriterName renders a version's origin as something a human can read: "you"
@@ -461,6 +550,76 @@ func (bn *Model) LastSeen(addr string) (time.Time, bool) {
 		return v.(time.Time), true
 	}
 	return time.Time{}, false
+}
+
+// ChatSeq reports how many broadcasts this node has sent.
+func (bn *Model) ChatSeq() uint64 {
+	bn.chatMu.Lock()
+	defer bn.chatMu.Unlock()
+	return bn.chatSeq
+}
+
+// NextChatSeq stamps the next broadcast and remembers it, so a restart with a
+// state file continues the author's numbering rather than restarting it —
+// which every peer would otherwise read as the whole conversation going
+// missing.
+func (bn *Model) NextChatSeq() uint64 {
+	bn.chatMu.Lock()
+	defer bn.chatMu.Unlock()
+	bn.chatSeq++
+	return bn.chatSeq
+}
+
+// OwnChat returns this node's own broadcasts with the named sequence numbers,
+// and the ones it no longer holds because the ring has moved past them.
+func (bn *Model) OwnChat(self string, seqs []uint64) (found []pb.ChatEntry, gone []uint64) {
+	bn.chatMu.Lock()
+	defer bn.chatMu.Unlock()
+	bySeq := make(map[uint64]pb.ChatEntry, len(bn.chatLog))
+	for _, e := range bn.chatLog {
+		if e.Seq != 0 && e.Sender == self {
+			bySeq[e.Seq] = e
+		}
+	}
+	for _, s := range seqs {
+		if e, ok := bySeq[s]; ok {
+			found = append(found, e)
+		} else {
+			gone = append(gone, s)
+		}
+	}
+	return found, gone
+}
+
+// InsertChat places a line that arrived out of order where it belongs, rather
+// than at the bottom.
+//
+// A recovered line is by definition older than what is already on screen —
+// appending it would answer "which line did I miss?" by putting the answer
+// after the lines that followed it, which reads as a new message rather than a
+// repair. Timestamps are per second, so two lines in the same second from the
+// same author are separated by their sequence, which is exactly what it is
+// for.
+func (bn *Model) InsertChat(entry pb.ChatEntry) {
+	bn.chatMu.Lock()
+	i := len(bn.chatLog)
+	for i > 0 {
+		prev := bn.chatLog[i-1]
+		older := prev.TS < entry.TS ||
+			(prev.TS == entry.TS && !(prev.Sender == entry.Sender && prev.Seq > entry.Seq))
+		if older {
+			break
+		}
+		i--
+	}
+	bn.chatLog = append(bn.chatLog, pb.ChatEntry{})
+	copy(bn.chatLog[i+1:], bn.chatLog[i:])
+	bn.chatLog[i] = entry
+	if len(bn.chatLog) > chatRing {
+		bn.chatLog = bn.chatLog[len(bn.chatLog)-chatRing:]
+	}
+	bn.chatMu.Unlock()
+	bn.Persist()
 }
 
 func (bn *Model) AppendChat(entry pb.ChatEntry) {

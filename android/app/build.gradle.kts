@@ -13,8 +13,8 @@ android {
         applicationId = "com.nexusriot.rezoagwe"
         minSdk = 26
         targetSdk = 35
-        versionCode = 7
-        versionName = "0.4.3"
+        versionCode = 10
+        versionName = "0.4.6"
     }
 
     buildTypes {

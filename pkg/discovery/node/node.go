@@ -159,6 +159,13 @@ type Node struct {
 	actMu    sync.Mutex
 	activity []string
 
+	// chatSeq numbers this node's own broadcasts; chatGaps follows everyone
+	// else's. Chat is the one payload with no repair path of its own — see
+	// chatseq.go.
+	chatSeqMu sync.Mutex
+	chatSeq   uint64
+	chatGaps  *chatTracker
+
 	rndMu sync.Mutex
 	rnd   *rand.Rand
 }
@@ -197,7 +204,13 @@ func New(cfg Config, ev Events) (*Node, error) {
 		rnd:       rand.New(rand.NewSource(time.Now().UnixNano())),
 		aeCursors: make(map[string]string),
 		strangers: make(map[string]int64),
+		chatGaps:  newChatTracker(),
+		chatSeq:   m.ChatSeq(),
 	}
+	// The log on disk knows how far each author had got. Without this the
+	// tracker starts blank and the first line from any author sets a fresh
+	// baseline, so anything said while this node was down is lost in silence.
+	n.chatGaps.Seed(m.ChatLog())
 	n.Metrics.SetGauges(func() metrics.Gauges {
 		return metrics.Gauges{
 			Peers:      len(n.Model.GetNodes()),
@@ -374,7 +387,10 @@ func (n *Node) randomPeer() string {
 }
 
 func (n *Node) helloMessage() pb.Hello {
-	return pb.Hello{From: n.cfg.AdvertiseAddr, Nick: n.Model.Nick(), ID: n.Model.NodeID}
+	return pb.Hello{
+		From: n.cfg.AdvertiseAddr, Nick: n.Model.Nick(), ID: n.Model.NodeID,
+		ChatSeq: n.Model.ChatSeq(),
+	}
 }
 
 func (n *Node) helloAllPeers() {
@@ -404,6 +420,11 @@ func (n *Node) gossipLoop() {
 			// random peer, and the digest is what turns "eventually consistent"
 			// from a hope into a mechanism.
 			n.antiEntropyRound(target)
+			// And the same for chat, which has no digest of its own: a gap in
+			// an author's sequence is asked for here rather than the instant
+			// it appears, because most gaps are a reordering that closes on
+			// its own within milliseconds.
+			n.pullChatGaps()
 		}
 	}
 }

@@ -3,6 +3,7 @@ package proto
 import (
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -171,5 +172,46 @@ func TestChatLogRoundTrip(t *testing.T) {
 	}
 	if len(out) != 1 || out[0].Nick != "bob" || out[0].Text != "hi" {
 		t.Fatalf("round trip lost data: %+v", out)
+	}
+}
+
+// The value hash is what lets a consistency check tell apart two replicas that
+// agree on the version but hold different data (§14). A port that drops it
+// turns that divergence back into apparent agreement — which the JavaScript
+// codec did, because its encoder is an explicit allowlist.
+//
+// It must also stay *off* the anti-entropy digests, which share this shape and
+// never set one: 64 characters per entry there would shrink what fits in a
+// datagram for no gain.
+func TestKeyVersionCarriesItsValueHashAndOmitsItWhenEmpty(t *testing.T) {
+	hash := strings.Repeat("a", 64)
+	withHash, err := json.Marshal(KeyVersion{
+		Key: "k", Version: Version{Counter: 3, Node: "node-a"}, ValueHash: hash,
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(withHash), `"vhash":"`+hash+`"`) {
+		t.Errorf("the hash is not on the wire: %s", withHash)
+	}
+
+	// A digest entry sets no hash, and must not start sending an empty one.
+	bare, err := json.Marshal(KeyVersion{Key: "k", Version: Version{Counter: 3, Node: "node-a"}})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(bare), "vhash") {
+		t.Errorf("an empty value hash must be omitted: %s", bare)
+	}
+
+	// A peer older than the field sends none, which has to decode as "cannot
+	// compare" rather than failing — that is what keeps a rolling upgrade from
+	// reporting every peer as divergent.
+	var legacy KeyVersion
+	if err := json.Unmarshal([]byte(`{"key":"k","version":{"counter":3,"node":"node-a"}}`), &legacy); err != nil {
+		t.Fatalf("a peer too old to send a hash did not decode: %v", err)
+	}
+	if legacy.ValueHash != "" {
+		t.Errorf("value hash = %q, want empty", legacy.ValueHash)
 	}
 }

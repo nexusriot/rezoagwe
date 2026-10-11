@@ -30,6 +30,8 @@ object Kind {
     // arrive is labelled rather than counted as "unknown".
     const val FINGERPRINT: Byte = 11
     const val FINGERPRINT_REPLY: Byte = 12
+    const val CHAT_PULL: Byte = 13
+    const val CHAT_BACKLOG: Byte = 14
 
     const val BOOTSTRAP_REGISTER: Byte = 20
     const val BOOTSTRAP_DISCOVER: Byte = 21
@@ -49,6 +51,8 @@ object Kind {
         DIRECT_MESSAGE -> "direct_message"
         FINGERPRINT -> "fingerprint"
         FINGERPRINT_REPLY -> "fingerprint_reply"
+        CHAT_PULL -> "chat_pull"
+        CHAT_BACKLOG -> "chat_backlog"
         BOOTSTRAP_REGISTER -> "bootstrap_register"
         BOOTSTRAP_DISCOVER -> "bootstrap_discover"
         BOOTSTRAP_ROSTER -> "bootstrap_roster"
@@ -216,7 +220,45 @@ data class ChatMessage(
     val ts: Long = 0,
     val action: Boolean = false,
     val to: String = "",
+    /**
+     * The author's own broadcast counter, from 1, surviving a restart with the
+     * state file. Chat is one datagram per peer with nothing re-sending it, so
+     * without a sequence a dropped line is indistinguishable from one that was
+     * never sent — at both ends. Zero means unsequenced and is never
+     * gap-checked.
+     */
+    val seq: Long = 0,
+    /**
+     * The author's persistent node id, which is what [seq] counts against.
+     * Keying on the id rather than the address matches how a KV version already
+     * identifies a writer, and keeps a node that restarts with no state file
+     * from appearing to rewind its whole conversation.
+     */
+    val node: String = "",
 )
+
+/** Asks an author to re-send its own broadcasts by sequence number. */
+@Serializable
+data class ChatPull(
+    val from: String = "",
+    val seqs: List<Long> = emptyList(),
+)
+
+/** Answers a [ChatPull]. */
+@Serializable
+data class ChatBacklog(
+    val from: String = "",
+    val messages: List<ChatMessage> = emptyList(),
+    /**
+     * The sequence numbers the author no longer holds. Saying so turns "still
+     * waiting" into "gone", and a receiver that is not told keeps asking
+     * forever.
+     */
+    val unavailable: List<Long> = emptyList(),
+)
+
+/** Bounds how many sequence numbers one [ChatPull] may name. */
+const val MAX_CHAT_PULL = 64
 
 object ChatKind {
     const val MESSAGE = ""
@@ -233,6 +275,13 @@ data class ChatEntry(
     val text: String = "",
     val kind: String = ChatKind.MESSAGE,
     val to: String = "",
+    /** The author's own sequence number, carried into the log so the author
+     *  can answer a pull for it and a re-delivery is recognised as one. */
+    val seq: Long = 0,
+    /** The author's persistent id, which [seq] counts against. A log that kept
+     *  only the address could not tell the tracker whose numbering a stored
+     *  line belongs to, so the baseline would not survive a restart. */
+    val node: String = "",
 )
 
 @Serializable
@@ -257,6 +306,12 @@ data class Hello(
     val from: String = "",
     val nick: String = "",
     val id: String = "",
+    /**
+     * How many lines this node has broadcast, carried on the heartbeat so a
+     * peer learns where our numbering stands when we *meet* rather than when
+     * we first happen to speak.
+     */
+    @SerialName("chat_seq") val chatSeq: Long = 0,
 )
 
 @Serializable
@@ -270,6 +325,14 @@ data class KeyVersion(
     val key: String,
     val version: Version,
     val deleted: Boolean = false,
+    /**
+     * sha256 of the value, hex, empty for a tombstone or an empty value. It is
+     * what lets the checker tell apart two replicas that agree on the version
+     * but hold different data — the one divergence last-write-wins cannot
+     * repair, because neither side's version is newer. Absent from a peer too
+     * old to send it, which reads as "cannot compare" rather than a difference.
+     */
+    @SerialName("vhash") val valueHash: String = "",
 )
 
 /**

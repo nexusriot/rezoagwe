@@ -381,3 +381,169 @@ func TestStaleRejectionsAreNotAFinding(t *testing.T) {
 		t.Fatalf("stale rejections alone made the node unhealthy: %+v", checks)
 	}
 }
+
+// Chat is the one payload with no digest behind it, so a line that never
+// arrived leaves nothing in the store to compare. Until the sequence existed
+// the loss was not quiet, it was invisible — no counter at either end moved.
+func TestLostChatLinesAreAFinding(t *testing.T) {
+	d := healthy()
+	d.ChatGaps = []ChatGap{{Addr: "10.0.0.2:3137", Nick: "bob", Lost: 3}}
+
+	checks := Checks(d, now)
+	var found *Check
+	for i := range checks {
+		if strings.Contains(checks[i].Title, "chat line") {
+			found = &checks[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("no check named the lost lines: %+v", checks)
+	}
+	if found.Severity != SeverityWarn {
+		t.Fatalf("severity = %q, want warn", found.Severity)
+	}
+	if !strings.Contains(found.Title, "3") {
+		t.Fatalf("title does not say how many: %q", found.Title)
+	}
+	if !strings.Contains(found.Detail, "bob") {
+		t.Fatalf("detail does not say whose: %q", found.Detail)
+	}
+}
+
+// A gap that may still close is not a loss, and reporting it as one would make
+// every reordered datagram look like data loss.
+func TestAnOutstandingChatGapIsOnlyInformational(t *testing.T) {
+	d := healthy()
+	d.ChatGaps = []ChatGap{{Addr: "10.0.0.2:3137", Nick: "bob", Outstanding: 2}}
+
+	checks := Checks(d, now)
+	for _, c := range checks {
+		if strings.Contains(c.Title, "chat line") {
+			if c.Severity != SeverityInfo {
+				t.Fatalf("severity = %q, want info — it may still arrive", c.Severity)
+			}
+			return
+		}
+	}
+	t.Fatalf("no check mentioned the outstanding gap: %+v", checks)
+}
+
+// A clean stream says nothing at all.
+func TestARecoveredChatGapIsNotAFinding(t *testing.T) {
+	d := healthy()
+	d.ChatGaps = []ChatGap{{Addr: "10.0.0.2:3137", Nick: "bob", Recovered: 4}}
+
+	checks := Checks(d, now)
+	if checks[0].Severity != SeverityOK {
+		t.Fatalf("a repaired gap made the node unhealthy: %+v", checks)
+	}
+}
+
+// Both guards refuse the frame, so nothing is broken — but neither has a
+// legitimate cause, and these are exactly the frames that used to raise an
+// author's sequence out of reach and silence them for good.
+func TestMalformedChatRepairIsReported(t *testing.T) {
+	d := healthy()
+	d.Metrics.ChatUnsolicited = 3
+	d.Metrics.ChatSelfAttributed = 1
+
+	checks := Checks(d, now)
+	var found *Check
+	for i := range checks {
+		if strings.Contains(checks[i].Title, "malformed repair") {
+			found = &checks[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("no check named the refused frames: %+v", checks)
+	}
+	if found.Severity != SeverityWarn {
+		t.Fatalf("severity = %q, want warn — they were refused, not acted on", found.Severity)
+	}
+	if !strings.Contains(found.Title, "4") {
+		t.Fatalf("title does not total them: %q", found.Title)
+	}
+	for _, want := range []string{"nobody asked for", "claiming to be"} {
+		if !strings.Contains(found.Detail, want) {
+			t.Fatalf("detail does not separate the two causes (%q): %q", want, found.Detail)
+		}
+	}
+}
+
+// A cluster where nothing misbehaves says nothing.
+func TestNoMalformedRepairIsNotAFinding(t *testing.T) {
+	checks := Checks(healthy(), now)
+	for _, c := range checks {
+		if strings.Contains(c.Title, "malformed repair") {
+			t.Fatalf("reported malformed repair on a clean cluster: %+v", c)
+		}
+	}
+}
+
+// Two nodes sharing an identity is the one divergence replication cannot
+// repair, so it has to be said out loud. Measured on a live cluster: the two
+// stayed split on a shared key for as long as they ran, and every tool
+// reported the node healthy.
+func TestAPeerUsingOurIdentityIsAnError(t *testing.T) {
+	checks := Checks(Snapshot{
+		NodeID:    "00000000-dead-beef",
+		Impostors: []string{"192.168.18.79:3142"},
+	}, time.Now())
+
+	c := findCheck(t, checks, "using this node's identity")
+	if c.Severity != SeverityError {
+		t.Fatalf("severity = %v, want error", c.Severity)
+	}
+	if !strings.Contains(c.Title, "192.168.18.79:3142") {
+		t.Fatalf("the check does not name the peer: %q", c.Title)
+	}
+}
+
+// A node that changed address rebinds once. Reporting that as a shared
+// identity would fire on every DHCP lease.
+func TestASingleAddressChangeIsNotReported(t *testing.T) {
+	checks := Checks(Snapshot{
+		IDConflicts: []IDConflict{{ID: "peer-id", Addrs: []string{"a:1", "b:1"}, Flips: 1}},
+	}, time.Now())
+
+	mustNotFind(t, checks, "is claimed by")
+}
+
+func TestOneIDClaimedByTwoLiveAddressesIsAnError(t *testing.T) {
+	checks := Checks(Snapshot{
+		IDConflicts: []IDConflict{{
+			ID: "00000000-dead-beef", Addrs: []string{"192.168.18.79:3141", "192.168.18.79:3142"},
+			Flips: 12,
+		}},
+	}, time.Now())
+
+	c := findCheck(t, checks, "is claimed by")
+	if c.Severity != SeverityError {
+		t.Fatalf("severity = %v, want error", c.Severity)
+	}
+	for _, want := range []string{"192.168.18.79:3141", "192.168.18.79:3142"} {
+		if !strings.Contains(c.Title, want) {
+			t.Fatalf("the check does not name %s: %q", want, c.Title)
+		}
+	}
+}
+
+// Tombstone GC is the one setting that can silently undo a delete: a node away
+// longer than the age comes back still holding the value and pushes it back
+// (DESIGN.md §5.5). Demonstrated on a live pair — the delete was undone on
+// both nodes and the consistency check reported them converged.
+//
+// So the advice has to state the constraint, not only the benefit. The three
+// ports word it differently, but a port that recommends the setting without
+// saying what bounds it is telling a user to lose deletes.
+func TestTombstoneAdviceStatesWhatBoundsTheAge(t *testing.T) {
+	d := healthy()
+	d.Gauges.Tombstones = 7
+	c := findCheck(t, Checks(d, time.Now()), "tombstone(s) kept forever")
+
+	if !strings.Contains(c.Detail, "longest") {
+		t.Errorf("the advice does not say what the age must exceed: %q", c.Detail)
+	}
+}

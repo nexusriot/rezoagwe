@@ -250,3 +250,81 @@ test('the replication ceiling is the one Go uses', () => {
   assert.equal(W.MAX_FRAME_BYTES, 64 << 20);
   assert.equal(W.MAX_REPLICABLE_VALUE_BYTES, (64 << 20) - (64 << 10));
 });
+
+/**
+ * The chat sequence is protocol, so the three ports have to encode it the same
+ * way or a gap in one is a duplicate in another. These are the bytes Go emits.
+ */
+test('a sequenced chat message is on the wire exactly as Go writes it', () => {
+  const encoded = W.encodeChatMessage({
+    sender: '10.0.0.1:3137', nick: 'alice', text: 'hello', ts: 1700000000,
+    action: false, to: '', seq: 7, node: 'node-a',
+  });
+  assert.deepEqual(encoded, {
+    sender: '10.0.0.1:3137', nick: 'alice', text: 'hello', ts: 1700000000, seq: 7, node: 'node-a',
+  }, 'omitempty must drop action and to, and keep seq and node');
+
+  // A peer older than the field sends neither, and must decode as unsequenced
+  // rather than failing — that is what keeps a rolling upgrade talking.
+  const legacy = W.decodeChatMessage({ sender: '10.0.0.9:3137', text: 'hi', ts: 1 });
+  assert.equal(legacy.seq, 0);
+  assert.equal(legacy.node, '');
+
+  // And an unsequenced message is omitted from the encoding entirely, so a
+  // node that never numbers a line does not start claiming seq 0 on the wire.
+  const unsequenced = W.encodeChatMessage({ sender: 'a', text: 'hi', ts: 1 });
+  assert.ok(!('seq' in unsequenced), 'seq 0 must be omitted');
+  assert.ok(!('node' in unsequenced), 'an empty node id must be omitted');
+});
+
+test('a chat backlog round-trips, including what the author cannot supply', () => {
+  const body = W.encodeChatBacklog({
+    from: '10.0.0.1:3137',
+    messages: [{ sender: '10.0.0.1:3137', nick: 'a', text: 'x', ts: 5, seq: 2, node: 'n' }],
+    unavailable: [3, 4],
+  });
+  const back = W.decodeChatBacklog(JSON.parse(JSON.stringify(body)));
+  assert.equal(back.from, '10.0.0.1:3137');
+  assert.equal(back.messages.length, 1);
+  assert.equal(back.messages[0].seq, 2);
+  assert.deepEqual(back.unavailable, [3, 4]);
+
+  // Go marshals an empty slice as null for a field without omitempty; an empty
+  // backlog has to decode rather than throw, or a "nothing to send" answer
+  // would count as malformed and the gap would never close.
+  const empty = W.decodeChatBacklog({ from: 'a', messages: null, unavailable: null });
+  assert.deepEqual(empty.messages, []);
+  assert.deepEqual(empty.unavailable, []);
+});
+
+/**
+ * The value hash is what lets a consistency check tell apart two replicas that
+ * agree on the version but hold different data. A codec that drops it turns
+ * that divergence back into apparent agreement — which is what this port did
+ * until a cluster test caught the key going unnamed while the bucket digests
+ * disagreed.
+ *
+ * It must also stay *off* the anti-entropy digests, which share this shape and
+ * never set one: 64 characters per entry there would shrink what fits in a
+ * datagram for no gain.
+ */
+test('a key version carries its value hash, and omits it when empty', () => {
+  const hash = 'a'.repeat(64);
+  const encoded = W.encodeKeyVersion({
+    key: 'k', version: { counter: 3, node: 'node-a' }, deleted: false, vhash: hash,
+  });
+  assert.deepEqual(encoded, {
+    key: 'k', version: { counter: 3, node: 'node-a' }, vhash: hash,
+  }, 'omitempty must drop deleted and keep vhash');
+
+  // A digest entry sets no hash, and must not start sending an empty one.
+  const digestEntry = W.encodeKeyVersion({ key: 'k', version: { counter: 3, node: 'node-a' } });
+  assert.ok(!('vhash' in digestEntry), 'an empty value hash must be omitted');
+
+  // A peer older than the field sends none, which has to decode as "cannot
+  // compare" rather than failing — that is what keeps a rolling upgrade from
+  // reporting every peer as divergent.
+  const legacy = W.decodeKeyVersion({ key: 'k', version: { counter: 3, node: 'node-a' } });
+  assert.equal(legacy.vhash, '');
+  assert.equal(W.decodeKeyVersion({ key: 'k', version: { counter: 3, node: 'n' }, vhash: hash }).vhash, hash);
+});

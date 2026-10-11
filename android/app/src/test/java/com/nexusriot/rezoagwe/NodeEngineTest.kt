@@ -2,6 +2,7 @@ package com.nexusriot.rezoagwe
 
 import com.nexusriot.rezoagwe.core.BootstrapConfig
 import com.nexusriot.rezoagwe.core.BootstrapServer
+import com.nexusriot.rezoagwe.core.ID_CONFLICT_FLIPS
 import com.nexusriot.rezoagwe.core.NodeConfig
 import com.nexusriot.rezoagwe.core.NodeEngine
 import com.nexusriot.rezoagwe.core.NodeRole
@@ -9,6 +10,11 @@ import com.nexusriot.rezoagwe.core.Severity
 import com.nexusriot.rezoagwe.core.healthChecks
 import com.nexusriot.rezoagwe.net.MAX_DATAGRAM_PAYLOAD
 import com.nexusriot.rezoagwe.proto.ChatKind
+import com.nexusriot.rezoagwe.proto.Codec
+import com.nexusriot.rezoagwe.proto.ChatMessage
+import com.nexusriot.rezoagwe.proto.KVAction
+import com.nexusriot.rezoagwe.proto.KVUpdate
+import com.nexusriot.rezoagwe.proto.Kind
 import com.nexusriot.rezoagwe.proto.Version
 import java.io.IOException
 import java.net.DatagramSocket
@@ -42,6 +48,8 @@ private class NetworkOnMainThreadException : RuntimeException()
 
 class NodeEngineTest {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    /** Ports already handed out, so one is never issued twice. */
+    private val issuedPorts = mutableSetOf<Int>()
     private val engines = mutableListOf<NodeEngine>()
     private val servers = mutableListOf<BootstrapServer>()
 
@@ -53,13 +61,22 @@ class NodeEngineTest {
     }
 
     /**
-     * A port free for both sockets the engine binds. Checking only TCP left the
-     * suite able to pick a number whose UDP half was taken, which failed as a
-     * BindException in an unrelated test.
+     * A port free for both sockets the engine binds, and not one already handed
+     * out.
+     *
+     * Checking only TCP left the suite able to pick a number whose UDP half was
+     * taken, which failed as a BindException in an unrelated test. Handing the
+     * same number out twice does the same thing for the same reason: nothing
+     * holds the port between this call and the `start()` that binds it, so two
+     * engines in one test could be given one port, the second would fail to
+     * bind, and the test that depended on it failed looking like a protocol
+     * bug. Remembering what has been issued is what makes the answer true by
+     * the time it is used.
      */
     private fun freePort(): Int {
-        repeat(20) {
+        repeat(40) {
             val candidate = ServerSocket(0).use { it.localPort }
+            if (!issuedPorts.add(candidate)) return@repeat
             val usable = try {
                 DatagramSocket(null).use { udp ->
                     udp.reuseAddress = true
@@ -458,7 +475,15 @@ class NodeEngineTest {
 
         // Alice adopts every gossiped address, so the ghost becomes a peer of hers
         // too; dropping it again is what leaves a node known but not reachable.
-        waitFor("alice to adopt the gossiped address") { a.topology.value.node(ghost) != null }
+        //
+        // Wait for the adoption itself, not merely for the ghost to appear in the
+        // graph. handleGossip records the sender's claimed peers — which already
+        // puts the ghost in the graph as INDIRECT — and only then adopts them.
+        // Forgetting it in that window finds nothing to forget and returns
+        // silently, and the adoption that follows leaves it DIRECT for good.
+        waitFor("alice to adopt the gossiped address") {
+            a.topology.value.node(ghost)?.role == NodeRole.DIRECT
+        }
         a.forgetPeer(ghost)
         waitFor("the ghost to remain in the graph without being a peer") {
             a.topology.value.node(ghost)?.role == NodeRole.INDIRECT
@@ -741,4 +766,128 @@ class NodeEngineTest {
         )
     }
 
+
+    /**
+     * A node never receives its own broadcast: it appends its own lines on
+     * send, and no peer echoes them back. Taking one is how a single bad line
+     * spreads — it lands in this node's log, is handed out in every state
+     * snapshot afterwards, and every node that syncs seeds its high-water mark
+     * for this author from it. Measured on hardware: one forged sequence and
+     * three peers stopped hearing the author entirely.
+     */
+    @Test
+    fun aChatLineAttributedToOurselfIsRefused() {
+        val (a, b) = pair()
+        a.sendChat("said by a")
+        waitFor("the line to reach b") { b.chat.value.any { it.text == "said by a" } }
+
+        // Framed by hand with the cluster's own codec, because no engine would
+        // ever send this: it is a line claiming to be a's, handed to a.
+        val forged = Codec("", Codec.DEFAULT_CLUSTER).encode(
+            Kind.CHAT,
+            ChatMessage(
+                sender = a.addr, node = a.nodeId, nick = "alice", text = "NOT-SAID-BY-A",
+                ts = System.currentTimeMillis() / 1000, seq = 900001,
+            ),
+        )
+        b.sendPacket(a.addr, Kind.CHAT, forged)
+        waitFor("the self-attributed line to be refused") {
+            a.diagnostics().metrics.chatSelfAttributed > 0
+        }
+        assertTrue(
+            "took a line claiming to be our own",
+            a.chat.value.none { it.text == "NOT-SAID-BY-A" },
+        )
+        // The log is what every snapshot is built from.
+        assertTrue(
+            "a forged sequence reached the log snapshots are built from",
+            a.chat.value.none { it.seq == 900001L },
+        )
+
+        // And our own numbering is untouched.
+        a.sendChat("still audible")
+        waitFor("the next line to reach b") { b.chat.value.any { it.text == "still audible" } }
+        assertEquals(2L, a.chat.value.first { it.text == "still audible" }.seq)
+    }
+
+    /**
+     * A node id is what every version is stamped with, so two nodes sharing
+     * one write versions that compare equal while holding different values.
+     * Neither side is newer, so neither accepts the other and the two stay
+     * split for good. The engine cannot repair that; it has to notice it.
+     */
+    @Test
+    fun `a node that moved address rebinds its id once`() {
+        val e = engine(freePort(), "a")
+        e.setNodeId("peer-id", "127.0.0.1:3138")
+        e.setNodeId("peer-id", "127.0.0.1:4000")
+        e.setNodeId("peer-id", "127.0.0.1:4000")
+
+        val conflicts = e.idConflicts()
+        assertEquals(1, conflicts.size)
+        assertEquals("a single move must not look like two live nodes", 1L, conflicts[0].flips)
+    }
+
+    @Test
+    fun `two addresses claiming one id keep flipping`() {
+        val e = engine(freePort(), "a")
+        repeat(6) {
+            e.setNodeId("shared-id", "127.0.0.1:3141")
+            e.setNodeId("shared-id", "127.0.0.1:3142")
+        }
+
+        val conflict = e.idConflicts().single()
+        assertTrue("twins flipped only ${conflict.flips} times", conflict.flips >= ID_CONFLICT_FLIPS)
+        assertNotEquals(conflict.addrs[0], conflict.addrs[1])
+        assertEquals(
+            "the conflict never reached the diagnostics",
+            1,
+            e.diagnostics().idConflicts.size,
+        )
+    }
+
+    // The unambiguous case: nothing legitimate makes a peer announce *our* id.
+    @Test
+    fun `a peer claiming our own id is named, and we never accuse ourselves`() {
+        val e = engine(freePort(), "a")
+        e.setNodeId(e.nodeId, e.addr)
+        assertTrue("the node accused itself", e.impostors().isEmpty())
+
+        e.setNodeId(e.nodeId, "127.0.0.1:3142")
+        assertEquals(listOf("127.0.0.1:3142"), e.diagnostics().impostors)
+    }
+
+    /**
+     * Two nodes started from copies of one state file share a node id, so
+     * their writes to one key carry the identical version. Neither is newer,
+     * so neither replica ever accepts the other and the split is permanent —
+     * the one divergence anti-entropy cannot repair.
+     *
+     * The check used to report it as convergence, because the fingerprint
+     * folded the version and not the value. Measured on a six-node cluster
+     * before the fix: 45 seconds of anti-entropy, both sides still holding
+     * different values, `converged: true`.
+     */
+    @Test
+    fun `a key held at one version with two values is reported, not hidden`() {
+        val a = engine(freePort(), "alice")
+        val b = engine(freePort(), "bob")
+        a.start()
+        b.start()
+
+        val shared = Version(100, "00000000-dead-beef")
+        a.store.apply(KVUpdate(action = KVAction.SET, key = "split", value = "written-by-a", version = shared))
+        b.store.apply(KVUpdate(action = KVAction.SET, key = "split", value = "written-by-b", version = shared))
+        a.addPeer(b.addr)
+        b.addPeer(a.addr)
+
+        val peer = namedDifferencesOf(a)
+        val diff = peer.differences.firstOrNull { it.key == "split" }
+        assertNotNull("the diverging key was not named: $peer", diff)
+        assertTrue(
+            "the difference was not marked as one replication cannot repair",
+            diff!!.sameVersion,
+        )
+        assertEquals("both sides should report the identical version", diff.local, diff.remote)
+    }
 }

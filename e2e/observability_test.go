@@ -398,3 +398,274 @@ func TestARefusedReplicationIsNotReportedAsStaleness(t *testing.T) {
 	// the error is warning about.
 	valueEverywhere(t, []node{a, b}, key, strings.Repeat("x", 1_200_000), 30*time.Second)
 }
+
+// Chat delivery is reported, and the numbers add up across real processes.
+//
+// A chat line has no digest behind it the way a key does, so the only evidence
+// a line arrived is the sequence it carries. In-process tests can assert the
+// tracker's rules; only separate processes exchanging real datagrams can show
+// that the sequence survives the wire, that an author answers a pull for its
+// own lines, and that nothing is counted as missing on a healthy cluster.
+func TestChatIsSequencedAcrossProcesses(t *testing.T) {
+	line := fmt.Sprintf("sequenced-%d", time.Now().UnixNano())
+	a.say(t, line)
+
+	for _, n := range []node{b, c} {
+		eventually(t, n.name+" receives the line", 20*time.Second, func() (bool, string) {
+			for _, e := range n.chat(t) {
+				if e.Text == line {
+					return true, ""
+				}
+			}
+			return false, "not in the log yet"
+		})
+	}
+
+	// Every peer agrees nothing is missing: a cluster that is working must not
+	// report gaps, or the finding means nothing when it does appear.
+	for _, n := range []node{a, b, c} {
+		if got := n.metric(t, `rezoagwe_chat_lost_total`); got != 0 {
+			t.Fatalf("%s reports %v chat line(s) lost on a healthy cluster", n.name, got)
+		}
+		if got := n.metric(t, `rezoagwe_chat_duplicates_total`); got != 0 {
+			t.Fatalf("%s counted %v duplicate chat line(s) with nothing re-sending them", n.name, got)
+		}
+	}
+
+	// And the line is held once, not twice — the sequence is what makes a
+	// re-delivery recognisable, and a cluster with no loss should never have
+	// exercised that path at all.
+	seen := 0
+	for _, e := range b.chat(t) {
+		if e.Text == line {
+			seen++
+		}
+	}
+	if seen != 1 {
+		t.Fatalf("the line appears %d times in %s's log, want 1", seen, b.name)
+	}
+}
+
+// A node that joins after a conversation has started must not report every
+// line it was not there for as lost. A joiner that cried wolf would make the
+// finding useless on the one cluster where it matters.
+func TestAJoinerDoesNotReportTheConversationItMissedAsLost(t *testing.T) {
+	if got := late.metric(t, `rezoagwe_chat_lost_total`); got != 0 {
+		t.Fatalf("the late joiner reports %v chat line(s) lost that were said before it arrived", got)
+	}
+	if got := late.metric(t, `rezoagwe_chat_gaps_total`); got != 0 {
+		t.Fatalf("the late joiner claims %v gap(s) in a conversation it was not in", got)
+	}
+}
+
+// A restarted node has to carry on numbering where it left off, and this is
+// the only level that can show it: the hazard needs a second process using the
+// same identity, and a peer that still remembers the first one.
+//
+// The sequence is what makes a re-delivery recognisable, so a node that began
+// counting again at 1 would have its first lines read as duplicates of the
+// ones its peers already hold — and **dropped**. The feature built to stop
+// chat going missing would be the thing making it go missing, silently, on
+// every restart.
+func TestARestartedNodeContinuesItsChatSequence(t *testing.T) {
+	ensureRestarted(t, restart, envSeconds("E2E_RESTART_SEC", 30)+settle)
+	eventually(t, "the restarted node to rejoin", settle, func() (bool, string) {
+		if h := restart.health(t); !h.Connected {
+			return false, fmt.Sprintf("peers = %d", h.Peers)
+		}
+		return true, ""
+	})
+
+	before := findChat(restart.chat(t), restartChatBefore)
+	if before == nil {
+		t.Skip("the pre-restart line never landed before the first process was killed")
+	}
+	if before.Seq == 0 {
+		t.Fatalf("the pre-restart line carries no sequence: %+v", before)
+	}
+
+	after := fmt.Sprintf("frank is back %d", time.Now().UnixNano())
+	restart.say(t, after)
+
+	// The consequence first: the line reaches every peer. A sequence that
+	// restarted at 1 would be refused as something they already hold, and this
+	// is the assertion that would fail — with nothing in any log to say why.
+	for _, n := range []node{a, b, c} {
+		eventually(t, n.name+" receives the line said after the restart", settle, func() (bool, string) {
+			if countText(n.chat(t), after) == 0 {
+				return false, "not in the log yet"
+			}
+			return true, ""
+		})
+	}
+
+	// Then the cause: the numbering continued rather than starting over.
+	sent := findChat(restart.chat(t), after)
+	if sent == nil {
+		t.Fatal("the restarted node does not hold its own line")
+	}
+	if sent.Seq <= before.Seq {
+		t.Fatalf("sequence went from %d to %d across the restart: the counter did not survive, "+
+			"so every peer reads these lines as duplicates it already has",
+			before.Seq, sent.Seq)
+	}
+	if sent.Node != before.Node {
+		t.Fatalf("node id changed across a restart with a state file: %q -> %q", before.Node, sent.Node)
+	}
+
+	// And exactly once everywhere — the pull path and a state snapshot can both
+	// deliver a line, so recognising the second copy is what keeps it to one.
+	for _, n := range []node{a, b, c, restart} {
+		if got := countText(n.chat(t), after); got != 1 {
+			t.Errorf("%s holds the line %d times, want 1", n.name, got)
+		}
+	}
+}
+
+// findChat returns the first entry with this text, or nil.
+func findChat(entries []chatEntry, text string) *chatEntry {
+	for i := range entries {
+		if entries[i].Text == text {
+			return &entries[i]
+		}
+	}
+	return nil
+}
+
+// A repair reply may only fill a gap the asking node is already waiting for.
+//
+// Found on hardware: a backlog carrying a line attributed to another peer,
+// numbered far ahead, was accepted — which raised that author's high-water
+// mark so far that every genuine line it sent afterwards sorted below it and
+// was dropped as a duplicate. One datagram silenced an author at that node
+// permanently, through the mechanism built to stop chat going missing. Only
+// separate processes can show it: the guard is on what arrives over the wire.
+func TestChatRepairNeverIntroducesState(t *testing.T) {
+	line := fmt.Sprintf("guarded-%d", time.Now().UnixNano())
+	a.say(t, line)
+	for _, n := range []node{b, c} {
+		eventually(t, n.name+" receives the line", 20*time.Second, func() (bool, string) {
+			return countText(n.chat(t), line) == 1, "not in the log yet"
+		})
+	}
+
+	// On a cluster where nothing was lost, nothing was ever asked for — so a
+	// healthy run must show no backlog traffic and nothing refused either.
+	for _, n := range []node{a, b, c} {
+		if got := n.metric(t, `rezoagwe_chat_unsolicited_total`); got != 0 {
+			t.Errorf("%s refused %v backlog line(s) on a cluster that lost nothing", n.name, got)
+		}
+		if got := n.metric(t, `rezoagwe_chat_self_attributed_total`); got != 0 {
+			t.Errorf("%s was offered %v line(s) claiming to be its own", n.name, got)
+		}
+	}
+}
+
+// Every peer's heartbeat says where its own numbering stands, which is what
+// makes a quiet author's lines recoverable at all: without it the baseline
+// waits until that author speaks, and anything said before then is neither
+// delivered nor reported. Measured on hardware before the fix: three lines
+// from a peer that had never spoken, gone in silence.
+func TestEveryPeerKnowsWhereEveryAuthorsNumberingStands(t *testing.T) {
+	// Give every node something to announce, then let a heartbeat round pass.
+	a.say(t, fmt.Sprintf("a-speaks-%d", time.Now().UnixNano()))
+	b.say(t, fmt.Sprintf("b-speaks-%d", time.Now().UnixNano()))
+	time.Sleep(8 * time.Second)
+
+	// Nobody may be claiming a gap: every author's position is known and
+	// every line was delivered.
+	for _, n := range []node{a, b, c} {
+		d := n.diagnostics(t)
+		for _, chk := range d.Checks {
+			if strings.Contains(chk.Title, "chat line") {
+				t.Errorf("%s reports %q on a cluster that lost nothing", n.name, chk.Title)
+			}
+		}
+		if got := n.metric(t, `rezoagwe_chat_lost_total`); got != 0 {
+			t.Errorf("%s gave up on %v chat line(s)", n.name, got)
+		}
+	}
+}
+
+// Two nodes started from copies of one state file share a node id, so their
+// writes to one key are stamped with the same counter *and* the same id.
+// Neither version is newer, so neither replica ever accepts the other and the
+// split is permanent — the one divergence anti-entropy cannot repair.
+//
+// The check used to report it as convergence, because the fingerprint folded
+// the version and not the value. Measured on a six-node cluster before the
+// fix: 45 seconds of anti-entropy, both sides still holding different values,
+// `converged: true`, every peer agreeing, and `/diagnostics` saying the node
+// looked healthy.
+//
+// The twins run in a cluster of their own, and the split is seeded into their
+// state files rather than raced for, because that is the state a copied file
+// plus one write on each side reaches and seeding it makes this deterministic.
+func TestTwinsUnderOneIdentityAreReportedNotHidden(t *testing.T) {
+	const key = "split-brain"
+
+	// Both really do hold different values for the one key.
+	va, _, oka := twinA.get(t, key)
+	vb, _, okb := twinB.get(t, key)
+	if !oka || !okb {
+		t.Fatalf("the twins do not both hold %s: a=%v b=%v", key, oka, okb)
+	}
+	if va == vb {
+		t.Fatalf("the twins agree on %s (%q); the split was not seeded", key, va)
+	}
+
+	var found peerConsistency
+	eventually(t, "the twins to see each other and report the split", converge, func() (bool, string) {
+		r := twinA.consistency(t)
+		if len(r.Peers) == 0 {
+			return false, "twin-a has not met twin-b yet"
+		}
+		if r.Converged {
+			return false, "the report still claims the twins agree"
+		}
+		for _, p := range r.Peers {
+			if p.Agrees || !p.Reachable {
+				continue
+			}
+			found = p
+			return true, ""
+		}
+		return false, "no peer is reported as disagreeing"
+	})
+
+	var named *keyDifference
+	for i := range found.Differences {
+		if found.Differences[i].Key == key {
+			named = &found.Differences[i]
+		}
+	}
+	if named == nil {
+		t.Fatalf("the report differs in %d bucket(s) but does not name %s: %+v",
+			len(found.DifferingBuckets), key, found.Differences)
+	}
+	// The whole point: both sides at the identical version. Reporting it as an
+	// ordinary difference would suggest anti-entropy will sort it out.
+	if !named.SameVersion {
+		t.Errorf("%s: the difference is not marked as one replication cannot repair: %+v", key, named)
+	}
+	if named.Local != named.Remote {
+		t.Errorf("%s: versions reported as %q and %q, want the identical version on both sides",
+			key, named.Local, named.Remote)
+	}
+
+	// And the cause is named, not just the symptom.
+	eventually(t, "the identity conflict to be reported", converge, func() (bool, string) {
+		for _, c := range twinA.diagnostics(t).Checks {
+			if strings.Contains(c.Title, "using this node's identity") {
+				if c.Severity != "error" {
+					return false, "the identity conflict is reported as " + c.Severity
+				}
+				if !strings.Contains(c.Detail, "state file") {
+					return false, "the check does not say how to fix it"
+				}
+				return true, ""
+			}
+		}
+		return false, "no check names the node sharing this node's identity"
+	})
+}

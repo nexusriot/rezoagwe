@@ -40,6 +40,19 @@ func (n *Node) Diagnostics() diagnostics.Snapshot {
 		advertise = n.cfg.AdvertiseAddr
 	}
 
+	chatGaps := make([]diagnostics.ChatGap, 0)
+	for _, g := range n.ChatGaps() {
+		chatGaps = append(chatGaps, diagnostics.ChatGap{
+			Addr: g.Addr, Nick: g.Nick, Outstanding: g.Outstanding,
+			Lost: g.Lost, Recovered: g.Recovered,
+		})
+	}
+	idConflicts := make([]diagnostics.IDConflict, 0)
+	for _, c := range n.Model.IDConflicts() {
+		idConflicts = append(idConflicts, diagnostics.IDConflict{
+			ID: c.ID, Addrs: c.Addrs, Flips: c.Flips, At: c.At,
+		})
+	}
 	return diagnostics.Snapshot{
 		Addr:              n.cfg.AdvertiseAddr,
 		BindAddr:          n.cfg.NodeAddr,
@@ -56,6 +69,9 @@ func (n *Node) Diagnostics() diagnostics.Snapshot {
 		Seeds:             append([]string(nil), n.cfg.BootstrapAddrs...),
 		Peers:             peers,
 		Strangers:         strangers,
+		IDConflicts:       idConflicts,
+		Impostors:         n.Model.Impostors(),
+		ChatGaps:          chatGaps,
 		Metrics:           snap,
 		Gauges:            snap.Gauges,
 		Topology:          n.Topology(),

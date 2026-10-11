@@ -37,6 +37,8 @@ const (
 	KindDirectMessage    MessageKind = 10
 	KindFingerprint      MessageKind = 11
 	KindFingerprintReply MessageKind = 12
+	KindChatPull         MessageKind = 13
+	KindChatBacklog      MessageKind = 14
 
 	KindBootstrapRegister MessageKind = 20
 	KindBootstrapDiscover MessageKind = 21
@@ -72,6 +74,10 @@ func (k MessageKind) String() string {
 		return "fingerprint"
 	case KindFingerprintReply:
 		return "fingerprint_reply"
+	case KindChatPull:
+		return "chat_pull"
+	case KindChatBacklog:
+		return "chat_backlog"
 	case KindBootstrapRegister:
 		return "bootstrap_register"
 	case KindBootstrapDiscover:
@@ -151,7 +157,51 @@ type ChatMessage struct {
 	// To is set on a direct message (KindDirectMessage) and names the intended
 	// recipient's address, so the receiver can label it.
 	To string `json:"to,omitempty"`
+	// Seq counts this sender's own broadcasts, from 1, and survives a restart
+	// with the state file. It is what lets a receiver notice that a line never
+	// arrived: chat is one datagram per peer with nothing re-sending it, so
+	// without a sequence a dropped message is indistinguishable from one that
+	// was never sent, at both ends.
+	//
+	// Zero means unsequenced — a peer older than this field, or a direct
+	// message — and is never gap-checked.
+	Seq uint64 `json:"seq,omitempty"`
+	// Node is the author's persistent node id, which is what Seq counts
+	// against. Keying on the id rather than the address matches how a KV
+	// version already identifies a writer: a node that moves ports is still
+	// the same author, and a node that restarts with no state file gets a new
+	// id and is correctly read as a new one — rather than appearing to rewind
+	// its whole conversation and having every line after it ignored as a
+	// duplicate.
+	Node string `json:"node,omitempty"`
 }
+
+// ChatPull asks a sender to re-send its own broadcasts by sequence number.
+//
+// Addressed to the author, not to whoever happens to be nearby: only the
+// author can be sure what its own Seq 7 was, and asking a third party would
+// propagate whatever that peer had instead.
+type ChatPull struct {
+	From string `json:"from"`
+	// Seqs are the sender's sequence numbers this node is missing, bounded by
+	// MaxChatPull so one request stays one datagram.
+	Seqs []uint64 `json:"seqs"`
+}
+
+// ChatBacklog answers a ChatPull.
+type ChatBacklog struct {
+	From string `json:"from"`
+	// Messages are the requested lines the author still holds.
+	Messages []ChatMessage `json:"messages,omitempty"`
+	// Unavailable are the ones it no longer holds, because the chat ring has
+	// moved past them. Saying so is the point: it turns "still waiting" into
+	// "gone", which is the difference between a gap that will heal and one
+	// that will not, and a receiver that is not told keeps asking forever.
+	Unavailable []uint64 `json:"unavailable,omitempty"`
+}
+
+// MaxChatPull bounds how many sequence numbers one request may name.
+const MaxChatPull = 64
 
 type StateRequest struct {
 	From string `json:"from"`
@@ -188,6 +238,16 @@ type ChatEntry struct {
 	Kind   ChatKind `json:"kind,omitempty"`
 	// To is the counterpart address of a direct message.
 	To string `json:"to,omitempty"`
+	// Seq is the author's own sequence number, carried into the log so the
+	// author can answer a ChatPull for it and so a re-delivery is recognised
+	// as one rather than appended twice. Zero on system lines, direct
+	// messages, and anything from a peer older than the field.
+	Seq uint64 `json:"seq,omitempty"`
+	// Node is the author's persistent id, recorded for the same reason a KV
+	// entry records its writer: Seq counts against the id, so a log that kept
+	// only the address could not tell the tracker which author's numbering a
+	// stored line belongs to — and the baseline would not survive a restart.
+	Node string `json:"node,omitempty"`
 }
 
 // ChatLog is a slice of entries that also accepts the wire-v1 form, where chat
@@ -245,6 +305,13 @@ type Hello struct {
 	// Version.Node — so peers can attribute a write to a nickname even after
 	// the node moves to a different address.
 	ID string `json:"id,omitempty"`
+	// ChatSeq is how many lines this node has broadcast, carried on the
+	// heartbeat so a peer learns where our numbering stands when we *meet*
+	// rather than when we first happen to speak. Without it the baseline for a
+	// quiet author is set by their first audible line, and everything they
+	// said before that — including while this node was listening but
+	// unreachable — is neither delivered nor reported.
+	ChatSeq uint64 `json:"chat_seq,omitempty"`
 }
 
 // Goodbye is sent to every known peer when a node shuts down cleanly, so
@@ -260,6 +327,13 @@ type KeyVersion struct {
 	Key     string  `json:"key"`
 	Version Version `json:"version"`
 	Deleted bool    `json:"deleted,omitempty"`
+	// ValueHash is sha256 of the value, hex, and empty for a tombstone or an
+	// empty value. It is what lets the checker tell apart two replicas that
+	// agree on the version but hold different data — the one divergence
+	// last-write-wins cannot repair, because neither side's version is newer.
+	// Absent from a peer too old to send it, which reads as "cannot compare"
+	// rather than as a difference.
+	ValueHash string `json:"vhash,omitempty"`
 }
 
 // Digest advertises what the sender holds for a *contiguous slice* of the

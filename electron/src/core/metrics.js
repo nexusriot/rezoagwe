@@ -25,6 +25,18 @@ class Metrics {
     this.malformedDrops = 0;
 
     this.kvApplied = 0;
+    // Chat has no digest to repair it, so these are the only evidence that a
+    // line went missing at all.
+    this.chatGapsFound = 0;
+    this.chatRecovered = 0;
+    this.chatLost = 0;
+    this.chatPullsSent = 0;
+    this.chatPullsServed = 0;
+    this.chatDuplicates = 0;
+    // Backlog lines dropped because nothing asked for them.
+    this.chatUnsolicited = 0;
+    // Inbound chat claiming to be written by this node.
+    this.chatSelfAttributed = 0;
     this.kvRejectedStale = 0;
     // Remote updates this node declined to store at all. Kept apart from
     // kvRejectedStale because they mean opposite things: a stale rejection is
@@ -164,6 +176,14 @@ class Metrics {
       skewDrops: this.skewDrops,
       malformedDrops: this.malformedDrops,
       kvApplied: this.kvApplied,
+      chatGapsFound: this.chatGapsFound,
+      chatRecovered: this.chatRecovered,
+      chatLost: this.chatLost,
+      chatPullsSent: this.chatPullsSent,
+      chatPullsServed: this.chatPullsServed,
+      chatDuplicates: this.chatDuplicates,
+      chatUnsolicited: this.chatUnsolicited,
+      chatSelfAttributed: this.chatSelfAttributed,
       kvRejectedStale: this.kvRejectedStale,
       kvRefused: this.kvRefused,
       kvLocalWrites: this.kvLocalWrites,
@@ -199,6 +219,14 @@ class Metrics {
     counter('skew_drops_total', 'Packets dropped for timestamp skew.', s.skewDrops);
     counter('malformed_drops_total', 'Packets dropped as unparseable.', s.malformedDrops);
     counter('kv_applied_total', 'Remote updates merged into the store.', s.kvApplied);
+    counter('chat_gaps_total', 'Chat lines a sequence gap showed had not arrived.', s.chatGapsFound);
+    counter('chat_recovered_total', 'Missing chat lines a backlog pull recovered.', s.chatRecovered);
+    counter('chat_lost_total', 'Chat lines given up on.', s.chatLost);
+    counter('chat_pulls_sent_total', 'Backlog requests sent.', s.chatPullsSent);
+    counter('chat_pulls_served_total', 'Backlog requests answered for a peer.', s.chatPullsServed);
+    counter('chat_duplicates_total', 'Chat lines dropped as already held.', s.chatDuplicates);
+    counter('chat_unsolicited_total', 'Backlog lines dropped because nothing asked for them.', s.chatUnsolicited);
+    counter('chat_self_attributed_total', 'Inbound chat claiming to be written by this node.', s.chatSelfAttributed);
     counter('kv_rejected_stale_total', 'Remote updates rejected as not newer.', s.kvRejectedStale);
     counter('kv_refused_total', "Remote updates refused by this node's store limits.", s.kvRefused);
     counter('kv_local_writes_total', 'Local writes and deletes.', s.kvLocalWrites);

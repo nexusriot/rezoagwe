@@ -10,11 +10,29 @@ the code it touches.
 
 ## Shipped
 
-The repository is at **0.4.3** — the version the Makefile stamps into the Go
+The repository is at **0.4.6** — the version the Makefile stamps into the Go
 binaries and their `.deb`, the desktop client's `package.json`, and the Android
 app's `versionName`; a test keeps the four in step.
 
-0.4.3 is a documentation round over 0.4.2's fixes. The automated checks were
+0.4.6 is what a second hardware round found by running two nodes from copies
+of one state file: they diverged permanently on a shared key — neither version
+newer, so neither replica ever accepting the other — while the consistency
+check reported the cluster converged and every tool called the node healthy.
+The store fingerprint folded the version and not the value, so the one feature
+built to detect divergence could not see it. Fixing that is a protocol change:
+the fold now covers a hash of the value in all three ports, and a node on an
+older build reports every rebuilt peer as divergent until it is upgraded.
+
+0.4.5 before it is what a hardware round did to that feature: it confirmed sequencing
+works over a real radio — a line lost to a genuine Wi-Fi outage was named,
+asked for and recovered — and then found three ways the implementation was
+wrong, two of which only separate processes on a real network could reach.
+
+0.4.4 before it closed the one gap the earlier hardware run found that was not
+a bug in any code: chat had no repair path and, worse, no way to notice it
+needed one.
+
+0.4.3 before it was a documentation round over 0.4.2's fixes. The automated checks were
 all green and stayed green: what they cannot see is a claim nobody thought to
 encode, and five had gone stale — including the picture saying **"four
 implementations"** twice while drawing three, with its own footer saying "all
@@ -37,6 +55,124 @@ the Kotlin and JavaScript ports — which had been carrying the same anti-entrop
 defect all along.
 
 Newest first.
+
+### 0.4.6 — the divergence the divergence detector could not see
+
+Found by running two Go peers from copies of one state file, which is what a
+cloned image or a restored backup produces. Every version is stamped with the
+node id, so the twins' writes to one key compared **equal**: neither newer,
+neither accepted, 45 seconds of anti-entropy and still split — reported as
+`converged: true`, every peer agreeing, `Node looks healthy`.
+
+* **The fingerprint now folds a hash of the value**, in Go, Kotlin and
+  JavaScript, re-pinned to new shared vectors. Empty for a tombstone, because
+  `Apply` stores whatever value rides along with a remote delete and nothing on
+  the wire guarantees that field is cleared. A **protocol change**: mixed builds
+  report false divergence until every node is upgraded (§14).
+* **The second round of the check names the key** and flags it `same_version` —
+  the only difference in a report that replication will never repair.
+* **A shared identity is reported directly** (§14.1): a peer announcing this
+  node's own id is named outright, and one id claimed by two addresses is
+  counted, because a node that moved address rebinds once where twins rebind on
+  every heartbeat. Measured: 58 flips against 1.
+* **Both GUI ports recommended tombstone GC without the warning that makes it
+  safe.** Demonstrated on an isolated pair — a node stopped before a delete came
+  back still holding the value, the delete was undone on both sides, and the
+  check called them converged. The Go advice named the constraint; Kotlin and
+  JavaScript, the two that expose the age as a field, did not. Now all three do,
+  and a test in each port fails if the clause is dropped again.
+
+The e2e cast gained two twins in a cluster of their own, seeded with the split
+rather than racing for it, so the whole chain — permanent divergence, the named
+key, the identity error — is asserted on every run.
+
+### 0.4.5 — what a hardware round did to the finished feature
+
+Chat sequencing was built, tested and documented before any of it had touched a
+radio. Driving it on a real cluster — a tablet over Wi-Fi, two Go peers and the
+desktop client — confirmed the feature works and then found three ways it was
+wrong, two of which no in-process test could reach.
+
+- ✅ **A repair can no longer introduce state** — found by a hardware round
+  driving the finished feature. A `ChatBacklog` carrying a line attributed to
+  another peer, numbered far ahead, was accepted: that raised the author's
+  high-water mark so far that every genuine line they sent afterwards sorted
+  below it and was dropped as a duplicate. **One datagram silenced an author at
+  that node permanently** — through the mechanism built to stop chat going
+  missing — and it spread, because the line landed in a log that every state
+  snapshot is built from. A backlog is now accepted only for a gap this node is
+  already waiting for, from the author that answered, and nothing claiming to
+  be written by this node is taken at all.
+- ✅ **A quiet author's lines are recoverable** — the baseline used to be set
+  by the first line an author was *heard* to say, which conflates "I was not
+  there" with "I was there and did not hear it". Measured: a peer that had
+  never spoken said three lines while one node was off the air, and that node
+  reported nothing. `Hello` now carries the sender's own chat position on every
+  heartbeat, so the baseline is set when two nodes *meet*. Verified on hardware
+  by recovering exactly that case with no later line needed to reveal it.
+- ✅ **What the tracker accumulates is bounded** — the gaps inside an author
+  were capped from the start, the authors were not. An entry is created by
+  every *heartbeat*, not only by a line, and a node restarted without a state
+  file returns with a new id, so cluster churn grew the set and nothing shrank
+  it: the cleanup methods existed in all three ports and were dead code. Now
+  capped at the most recently active, with `forget` wired to the explicit
+  *forget this peer* action — and deliberately **not** to eviction, since a
+  peer that falls quiet for fifteen seconds and comes back is exactly the one
+  whose outstanding gaps are still worth asking for.
+- ✅ **A flaky test, and the race it was hiding** —
+  `NodeEngineTest.aPeerListedByNobodyWeTalkToStaysIndirect` failed once in six
+  runs. `handleGossip` records a sender's claimed peers — which already puts a
+  gossiped address in the graph — and only *then* adopts them. The test waited
+  for mere presence, so `forgetPeer` could land in that window, find nothing to
+  forget and return silently, leaving the node DIRECT for good. Waits for the
+  adoption now.
+
+### 0.4.4 — chat sequencing
+
+- ✅ **A dropped chat line is detectable** — every broadcast now carries its
+  author's own sequence number and persistent node id (wire kinds 13 and 14,
+  [DESIGN §5.7](DESIGN.md#57-chat-delivery-and-the-gap-that-used-to-be-invisible)).
+  The store is repaired because every entry carries a version a digest can
+  compare; a chat line carried nothing, so a dropped one was not merely
+  unrecoverable, it was **invisible** — the author's log said sent, every
+  receiver's simply never had it, and no counter at either end moved. The
+  hardware run lost exactly one line this way and the only reason anyone
+  noticed was a human reading both screens.
+- ✅ **…and repairable** — `ChatPull` / `ChatBacklog`, addressed to the
+  author, because only the author can be sure what its own seq 7 was. The
+  answer carries the lines it still holds *and* the ones it does not, which
+  is what turns "still waiting" into "gone"; a receiver that is never told
+  keeps asking forever.
+- ✅ **…without showing anything twice** — a sequence makes a re-delivery
+  recognisable, so the cure does not put a second copy of every recovered
+  line on screen. Recovered lines are re-inserted where they were said, not
+  appended after the lines that followed them.
+- ✅ **Keyed on the node id, not the address** — the same choice a KV version
+  makes. A node that moves ports stays one author; a node that restarts with
+  no state file gets a fresh id and reads as a new one, instead of appearing
+  to rewind its whole conversation and having everything after it dropped as
+  a duplicate.
+- ✅ **Reported** — `chat_gaps_total`, `chat_recovered_total`,
+  `chat_lost_total` and `chat_duplicates_total` in all three ports, a *Chat
+  delivery* block in the TUI, the Android metrics screen and the desktop
+  counters, and a diagnostics finding that separates a gap which may still
+  close (info) from one that will not (warning).
+- ✅ **The baseline survives a restart** — found by asking what the e2e suite
+  could not yet see. The tracker was in memory only, so a node that restarted
+  read the first line from any author as its baseline and lost whatever had
+  been said while it was down: the one window where a line is most likely to
+  have been missed. Each stored line now records its author's id beside its
+  sequence, and the tracker is seeded from the state file at startup and from
+  every synced snapshot.
+- ✅ **…and so does the node's own counter**, for the opposite reason: a node
+  that began numbering again at 1 would have its first lines read as
+  duplicates and dropped by every peer that still remembers the old process.
+  Proved across processes by `TestARestartedNodeContinuesItsChatSequence`,
+  which fails by the line never arriving at all — exactly the silent loss the
+  feature exists to end.
+- Carried into Kotlin and JavaScript in the same round, with the tracker
+  rules pinned case-for-case in all three suites and the encoding pinned
+  against the bytes Go writes.
 
 ### 0.4.3 — the documentation caught up with the fixes
 

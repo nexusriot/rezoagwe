@@ -28,8 +28,22 @@ type Metrics struct {
 	SkewDrops      atomic.Uint64
 	MalformedDrops atomic.Uint64
 
-	KVApplied       atomic.Uint64
-	KVRejectedStale atomic.Uint64
+	KVApplied atomic.Uint64
+	// Chat has no digest to repair it, so these are the only evidence that a
+	// line went missing at all.
+	ChatGapsFound   atomic.Uint64
+	ChatRecovered   atomic.Uint64
+	ChatLost        atomic.Uint64
+	ChatPullsSent   atomic.Uint64
+	ChatPullsServed atomic.Uint64
+	ChatDuplicates  atomic.Uint64
+	// ChatUnsolicited counts backlog lines dropped because nothing asked for
+	// them — the repair channel refusing to introduce state.
+	ChatUnsolicited atomic.Uint64
+	// ChatSelfAttributed counts inbound chat claiming to be written by this
+	// node. Nothing legitimate does that.
+	ChatSelfAttributed atomic.Uint64
+	KVRejectedStale    atomic.Uint64
 	// KVRefused counts remote updates this node declined to store at all —
 	// over the value limit, past the key limit, or too large to replicate.
 	// Kept apart from KVRejectedStale because they mean opposite things: a
@@ -260,13 +274,21 @@ type Snapshot struct {
 	SkewDrops      uint64
 	MalformedDrops uint64
 
-	KVApplied       uint64
-	KVRejectedStale uint64
-	KVRefused       uint64
-	KVLocalWrites   uint64
-	KVCASFailures   uint64
-	KVExpired       uint64
-	KVGCed          uint64
+	KVApplied          uint64
+	ChatGapsFound      uint64
+	ChatRecovered      uint64
+	ChatLost           uint64
+	ChatPullsSent      uint64
+	ChatPullsServed    uint64
+	ChatDuplicates     uint64
+	ChatUnsolicited    uint64
+	ChatSelfAttributed uint64
+	KVRejectedStale    uint64
+	KVRefused          uint64
+	KVLocalWrites      uint64
+	KVCASFailures      uint64
+	KVExpired          uint64
+	KVGCed             uint64
 
 	AERounds uint64
 	AEPushed uint64
@@ -287,29 +309,37 @@ type Snapshot struct {
 
 func (m *Metrics) Snapshot() Snapshot {
 	s := Snapshot{
-		PacketsSent:     m.PacketsSent.Load(),
-		PacketsRecv:     m.PacketsRecv.Load(),
-		BytesSent:       m.BytesSent.Load(),
-		BytesRecv:       m.BytesRecv.Load(),
-		SendErrors:      m.SendErrors.Load(),
-		AuthFailures:    m.AuthFailures.Load(),
-		ReplayDrops:     m.ReplayDrops.Load(),
-		SkewDrops:       m.SkewDrops.Load(),
-		MalformedDrops:  m.MalformedDrops.Load(),
-		KVApplied:       m.KVApplied.Load(),
-		KVRejectedStale: m.KVRejectedStale.Load(),
-		KVRefused:       m.KVRefused.Load(),
-		KVLocalWrites:   m.KVLocalWrites.Load(),
-		KVCASFailures:   m.KVCASFailures.Load(),
-		KVExpired:       m.KVExpired.Load(),
-		KVGCed:          m.KVGCed.Load(),
-		AERounds:        m.AERounds.Load(),
-		AEPushed:        m.AEPushed.Load(),
-		AEPulled:        m.AEPulled.Load(),
-		StateSyncOut:    m.StateSyncOut.Load(),
-		StateSyncIn:     m.StateSyncIn.Load(),
-		StreamErrors:    m.StreamErrors.Load(),
-		HTTPRequests:    m.HTTPRequests.Load(),
+		PacketsSent:        m.PacketsSent.Load(),
+		PacketsRecv:        m.PacketsRecv.Load(),
+		BytesSent:          m.BytesSent.Load(),
+		BytesRecv:          m.BytesRecv.Load(),
+		SendErrors:         m.SendErrors.Load(),
+		AuthFailures:       m.AuthFailures.Load(),
+		ReplayDrops:        m.ReplayDrops.Load(),
+		SkewDrops:          m.SkewDrops.Load(),
+		MalformedDrops:     m.MalformedDrops.Load(),
+		KVApplied:          m.KVApplied.Load(),
+		ChatGapsFound:      m.ChatGapsFound.Load(),
+		ChatRecovered:      m.ChatRecovered.Load(),
+		ChatLost:           m.ChatLost.Load(),
+		ChatPullsSent:      m.ChatPullsSent.Load(),
+		ChatPullsServed:    m.ChatPullsServed.Load(),
+		ChatDuplicates:     m.ChatDuplicates.Load(),
+		ChatUnsolicited:    m.ChatUnsolicited.Load(),
+		ChatSelfAttributed: m.ChatSelfAttributed.Load(),
+		KVRejectedStale:    m.KVRejectedStale.Load(),
+		KVRefused:          m.KVRefused.Load(),
+		KVLocalWrites:      m.KVLocalWrites.Load(),
+		KVCASFailures:      m.KVCASFailures.Load(),
+		KVExpired:          m.KVExpired.Load(),
+		KVGCed:             m.KVGCed.Load(),
+		AERounds:           m.AERounds.Load(),
+		AEPushed:           m.AEPushed.Load(),
+		AEPulled:           m.AEPulled.Load(),
+		StateSyncOut:       m.StateSyncOut.Load(),
+		StateSyncIn:        m.StateSyncIn.Load(),
+		StreamErrors:       m.StreamErrors.Load(),
+		HTTPRequests:       m.HTTPRequests.Load(),
 	}
 	for i := 0; i < 256; i++ {
 		sent := m.sentByKind[i].Load()
@@ -393,6 +423,14 @@ func (s Snapshot) Prometheus() string {
 	counter("skew_drops_total", "Packets dropped for timestamp skew.", s.SkewDrops)
 	counter("malformed_drops_total", "Packets dropped as unparseable.", s.MalformedDrops)
 	counter("kv_applied_total", "Remote updates merged into the store.", s.KVApplied)
+	counter("chat_gaps_total", "Chat lines a sequence gap showed had not arrived.", s.ChatGapsFound)
+	counter("chat_recovered_total", "Missing chat lines a backlog pull recovered.", s.ChatRecovered)
+	counter("chat_lost_total", "Chat lines given up on: gone from the author's ring, or never answered.", s.ChatLost)
+	counter("chat_pulls_sent_total", "Backlog requests sent.", s.ChatPullsSent)
+	counter("chat_pulls_served_total", "Backlog requests answered for a peer.", s.ChatPullsServed)
+	counter("chat_duplicates_total", "Chat lines dropped as already held.", s.ChatDuplicates)
+	counter("chat_unsolicited_total", "Backlog lines dropped because nothing asked for them.", s.ChatUnsolicited)
+	counter("chat_self_attributed_total", "Inbound chat claiming to be written by this node.", s.ChatSelfAttributed)
 	counter("kv_rejected_stale_total", "Remote updates rejected as not newer.", s.KVRejectedStale)
 	counter("kv_refused_total", "Remote updates refused by this node's store limits.", s.KVRefused)
 	counter("kv_local_writes_total", "Local writes and deletes.", s.KVLocalWrites)

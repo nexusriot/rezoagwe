@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net"
+	"time"
 
 	log "github.com/sirupsen/logrus"
 
@@ -115,6 +116,10 @@ func (n *Node) dispatch(kind pb.MessageKind, body []byte) {
 		n.handleFingerprint(body)
 	case pb.KindFingerprintReply:
 		n.handleFingerprintReply(body)
+	case pb.KindChatPull:
+		n.handleChatPull(body)
+	case pb.KindChatBacklog:
+		n.handleChatBacklog(body)
 	case pb.KindBootstrapRoster:
 		n.handleBootstrapRoster(body)
 	default:
@@ -200,22 +205,138 @@ func (n *Node) handleChat(body []byte) {
 	if m.Nick != "" {
 		n.Model.SetNick(m.Sender, m.Nick)
 	}
-	kind := pb.ChatMsg
-	if m.Action {
-		kind = pb.ChatAction
+	if !n.acceptChat(m) {
+		return
 	}
-	n.appendChat(pb.ChatEntry{
-		TS:     m.TS,
-		Sender: m.Sender,
-		Nick:   m.Nick,
-		Text:   m.Text,
-		Kind:   kind,
-	})
 	// Learn about a chat sender we did not know as a peer.
 	if n.Model.AddPeer(m.Sender) {
 		n.announceJoin(m.Sender, m.Nick)
 		n.ev.PeersChanged()
 		n.send(m.Sender, pb.KindHello, n.helloMessage())
+	}
+}
+
+// acceptChat runs one broadcast past the sequence tracker and appends it if it
+// is new, reporting whether it was.
+//
+// A duplicate is dropped rather than appended. That matters more now than it
+// did: re-delivering a line is exactly what the repair path does, so without
+// this the cure would put a second copy of every recovered line on screen.
+func (n *Node) acceptChat(m pb.ChatMessage) bool {
+	// Nothing legitimate ever delivers this node its own broadcast: it appends
+	// its own lines on send, and no peer echoes them back. A message claiming
+	// to be ours is therefore either a bug or a forgery, and taking it is how
+	// one bad line spreads — it lands in *our* log, is handed out in every
+	// state snapshot afterwards, and every node that syncs seeds its
+	// high-water mark for us from it. A single forged sequence then silences
+	// this node across the whole cluster. Measured: one datagram, and three
+	// peers stopped hearing the author entirely.
+	if m.Node != "" && m.Node == n.Model.NodeID {
+		n.Metrics.ChatSelfAttributed.Add(1)
+		return false
+	}
+	if m.Node == "" && m.Sender != "" && m.Sender == n.cfg.AdvertiseAddr {
+		n.Metrics.ChatSelfAttributed.Add(1)
+		return false
+	}
+	before := n.chatGaps.outstanding()
+	recovered := false
+	switch n.chatGaps.Observe(m) {
+	case chatDuplicate:
+		n.Metrics.ChatDuplicates.Add(1)
+		return false
+	case chatFilledGap:
+		n.Metrics.ChatRecovered.Add(1)
+		recovered = true
+	default:
+		if grew := n.chatGaps.outstanding() - before; grew > 0 {
+			n.Metrics.ChatGapsFound.Add(uint64(grew))
+		}
+	}
+	kind := pb.ChatMsg
+	if m.Action {
+		kind = pb.ChatAction
+	}
+	e := pb.ChatEntry{
+		TS:     m.TS,
+		Sender: m.Sender,
+		Nick:   m.Nick,
+		Text:   m.Text,
+		Kind:   kind,
+		Seq:    m.Seq,
+		Node:   m.Node,
+	}
+	if recovered {
+		// Back where it belongs, not at the bottom: a repaired line is older
+		// than everything that followed it.
+		if e.TS == 0 {
+			e.TS = time.Now().Unix()
+		}
+		n.Model.InsertChat(e)
+		n.ev.ChatChanged()
+		return true
+	}
+	n.appendChat(e)
+	return true
+}
+
+// handleChatPull answers a peer asking for lines of ours it never received.
+//
+// Only our own broadcasts are served. A third party's copy of someone else's
+// Seq 7 is hearsay — it would propagate whatever that node happened to hold,
+// including nothing.
+func (n *Node) handleChatPull(body []byte) {
+	var req pb.ChatPull
+	if !n.unmarshal(body, &req) {
+		return
+	}
+	if req.From == "" || len(req.Seqs) == 0 {
+		return
+	}
+	if len(req.Seqs) > pb.MaxChatPull {
+		req.Seqs = req.Seqs[:pb.MaxChatPull]
+	}
+	entries, gone := n.Model.OwnChat(n.cfg.AdvertiseAddr, req.Seqs)
+	reply := pb.ChatBacklog{From: n.cfg.AdvertiseAddr, Unavailable: gone}
+	for _, e := range entries {
+		reply.Messages = append(reply.Messages, pb.ChatMessage{
+			Sender: e.Sender,
+			Nick:   e.Nick,
+			Text:   e.Text,
+			TS:     e.TS,
+			Action: e.Kind == pb.ChatAction,
+			Seq:    e.Seq,
+			Node:   n.Model.NodeID,
+		})
+	}
+	n.Metrics.ChatPullsServed.Add(1)
+	n.send(req.From, pb.KindChatBacklog, reply)
+}
+
+// handleChatBacklog folds a backlog into the log, and records what the author
+// said it can no longer supply.
+func (n *Node) handleChatBacklog(body []byte) {
+	var reply pb.ChatBacklog
+	if !n.unmarshal(body, &reply) {
+		return
+	}
+	for _, m := range reply.Messages {
+		// A repair repairs; it never introduces. Anything in a backlog that
+		// this node is not already waiting for from this peer is dropped: see
+		// chatTracker.Expecting for what accepting it costs.
+		if !n.chatGaps.Expecting(authorOf(m), reply.From, m.Seq) {
+			n.Metrics.ChatUnsolicited.Add(1)
+			n.logActivity("ignored an unasked-for chat line in a backlog from %s",
+				n.Model.NickOf(reply.From))
+			continue
+		}
+		n.acceptChat(m)
+	}
+	if len(reply.Unavailable) > 0 {
+		n.chatGaps.MarkUnavailable(reply.From, reply.Unavailable)
+		n.Metrics.ChatLost.Add(uint64(len(reply.Unavailable)))
+		n.logActivity("%s can no longer supply %d chat line(s) this node missed",
+			n.Model.NickOf(reply.From), len(reply.Unavailable))
 	}
 }
 
@@ -278,6 +399,10 @@ func (n *Node) mergeState(resp pb.StateResponse) {
 	}
 	if len(resp.Chat) > 0 {
 		n.Model.PrependChat(resp.Chat)
+		// A snapshot delivers history in bulk rather than line by line, so the
+		// tracker has to be told what it contains — otherwise this node keeps
+		// asking the author for lines it is now holding.
+		n.chatGaps.Seed(resp.Chat)
 		n.ev.ChatChanged()
 	}
 	if changed {
@@ -328,6 +453,19 @@ func (n *Node) handleHello(body []byte) {
 	}
 	if h.ID != "" {
 		n.Model.SetNodeID(h.ID, h.From)
+	}
+	// The heartbeat says how far this author's own numbering has got, which is
+	// how a quiet peer's lines become recoverable at all: without it the
+	// baseline waits for them to speak, and anything they said before that is
+	// neither delivered nor reported.
+	author := h.ID
+	if author == "" {
+		author = h.From
+	}
+	before := n.chatGaps.outstanding()
+	n.chatGaps.Announce(author, h.From, h.ChatSeq)
+	if grew := n.chatGaps.outstanding() - before; grew > 0 {
+		n.Metrics.ChatGapsFound.Add(uint64(grew))
 	}
 	if n.Model.AddPeer(h.From) {
 		n.announceJoin(h.From, h.Nick)

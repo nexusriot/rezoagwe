@@ -274,3 +274,68 @@ func TestPrependChatTakesTheSurplusASnapshotCarries(t *testing.T) {
 		t.Fatalf("a repeated snapshot grew the log to %d lines", got)
 	}
 }
+
+// A node that genuinely changed address rebinds its id once. Reporting that
+// as a conflict would cry wolf every time a laptop changed network.
+func TestANodeThatMovedAddressRebindsOnce(t *testing.T) {
+	m := newModel(t, "")
+	m.SetNodeID("peer-id", "127.0.0.1:3138")
+	m.SetNodeID("peer-id", "127.0.0.1:4000")
+	m.SetNodeID("peer-id", "127.0.0.1:4000")
+	m.SetNodeID("peer-id", "127.0.0.1:4000")
+
+	if got := m.AddrOfID("peer-id"); got != "127.0.0.1:4000" {
+		t.Fatalf("id resolves to %q, want the new address", got)
+	}
+	c := m.IDConflicts()
+	if len(c) != 1 {
+		t.Fatalf("a single move produced %d conflict records, want 1", len(c))
+	}
+	if c[0].Flips != 1 {
+		t.Fatalf("a single move counted %d flips, want 1", c[0].Flips)
+	}
+}
+
+// Two nodes sharing an id are both live, so each one's heartbeat takes the
+// binding back off the other. The count is what tells that apart from a move.
+func TestTwoAddressesClaimingOneIDKeepFlipping(t *testing.T) {
+	m := newModel(t, "")
+	for i := 0; i < 6; i++ {
+		m.SetNodeID("shared-id", "127.0.0.1:3141")
+		m.SetNodeID("shared-id", "127.0.0.1:3142")
+	}
+
+	c := m.IDConflicts()
+	if len(c) != 1 {
+		t.Fatalf("got %d conflict records, want 1", len(c))
+	}
+	if c[0].Flips < 3 {
+		t.Fatalf("twins flipped only %d times; a move is indistinguishable", c[0].Flips)
+	}
+	if c[0].Addrs[0] == c[0].Addrs[1] {
+		t.Fatal("the conflict names one address twice")
+	}
+}
+
+// The unambiguous case: nothing legitimate makes a peer announce *our* id.
+func TestAPeerClaimingOurOwnIDIsNamed(t *testing.T) {
+	m := newModel(t, "")
+	m.SetNodeID(m.NodeID, "127.0.0.1:3142")
+
+	got := m.Impostors()
+	if len(got) != 1 || got[0] != "127.0.0.1:3142" {
+		t.Fatalf("impostors = %v, want the one peer claiming our id", got)
+	}
+}
+
+// Our own address announcing our own id is just us, seen through a peer's
+// gossip. Reporting it would make every node accuse itself.
+func TestOurOwnAddressIsNotAnImpostor(t *testing.T) {
+	m := newModel(t, "")
+	m.SetNodeID(m.NodeID, m.AdvertiseAddr)
+	m.SetNodeID(m.NodeID, m.NodeAddr)
+
+	if got := m.Impostors(); len(got) != 0 {
+		t.Fatalf("the node accused itself: %v", got)
+	}
+}

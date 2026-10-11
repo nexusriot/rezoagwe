@@ -29,6 +29,8 @@ const Kind = Object.freeze({
   DIRECT_MESSAGE: 10,
   FINGERPRINT: 11,
   FINGERPRINT_REPLY: 12,
+  CHAT_PULL: 13,
+  CHAT_BACKLOG: 14,
   BOOTSTRAP_REGISTER: 20,
   BOOTSTRAP_DISCOVER: 21,
   BOOTSTRAP_ROSTER: 22,
@@ -153,7 +155,9 @@ function encodeChatMessage(m) {
     ts: m.ts,
     action: !!m.action,
     to: m.to || '',
-  }, ['action', 'to']);
+    seq: m.seq || 0,
+    node: m.node || '',
+  }, ['action', 'to', 'seq', 'node']);
 }
 
 function decodeChatMessage(o) {
@@ -165,6 +169,40 @@ function decodeChatMessage(o) {
     ts: num(o.ts),
     action: o.action === true,
     to: str(o.to),
+    seq: num(o.seq),
+    node: str(o.node),
+  };
+}
+
+/** Asks an author to re-send its own broadcasts by sequence number. */
+function encodeChatPull(p) {
+  return { from: p.from, seqs: (p.seqs || []).map((s) => Number(s)) };
+}
+
+function decodeChatPull(o) {
+  if (!o || typeof o !== 'object') throw new TypeError('bad chat pull');
+  return { from: str(o.from), seqs: (Array.isArray(o.seqs) ? o.seqs : []).map(num) };
+}
+
+/** Answers a chat pull. */
+function encodeChatBacklog(b) {
+  // Empty collections become null so withOmitEmpty drops them, which is what
+  // Go's omitempty does. An answer of "nothing to send" has to be the same
+  // bytes from every port, or a byte-for-byte comparison of two encoders
+  // reports a difference that is not one.
+  return withOmitEmpty({
+    from: b.from,
+    messages: (b.messages || []).length ? b.messages.map(encodeChatMessage) : null,
+    unavailable: (b.unavailable || []).length ? b.unavailable.map((x) => Number(x)) : null,
+  }, ['messages', 'unavailable']);
+}
+
+function decodeChatBacklog(o) {
+  if (!o || typeof o !== 'object') throw new TypeError('bad chat backlog');
+  return {
+    from: str(o.from),
+    messages: (Array.isArray(o.messages) ? o.messages : []).map(decodeChatMessage),
+    unavailable: (Array.isArray(o.unavailable) ? o.unavailable : []).map(num),
   };
 }
 
@@ -176,13 +214,15 @@ function encodeChatEntry(e) {
     text: e.text || '',
     kind: e.kind || '',
     to: e.to || '',
-  }, ['sender', 'nick', 'kind', 'to']);
+    seq: e.seq || 0,
+    node: e.node || '',
+  }, ['sender', 'nick', 'kind', 'to', 'seq', 'node']);
 }
 
 function decodeChatEntry(o) {
   // Wire v1 stored chat as pre-rendered strings; read those as system lines
   // rather than failing to parse the whole state file.
-  if (typeof o === 'string') return { ts: 0, sender: '', nick: '', text: stripMarkup(o), kind: ChatKind.SYSTEM, to: '' };
+  if (typeof o === 'string') return { ts: 0, sender: '', nick: '', text: stripMarkup(o), kind: ChatKind.SYSTEM, to: '', seq: 0, node: '' };
   if (!o || typeof o !== 'object') throw new TypeError('bad chat entry');
   return {
     ts: num(o.ts),
@@ -191,6 +231,8 @@ function decodeChatEntry(o) {
     text: str(o.text),
     kind: str(o.kind),
     to: str(o.to),
+    seq: num(o.seq),
+    node: str(o.node),
   };
 }
 
@@ -247,11 +289,12 @@ function decodePeerGossip(o) {
 }
 
 function encodeHello(h) {
-  return withOmitEmpty({ from: h.from, nick: h.nick || '', id: h.id || '' }, ['nick', 'id']);
+  return withOmitEmpty({ from: h.from, nick: h.nick || '', id: h.id || '', chat_seq: h.chatSeq || 0 },
+    ['nick', 'id', 'chat_seq']);
 }
 
 function decodeHello(o) {
-  return { from: str(o && o.from), nick: str(o && o.nick), id: str(o && o.id) };
+  return { from: str(o && o.from), nick: str(o && o.nick), id: str(o && o.id), chatSeq: num(o && o.chat_seq) };
 }
 
 function encodeGoodbye(g) {
@@ -263,16 +306,27 @@ function decodeGoodbye(o) {
 }
 
 function encodeKeyVersion(kv) {
+  // vhash is omitted when empty, which keeps it off the anti-entropy digests
+  // that share this shape: they compare versions and never set one, so adding
+  // 64 characters per entry there would shrink what fits in a datagram for no
+  // gain. The consistency check sets it, and needs it: without it two replicas
+  // holding different values at one version read as agreement.
   return withOmitEmpty({
     key: kv.key,
     version: { counter: kv.version.counter, node: kv.version.node },
     deleted: !!kv.deleted,
-  }, ['deleted']);
+    vhash: kv.vhash || '',
+  }, ['deleted', 'vhash']);
 }
 
 function decodeKeyVersion(o) {
   if (!o || typeof o.key !== 'string') throw new TypeError('bad key version');
-  return { key: o.key, version: decodeVersion(o.version), deleted: o.deleted === true };
+  return {
+    key: o.key,
+    version: decodeVersion(o.version),
+    deleted: o.deleted === true,
+    vhash: typeof o.vhash === 'string' ? o.vhash : '',
+  };
 }
 
 function encodeDigest(d) {
@@ -325,6 +379,9 @@ const FRAME_RESERVE = 64 << 10;
  * protocol rather than a tuning knob.
  */
 const MAX_REPLICABLE_VALUE_BYTES = MAX_FRAME_BYTES - FRAME_RESERVE;
+
+/** Bounds how many sequence numbers one chat pull may name. */
+const MAX_CHAT_PULL = 64;
 
 /**
  * What each code unit below 0x80 costs inside a JSON string, derived from the
@@ -481,8 +538,15 @@ module.exports = {
   decodeKVUpdate,
   encodeKVBatch,
   decodeKVBatch,
+  encodeKeyVersion,
+  decodeKeyVersion,
   encodeChatMessage,
   decodeChatMessage,
+  encodeChatPull,
+  decodeChatPull,
+  encodeChatBacklog,
+  decodeChatBacklog,
+  MAX_CHAT_PULL,
   encodeChatEntry,
   decodeChatEntry,
   encodeStateRequest,

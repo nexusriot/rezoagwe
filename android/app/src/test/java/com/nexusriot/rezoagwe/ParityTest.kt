@@ -180,8 +180,8 @@ class ParityTest {
 
         val zero = "0".repeat(64)
         val want = mapOf(
-            7 to "a2026aaa5ddb78cb47d1db8e5973b787420dafb7fc1ad30cca5944a5495f9898",
-            13 to "5afa98b8cab4abc9294acac825fad1b3f02d6125ec2f5b0def0456acb56e3abc",
+            7 to "2b28e2ab4fe49de1ac3292835d3f89a2d896a3349a7cba255bfb32eefce76ffd",
+            13 to "80c5334e9dffd54e9791a5080260534d255246b82b94077e9537e2ef01c05fd3",
         )
 
         val f = kv.fingerprint()

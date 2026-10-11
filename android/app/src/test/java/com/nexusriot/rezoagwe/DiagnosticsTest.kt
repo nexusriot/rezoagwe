@@ -10,6 +10,7 @@ import com.nexusriot.rezoagwe.core.Severity
 import com.nexusriot.rezoagwe.core.StoreDiagnostics
 import com.nexusriot.rezoagwe.core.TopologyBuilder
 import com.nexusriot.rezoagwe.core.asReport
+import com.nexusriot.rezoagwe.core.IdConflict
 import com.nexusriot.rezoagwe.core.healthChecks
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -317,6 +318,96 @@ class DiagnosticsTest {
         assertTrue(
             "stale rejections alone made the node unhealthy: $checks",
             checks.none { it.severity == Severity.ERROR || it.severity == Severity.WARN },
+        )
+    }
+
+    /**
+     * Both guards refuse the frame, so nothing is broken — but neither has a
+     * legitimate cause, and these are exactly the frames that used to raise an
+     * author's sequence out of reach and silence them for good.
+     */
+    @Test
+    fun malformedChatRepairIsReported() {
+        val d = healthy().copy(
+            metrics = MetricsSnapshot(chatUnsolicited = 3, chatSelfAttributed = 1),
+        )
+        val found = healthChecks(d, now).firstOrNull { it.title.contains("malformed repair") }
+        assertNotNull("no check named the refused frames", found)
+        assertEquals(Severity.WARN, found!!.severity)
+        assertTrue(found.title.contains("4"))
+        assertTrue(found.detail.contains("nobody asked for"))
+        assertTrue(found.detail.contains("claiming to be"))
+    }
+
+    @Test
+    fun aCleanClusterReportsNoMalformedRepair() {
+        assertTrue(healthChecks(healthy(), now).none { it.title.contains("malformed repair") })
+    }
+
+    /**
+     * Two nodes sharing an identity is the one divergence replication cannot
+     * repair, so it has to be said out loud. Measured on a live cluster: the
+     * two stayed split on a shared key for as long as they ran, and every tool
+     * reported the node healthy.
+     */
+    @Test
+    fun `a peer using this node's identity is an error that names it`() {
+        val d = healthy().copy(
+            nodeId = "00000000-dead-beef",
+            impostors = listOf("192.168.18.79:3142"),
+        )
+        val check = healthChecks(d, now).first { it.title.contains("using this node's identity") }
+        assertEquals(Severity.ERROR, check.severity)
+        assertTrue(check.title.contains("192.168.18.79:3142"))
+        assertTrue(check.detail.contains("state file"))
+    }
+
+    @Test
+    fun `a single address change is not reported as a shared identity`() {
+        val d = healthy().copy(
+            idConflicts = listOf(IdConflict("peer-id", listOf("a:1", "b:1"), flips = 1, at = 0)),
+        )
+        assertTrue(
+            "a node changing address was reported as a conflict",
+            healthChecks(d, now).none { it.title.contains("is claimed by") },
+        )
+    }
+
+    @Test
+    fun `one id claimed by two live addresses is an error naming both`() {
+        val d = healthy().copy(
+            idConflicts = listOf(
+                IdConflict(
+                    "00000000-dead-beef",
+                    listOf("192.168.18.79:3141", "192.168.18.79:3142"),
+                    flips = 12,
+                    at = 0,
+                ),
+            ),
+        )
+        val check = healthChecks(d, now).first { it.title.contains("is claimed by") }
+        assertEquals(Severity.ERROR, check.severity)
+        assertTrue(check.title.contains("3141"))
+        assertTrue(check.title.contains("3142"))
+    }
+
+    /**
+     * Tombstone GC is the one setting that can silently undo a delete: a node
+     * away longer than the age comes back still holding the value and pushes
+     * it back (DESIGN.md 5.5). Demonstrated on a live pair — the delete was
+     * undone on both nodes and the consistency check reported them converged.
+     *
+     * This port exposes the age as a field in Settings, so recommending it
+     * without saying what bounds it is telling a user to lose deletes. The
+     * caveat was present in the Go port and missing from both GUI ports.
+     */
+    @Test
+    fun `the tombstone advice says what bounds the GC age, not only the benefit`() {
+        val d = healthy().let { it.copy(store = it.store.copy(tombstones = 7)) }
+        val check = healthChecks(d, now).first { it.title.contains("tombstone(s) kept forever") }
+        assertTrue(
+            "the advice does not say what the age must exceed: ${check.detail}",
+            check.detail.contains("longest"),
         )
     }
 }

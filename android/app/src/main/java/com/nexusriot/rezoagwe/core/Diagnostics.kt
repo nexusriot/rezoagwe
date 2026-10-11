@@ -10,6 +10,29 @@ enum class Severity { OK, INFO, WARN, ERROR }
  */
 data class HealthCheck(val severity: Severity, val title: String, val detail: String)
 
+/**
+ * How often one node id must change hands before it is reported. A node that
+ * genuinely moved address rebinds once and stays; two nodes sharing an
+ * identity rebind on every heartbeat either one sends.
+ */
+const val ID_CONFLICT_FLIPS = 3L
+
+/** What this node has seen claim one node id. */
+data class IdBinding(
+    val addr: String,
+    val other: String = "",
+    val flips: Long = 0,
+    val at: Long = 0,
+)
+
+/** One node id claimed by two different addresses. */
+data class IdConflict(
+    val id: String,
+    val addrs: List<String>,
+    val flips: Long,
+    val at: Long,
+)
+
 /** Everything known about one peer, or about an address that talks to us without being one. */
 data class PeerDiagnostics(
     val addr: String,
@@ -71,6 +94,13 @@ data class NodeDiagnostics(
     val peers: List<PeerDiagnostics> = emptyList(),
     /** Addresses that sent us packets without being peers — a NAT or an advertise-host mismatch. */
     val strangers: List<PeerDiagnostics> = emptyList(),
+    /** Each author's chat delivery record. Chat is the one payload with no
+     *  digest behind it, so a missing line leaves no trace in the store. */
+    val chatGaps: List<ChatGapStat> = emptyList(),
+    /** Node ids seen claimed by more than one address. */
+    val idConflicts: List<IdConflict> = emptyList(),
+    /** Peer addresses seen claiming this node's own id. */
+    val impostors: List<String> = emptyList(),
     val store: StoreDiagnostics = StoreDiagnostics(),
     val metrics: MetricsSnapshot = MetricsSnapshot(),
     val topology: Topology = Topology(),
@@ -106,6 +136,31 @@ fun healthChecks(d: NodeDiagnostics, nowMs: Long): List<HealthCheck> {
         )
     }
 
+    for (peerAddr in d.impostors) {
+        checks += HealthCheck(
+            Severity.ERROR,
+            "$peerAddr is using this node's identity",
+            "That peer announces node id ${d.nodeId}, which is this node's. A node generates its " +
+                "id once and keeps it, so the two are running from copies of one state file. Every " +
+                "version both write is stamped with the same id, so their writes to a shared key " +
+                "compare equal, neither replica accepts the other, and the values stay different " +
+                "for good. Stop one and delete its state file so it starts with a fresh identity.",
+        )
+    }
+
+    for (c in d.idConflicts) {
+        // One rebinding is what a node changing address looks like.
+        if (c.flips < ID_CONFLICT_FLIPS) continue
+        checks += HealthCheck(
+            Severity.ERROR,
+            "node id ${c.id.take(8)} is claimed by ${c.addrs[0]} and ${c.addrs[1]}",
+            "The claim has moved between those addresses ${c.flips} times. A node that changed " +
+                "address would rebind once; repeated rebinding means both are live and sharing one " +
+                "identity, so their writes compare equal and any key they both set stays split " +
+                "permanently. Stop one and delete its state file.",
+        )
+    }
+
     if (m.skewDrops > 0) {
         checks += HealthCheck(
             Severity.ERROR,
@@ -122,6 +177,51 @@ fun healthChecks(d: NodeDiagnostics, nowMs: Long): List<HealthCheck> {
             "Authenticated frames whose body did not parse. Usually a peer running an older or newer " +
                 "protocol version.",
         )
+    }
+
+    if (m.chatUnsolicited > 0 || m.chatSelfAttributed > 0) {
+        // Both are refusals, so nothing is broken here — but neither has a
+        // legitimate cause. A backlog only ever answers a request this node
+        // made, and no peer ever echoes this node its own lines. Left
+        // unchecked these are exactly the frames that used to raise an
+        // author's sequence out of reach and silence them here for good.
+        checks += HealthCheck(
+            Severity.WARN,
+            "${m.chatUnsolicited + m.chatSelfAttributed} chat frame(s) refused as malformed repair",
+            "${m.chatUnsolicited} backlog line(s) nobody asked for and ${m.chatSelfAttributed} " +
+                "line(s) claiming to be written by this node. Both were dropped, and neither has " +
+                "a legitimate cause: a backlog only answers a request this node made, and no peer " +
+                "echoes a node its own lines. Some peer is running something that does not match " +
+                "the protocol.",
+        )
+    }
+
+    if (d.chatGaps.isNotEmpty()) {
+        // Chat is the one payload with no digest behind it, so a line that
+        // never arrived leaves nothing in the store to compare. Before the
+        // sequence existed this was not a quiet failure, it was an invisible
+        // one: the author's log said sent, every receiver simply never had it,
+        // and no counter moved at either end.
+        val lost = d.chatGaps.sumOf { it.lost }
+        val outstanding = d.chatGaps.sumOf { it.outstanding.toLong() }
+        val worst = d.chatGaps.firstOrNull { it.lost > 0 }?.let { g -> g.nick.ifEmpty { g.addr } }
+        when {
+            lost > 0 -> checks += HealthCheck(
+                Severity.WARN,
+                "$lost chat line(s) lost",
+                "These will not arrive: the author no longer holds them, or never answered a " +
+                    "request for them. Unlike a key, a chat line has no digest to repair it from " +
+                    "a third party, only its author can re-send it, and only while it is still " +
+                    "in that node's ring." +
+                    (if (worst != null) " The earliest were from $worst." else ""),
+            )
+            outstanding > 0 -> checks += HealthCheck(
+                Severity.INFO,
+                "$outstanding chat line(s) not yet arrived",
+                "A gap in an author's sequence. Most are a reordering that closes on its own; " +
+                    "the rest are asked for on the next gossip tick.",
+            )
+        }
     }
 
     if (m.kvRefused > 0) {
@@ -297,8 +397,10 @@ fun healthChecks(d: NodeDiagnostics, nowMs: Long): List<HealthCheck> {
         checks += HealthCheck(
             Severity.INFO,
             "${d.store.tombstones} tombstone(s) kept forever",
-            "Deletes replicate as tombstones and are never reclaimed while the GC age is 0. Set one in " +
-                "Settings if deletes are frequent.",
+            "Deletes replicate as tombstones and are never reclaimed while the GC age is 0. Set one " +
+                "in Settings if deletes are frequent — it has to exceed the longest outage you " +
+                "expect a node to come back from. A node that was away longer still holds the " +
+                "value, and pushes it back once the tombstone is gone, silently undoing the delete.",
         )
     }
 
@@ -342,6 +444,7 @@ fun NodeDiagnostics.asReport(nowMs: Long): String = buildString {
     appendLine("traffic         ${metrics.packetsSent} sent / ${metrics.packetsReceived} received, ${metrics.bytesSent}B / ${metrics.bytesReceived}B")
     appendLine("drops           auth ${metrics.authFailures}, replay ${metrics.replayDrops}, skew ${metrics.skewDrops}, malformed ${metrics.malformedDrops}")
     appendLine("replication     ${metrics.kvApplied} applied, ${metrics.kvRejectedStale} stale, ${metrics.kvRefused} refused by limits")
+    appendLine("chat delivery   ${metrics.chatGapsFound} gaps, ${metrics.chatRecovered} recovered, ${metrics.chatLost} lost, ${metrics.chatDuplicates} duplicates")
     appendLine("anti-entropy    ${metrics.aeRounds} rounds, ${metrics.aePushed} pushed, ${metrics.aePulled} pulled")
     appendLine()
     appendLine("peers (${peers.size})")

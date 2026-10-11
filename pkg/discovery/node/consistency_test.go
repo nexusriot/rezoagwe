@@ -303,3 +303,52 @@ func TestAConvergedReportNamesNothing(t *testing.T) {
 		t.Fatalf("an agreeing peer was given differences: %+v", report.Peers[0].Differences)
 	}
 }
+
+// The divergence the check used to call convergence.
+//
+// Two nodes started from copies of one state file share a node id, so their
+// writes to a shared key carry the identical version. Neither is newer, so
+// neither replica ever accepts the other and anti-entropy cannot repair it —
+// and the report said "converged", because the fingerprint folded the version
+// and not the value. Reproduced on a live six-node cluster before it was
+// fixed: 45 seconds of anti-entropy, both sides still split, every peer
+// reported as agreeing.
+func TestConsistencyFindsTwoValuesAtOneVersion(t *testing.T) {
+	net := transport.NewMemNet(1)
+	a, b := newPairedNodes(t, net)
+
+	for i := 0; i < 5; i++ {
+		u, _ := a.Set(fmt.Sprintf("k%02d", i), "v", 0)
+		b.Model.Store.Apply(u)
+	}
+
+	// One key written by two nodes under one identity.
+	shared := pb.Version{Counter: 100, Node: "00000000-dead-beef"}
+	a.Model.Store.Apply(pb.KVUpdate{Action: pb.KVSet, Key: "race", Value: "written-by-A", Version: shared})
+	b.Model.Store.Apply(pb.KVUpdate{Action: pb.KVSet, Key: "race", Value: "written-by-B", Version: shared})
+
+	report := a.CheckConsistency()
+	if report.Converged {
+		t.Fatalf("a permanently split key reported as converged: %+v", report)
+	}
+	if len(report.Peers) != 1 || !report.Peers[0].Reachable {
+		t.Fatalf("peer entry = %+v", report.Peers)
+	}
+
+	var found *KeyDifference
+	for i, d := range report.Peers[0].Differences {
+		if d.Key == "race" {
+			found = &report.Peers[0].Differences[i]
+		}
+	}
+	if found == nil {
+		t.Fatalf("the diverging key was not named: %+v", report.Peers[0])
+	}
+	if !found.SameVersion {
+		t.Error("the difference was not marked as one replication cannot repair")
+	}
+	if found.Local != found.Remote {
+		t.Errorf("versions reported as %s and %s, want the identical version on both sides",
+			found.Local, found.Remote)
+	}
+}

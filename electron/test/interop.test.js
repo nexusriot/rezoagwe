@@ -170,6 +170,21 @@ test('the Electron client joins a real Go cluster and replicates both ways', { s
     return text.includes('hello from the desktop client');
   });
 
+  // 6b. …and the sequence it carries survives the hop. A port that dropped
+  // the field would still deliver the line, so "it arrived" proves nothing on
+  // its own: the evidence is that Go counted no gap and no duplicate, which it
+  // could only do by reading this node's seq and node id.
+  const chatMetrics = (await http('GET', '/metrics')).text;
+  const chatCounter = (name) => {
+    const m = new RegExp(`^${name} (\\d+)$`, 'm').exec(chatMetrics);
+    assert.ok(m, `${name} is not exposed`);
+    return Number(m[1]);
+  };
+  assert.equal(chatCounter('rezoagwe_chat_gaps_total'), 0,
+    'Go claims a gap in a conversation that lost nothing');
+  assert.equal(chatCounter('rezoagwe_chat_duplicates_total'), 0,
+    'Go counted a duplicate with nothing re-sending anything');
+
   // 7. Anti-entropy: a write made while this node is deaf still converges.
   const realHandle = engine.handlePacket.bind(engine);
   engine.handlePacket = () => {};
