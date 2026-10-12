@@ -52,10 +52,10 @@ type Model struct {
 	// normalized is the peer set keyed by NormalizeAddr, so a lookup by the
 	// address a datagram *came from* is O(1). Peers are stored under the
 	// address they advertise, which is rarely the same string.
-	normalized     sync.Map // NormalizeAddr(address) -> address
-	ids            sync.Map // node id -> idBinding (attributes a version to a peer)
+	normalized sync.Map // NormalizeAddr(address) -> address
+	ids        sync.Map // node id -> idBinding (attributes a version to a peer)
 	// impostors is the set of addresses seen announcing this node's own id.
-	impostors sync.Map // address -> bool
+	impostors      sync.Map // address -> bool
 	BootstrapAddrs []string
 	NodeAddr       string
 	AdvertiseAddr  string
@@ -572,12 +572,26 @@ func (bn *Model) NextChatSeq() uint64 {
 
 // OwnChat returns this node's own broadcasts with the named sequence numbers,
 // and the ones it no longer holds because the ring has moved past them.
-func (bn *Model) OwnChat(self string, seqs []uint64) (found []pb.ChatEntry, gone []uint64) {
+//
+// Ownership is decided by node id, not address. The id is what the sequence
+// numbering belongs to and it outlives a restart; the address does not. A node
+// whose address changes under it — a phone losing Wi-Fi falls back to
+// advertising loopback and comes back on a different address — would otherwise
+// stop recognising every line it had written, and answer a pull for its own
+// seq 7 with "gone for good" while that line sat on its own screen. The asker
+// then counts it lost, which is the one outcome this whole mechanism exists to
+// avoid. Address is kept as a fallback for entries written before the node id
+// was carried in a chat entry.
+func (bn *Model) OwnChat(self, selfID string, seqs []uint64) (found []pb.ChatEntry, gone []uint64) {
 	bn.chatMu.Lock()
 	defer bn.chatMu.Unlock()
 	bySeq := make(map[uint64]pb.ChatEntry, len(bn.chatLog))
 	for _, e := range bn.chatLog {
-		if e.Seq != 0 && e.Sender == self {
+		if e.Seq == 0 {
+			continue
+		}
+		mine := e.Node == selfID || (e.Node == "" && e.Sender == self)
+		if mine {
 			bySeq[e.Seq] = e
 		}
 	}

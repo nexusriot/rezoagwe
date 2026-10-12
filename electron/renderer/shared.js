@@ -63,6 +63,37 @@
     return `${sec}s`;
   }
 
+  /** How much of a key or value a one-line row shows before it is capped. */
+  const ROW_TEXT_MAX = 120;
+
+  function escapeControl(text) {
+    return String(text).replace(/\n/g, ' ⏎ ').replace(/\r/g, '').replace(/\t/g, ' ');
+  }
+
+  function cap(text) {
+    return text.length <= ROW_TEXT_MAX ? text : `${text.slice(0, ROW_TEXT_MAX - 3)}...`;
+  }
+
+  /**
+   * Renders a store key for a one-line row.
+   *
+   * A key is arbitrary UTF-8: a newline or a tab in one is legal, and left
+   * unescaped CSS collapses both to a single space — so two genuinely
+   * different keys draw identically, next to a delete button. The value on the
+   * row has always been escaped this way; the key was the one field that was
+   * not. Capped too, since nothing bounds a key's length.
+   */
+  function displayKey(key) {
+    if (!key) return '(empty key)';
+    return cap(escapeControl(key));
+  }
+
+  /** The same treatment for a value preview, so a row renders consistently. */
+  function displayValue(value) {
+    if (!value) return '(empty)';
+    return cap(escapeControl(value));
+  }
+
   function formatBytes(bytes) {
     const b = Number(bytes) || 0;
     if (b < 1024) return `${b}B`;
@@ -123,6 +154,8 @@
     TWO_PANE_MIN_WIDTH,
     SHORT_HEIGHT,
     formatUptime,
+    displayKey,
+    displayValue,
     formatBytes,
     formatTime,
     colorFor,

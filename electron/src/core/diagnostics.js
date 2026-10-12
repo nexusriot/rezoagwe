@@ -24,8 +24,20 @@ function healthChecks(d, nowMs) {
   const add = (severity, title, detail) => checks.push({ severity, title, detail });
 
   if (!d.running) {
-    add(Severity.INFO, 'Node stopped',
-      'Nothing is gossiping. Start the node from the Peers tab or the header.');
+    // A node that failed to *start* is not the same as one nobody started, and
+    // the difference is the whole answer. Autostart runs before the window has
+    // loaded, so the toast for a failed bind reaches nobody, and a toast is
+    // gone in six seconds anyway — while "STOPPED" stays on screen for as long
+    // as the app is open. The reason has to live somewhere that lasts.
+    if (d.lastError) {
+      add(Severity.ERROR, 'The node could not start',
+        `${d.lastError}. A port already in use is the usual cause: another copy of this app, or a `
+        + `rezoagwe-discovery on the same machine. Change the node port in Settings, or stop whatever `
+        + 'holds it, and start the node again.');
+    } else {
+      add(Severity.INFO, 'Node stopped',
+        'Nothing is gossiping. Start the node from the Peers tab or the header.');
+    }
   }
 
   if (d.loadError) {
@@ -145,6 +157,18 @@ function healthChecks(d, nowMs) {
     }
     if (last) detail += ` Last: ${last.cause} to ${last.addr}${last.message ? ` (${last.message})` : ''}.`;
     add(Severity.WARN, `${m.sendErrors} send error(s)`, detail);
+  }
+
+  // Counted since the beginning and explained by nothing. The stream is the only
+  // path for a value too big for a datagram and for a whole-store sync on join,
+  // so a node whose streams fail is not slightly degraded: an oversized entry
+  // cannot reach that peer by any path.
+  if (m.streamErrors > 0) {
+    add(Severity.WARN, `${m.streamErrors} stream (TCP) error(s)`,
+      'A stream to a peer or a seed failed. Datagrams and streams share a port number but not '
+      + 'a protocol, so a firewall that passes UDP and blocks TCP looks exactly like this. Until '
+      + 'it works, a joiner falls back to the bounded datagram state sync, and any entry too '
+      + 'large for one datagram cannot replicate at all.');
   }
 
   if (d.running && !d.streamListener) {

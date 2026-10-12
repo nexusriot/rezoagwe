@@ -145,7 +145,9 @@ fun DiagnosticsScreen(node: NodeEngine, rendezvous: BootstrapServer) {
 
     val diagnostics = remember(generation) { node.diagnostics() }
     val device = remember(generation) { deviceReport(context) }
-    val checks = remember(generation) { healthChecks(diagnostics, now) }
+    // The device report is a health input, not just something to display: when
+    // the phone has no network, every protocol-level check below it is a guess.
+    val checks = remember(generation) { healthChecks(diagnostics, now, device) }
 
     Column(
         modifier = Modifier

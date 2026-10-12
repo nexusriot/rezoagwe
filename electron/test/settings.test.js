@@ -11,6 +11,7 @@ const {
   nodeNeedsRestart, bootstrapNeedsRestart,
 } = require('../src/core/settings');
 const { Persister } = require('../src/core/persistence');
+const { Runtime } = require('../src/core/runtime');
 
 const tmpdir = () => fs.mkdtempSync(path.join(os.tmpdir(), 'rezoagwe-settings-'));
 
@@ -141,5 +142,31 @@ test('a write failure is reported rather than thrown at a mutation site', async 
   await persister.flush();
   assert.equal(errors.length, 1, 'the write failed and said so');
   assert.ok(['EEXIST', 'ENOTDIR'].includes(errors[0].code), `unexpected failure: ${errors[0].code}`);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// Autostart runs before the window has finished loading, so the toast `guard()`
+// emits for a failed bind goes to a renderer that does not exist yet and is
+// dropped. The snapshot the renderer pulls once it *is* ready has to carry the
+// error across that gap, or the app opens on "STOPPED" with no reason anywhere
+// — which is what a user hits the first time the configured port is already
+// taken, and the one case they are least able to guess.
+test('the snapshot carries a start-up failure the renderer was not there to hear', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rezoagwe-runtime-'));
+  const runtime = new Runtime(dir, { listen: async () => { throw new Error('bind EADDRINUSE 0.0.0.0:3137'); } });
+
+  assert.equal(runtime.snapshot().lastError, '', 'nothing has failed yet');
+
+  const result = await runtime.startNode();
+  assert.equal(result.ok, false);
+  assert.match(runtime.snapshot().lastError, /EADDRINUSE/);
+
+  // And it clears once something works, so a stale error cannot haunt the UI.
+  runtime.opts.listen = async () => ({
+    on() {}, send() {}, close() {}, address: () => ({ port: 3137 }),
+  });
+  await runtime.guard(async () => {});
+  assert.equal(runtime.snapshot().lastError, '');
+
   fs.rmSync(dir, { recursive: true, force: true });
 });

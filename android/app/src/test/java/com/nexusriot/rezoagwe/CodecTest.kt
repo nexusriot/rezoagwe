@@ -9,6 +9,7 @@ import com.nexusriot.rezoagwe.proto.KVUpdate
 import com.nexusriot.rezoagwe.proto.Kind
 import com.nexusriot.rezoagwe.proto.WireJson
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
@@ -86,6 +87,33 @@ class CodecTest {
             "02e49ce58c95bd03572f543a1a2b99a9bd3d9a5e65e2b9196ea4865898efb43c",
             Codec.deriveKey("s3cret", "prod").toHex(),
         )
+    }
+
+    /**
+     * The fingerprint is the one thing two devices that cannot talk are told to
+     * compare, and the Go node, this app and the desktop client all print it.
+     * It therefore has to be the same function everywhere. It was not: this port
+     * printed the first four bytes of the framing key while Go printed a digest
+     * of it, so a phone and a Go node holding the *same* key reported a
+     * mismatch — the loudest possible false alarm from a check whose job is to
+     * be believed. These vectors come from Go's `Codec.KeyFingerprint`.
+     */
+    @Test
+    fun keyFingerprintMatchesGo() {
+        assertEquals("a4b7437d", Codec.keyFingerprint("", "rezoagwe"))
+        assertEquals("f3e8452a", Codec.keyFingerprint("s3cret", "prod"))
+        assertEquals("b526a31e", Codec.keyFingerprint("demo", "hwtest"))
+    }
+
+    /**
+     * And it must not be a prefix of the key. The fingerprint goes on screen and
+     * onto the clipboard with *Copy report*; four bytes of the live framing key
+     * is the opposite of what its own documentation promises.
+     */
+    @Test
+    fun keyFingerprintIsNotKeyMaterial() {
+        val keyPrefix = Codec.deriveKey("demo", "hwtest").toHex().take(8)
+        assertNotEquals(keyPrefix, Codec.keyFingerprint("demo", "hwtest"))
     }
 
     /**

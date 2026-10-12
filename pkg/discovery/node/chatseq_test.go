@@ -702,3 +702,46 @@ func TestChatSequenceKeepsTheAuthorsStillTalking(t *testing.T) {
 		t.Fatal("the one author that never stopped talking was evicted")
 	}
 }
+
+// The hardware case this cost a session to find: an author whose address moves
+// while it is cut off.
+//
+// A phone that loses Wi-Fi keeps its node running and falls back to advertising
+// loopback. Anything it says there is stamped with that address. When Wi-Fi
+// comes back it advertises its LAN address again, a peer notices the gap and
+// asks the author for the line — and the author, which decided "mine" by
+// address, answered that its own line was gone for good while that line was on
+// its own screen. Measured on a tablet against a Go node: gaps 2, recovered 0,
+// lost 2. Ownership is the node id, which does not move.
+func TestAnAuthorStillServesLinesItWroteUnderAnotherAddress(t *testing.T) {
+	net := transport.NewMemNet(23)
+	a, b := newPairedNodes(t, net)
+
+	a.SendChat("first")
+	waitForChat(t, b, "first")
+
+	// Off the air, and the address underneath the node changes.
+	net.Partition(a.cfg.AdvertiseAddr, b.cfg.AdvertiseAddr, true)
+	onAir := a.cfg.AdvertiseAddr
+	a.cfg.AdvertiseAddr = "127.0.0.1:3137"
+	a.SendChat("said while the address had moved")
+	a.cfg.AdvertiseAddr = onAir
+	net.Partition(onAir, b.cfg.AdvertiseAddr, false)
+
+	a.SendChat("third")
+	waitForChat(t, b, "third")
+
+	if got := b.Metrics.ChatGapsFound.Load(); got != 1 {
+		t.Fatalf("gaps found = %d, want 1", got)
+	}
+
+	b.pullChatGaps()
+	waitForChat(t, b, "said while the address had moved")
+
+	if got := b.Metrics.ChatLost.Load(); got != 0 {
+		t.Fatalf("lost = %d, want 0 — the author still held the line", got)
+	}
+	if got := b.Metrics.ChatRecovered.Load(); got != 1 {
+		t.Fatalf("recovered = %d, want 1", got)
+	}
+}

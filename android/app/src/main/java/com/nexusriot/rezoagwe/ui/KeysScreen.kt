@@ -239,7 +239,7 @@ private fun KeyRow(entry: Entry, onEdit: () -> Unit, onHistory: () -> Unit, onDe
     ) {
         Column(modifier = Modifier.weight(1f)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(entry.key, fontWeight = FontWeight.Bold)
+                Text(displayKey(entry.key), fontWeight = FontWeight.Bold)
                 if (entry.expiresAt > 0) {
                     val remaining = (entry.expiresAt - System.currentTimeMillis() / 1000).coerceAtLeast(0)
                     Text(
@@ -250,7 +250,7 @@ private fun KeyRow(entry: Entry, onEdit: () -> Unit, onHistory: () -> Unit, onDe
                 }
             }
             Text(
-                text = entry.value.replace("\n", " ⏎ ").take(120).ifEmpty { "(empty)" },
+                text = displayValue(entry.value),
                 style = MaterialTheme.typography.bodySmall,
                 fontFamily = FontFamily.Monospace,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,

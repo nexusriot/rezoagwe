@@ -150,6 +150,23 @@ whole job is to repair divergence, was the thing generating it, and the
 cluster stayed split for as long as the key lived with nothing but a
 send-error counter to say so.
 
+**The key fingerprint** — what every front end prints so two machines that
+cannot talk can tell "the key differs" from "the network drops packets" — is
+
+```
+fingerprint = hex(sha256(key)[0..4])
+```
+
+a hash *of* the framing key, never a prefix of it. Both matter, and they are
+the same requirement seen twice. A prefix would be four bytes of live key
+material on screen and on the clipboard, which is the opposite of what the
+fingerprint is for; and the value has to be identical in all three ports, or
+the one check whose entire job is to be believed tells two correctly
+configured nodes that they disagree. The Android and desktop ports printed
+`key[0..4]` while Go printed the digest, so a phone and a Go node sharing a
+key reported a mismatch — found on hardware, and now pinned to the same fixed
+vectors in all three suites.
+
 ### 3.2 Message kinds
 
 | Kind | Name                 | Purpose                                          |
@@ -228,6 +245,13 @@ stall startup.
   address; a peer with no traffic for 15 s is evicted locally. `Hello` and
   `PeerGossip` carry the sender's nickname *and* node id, which is what lets
   a version be attributed to a name rather than a UUID.
+
+  **Every way of learning a peer announces it**, the bootstrap roster
+  included. Eviction always announces a departure, so a path that adopted a
+  peer in silence produced a `left` for a node nobody had seen join — which
+  reads, in the one log a user actually watches, as a node leaving twice. It
+  shows up when a node drops to zero peers, re-asks its seeds (the only time
+  it re-discovers) and adopts an address bootstrap has not yet aged out.
 * **TTL sweep** turns expired entries into tombstones, keeping each entry's
   existing version (§5.2), and — when `-tombstone-ttl` is set — reclaims
   tombstones older than that.
@@ -286,6 +310,19 @@ own data file and discard the KV store along with the chat.
 These are protocol, not implementation detail: the Go, Kotlin and JavaScript
 stores must agree on every one of them or two replicas silently disagree —
 and disagree quietly, since nothing on the wire reports a divergence.
+
+A key is **arbitrary UTF-8**. A newline, a tab or a control character in one is
+legal, the store never rewrites it, and nothing bounds its length — so every
+surface that draws a key has to escape it, exactly as it already escapes a
+value. All three front ends escaped the value and none escaped the key: on a
+phone a key holding a newline drew across two lines and read as two keys next
+to a delete button, on the desktop CSS collapsed it so two different keys drew
+identically, and in the terminal it went into a one-line list item raw. The same
+gap ran through the activity feed in every port. Two corollaries: a label is
+**not** an identifier — the terminal client read the selected key back out of
+the row it had drawn, which a key ending in the expiry marker resolved wrongly —
+and a length cap counts **runes**, since slicing UTF-8 by byte cuts a character
+in half.
 
 ### 5.1 Last-write-wins
 
@@ -391,6 +428,20 @@ answer carries both the lines it still has and the ones it does not —
 saying so is the point, because it turns "still waiting" into "gone", and a
 receiver that is never told keeps asking forever. An author that does not
 answer at all is given up on after a bounded number of attempts.
+
+**Which lines are "its own" is decided by node id, never by address.** The id
+is what the numbering belongs to, and it outlives both a restart and a change
+of address; the advertised address does not. A phone that loses Wi-Fi keeps
+its node running and falls back to advertising loopback, so every line it
+says there is stamped with that address — and a node matching on the address
+disowns exactly those lines the moment Wi-Fi returns. It then answers the
+pull for its own `Seq 7` with "gone for good" while that line is on its own
+screen, and the asker files it as lost: the one outcome this whole mechanism
+exists to prevent, produced by the mechanism itself. Measured on a tablet
+against a Go node: gaps 2, recovered 0, lost 2. Address remains the fallback
+for entries written before a chat entry carried an id, and only then — an
+entry naming a *different* author is hearsay whatever address it arrived
+under.
 
 A recovered line is inserted at its place in the conversation rather than
 appended. It is by definition older than everything that followed it, and

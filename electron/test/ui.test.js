@@ -428,3 +428,57 @@ test('the tombstone advice says what bounds the GC age, not only the benefit', (
   assert.ok(check, 'the tombstone advice was not produced');
   assert.match(check.detail, /longest/, 'the advice does not say what the age must exceed');
 });
+
+// A node that failed to *start* is not a node nobody started, and the
+// difference is the whole answer. Autostart runs before the window has loaded,
+// so the toast for a failed bind reaches nobody — and a toast is gone in six
+// seconds, while "STOPPED" stays on screen for as long as the app is open. The
+// app opened on "STOPPED" with no reason anywhere, in the case a user is most
+// likely to hit (the port already taken) and least able to guess.
+test('a node that could not start says why, where it lasts', () => {
+  const stopped = baseDiagnostics({ running: false });
+
+  const nobodyStarted = healthChecks(stopped, Date.now());
+  assert.ok(nobodyStarted.some((c) => c.title === 'Node stopped'));
+
+  const failed = healthChecks({ ...stopped, lastError: 'bind EADDRINUSE 0.0.0.0:3137' }, Date.now());
+  const check = failed.find((c) => c.title === 'The node could not start');
+  assert.ok(check, `no check named the failure: ${JSON.stringify(failed.map((c) => c.title))}`);
+  assert.equal(check.severity, Severity.ERROR);
+  assert.match(check.detail, /EADDRINUSE/);
+  assert.ok(!failed.some((c) => c.title === 'Node stopped'), 'two explanations for one state');
+});
+
+// A key is arbitrary UTF-8. CSS collapses a newline and a tab to a single
+// space, so two genuinely different keys drew identically — next to a delete
+// button. The value on the row had always been escaped; the key was the one
+// field that was not.
+test('a key is escaped and capped for a one-line row, like its value', () => {
+  assert.equal(S.displayKey('line1\nline2\ttabbed'), 'line1 ⏎ line2 tabbed');
+  assert.equal(S.displayValue('first\nsecond'), 'first ⏎ second');
+
+  // Two keys that differ only in a control character must not render alike.
+  assert.notEqual(S.displayKey('a\nb'), S.displayKey('a b'));
+
+  assert.equal(S.displayKey(''), '(empty key)');
+  assert.equal(S.displayValue(''), '(empty)');
+
+  // Nothing bounds a key's length, and a long one pushes the row's controls
+  // off screen.
+  assert.equal(S.displayKey('x'.repeat(500)).length, 120);
+  assert.ok(S.displayKey('x'.repeat(500)).endsWith('...'));
+});
+
+// Counted since the beginning and explained by nothing: on a tablet with a
+// wrong key, five stream errors against an unreachable seed raised not one
+// word. The stream is the only path for an oversized value and for a
+// whole-store sync on join.
+test('stream errors are explained, not just counted', () => {
+  const d = baseDiagnostics({ metrics: { ...baseDiagnostics().metrics, streamErrors: 5 } });
+  const check = healthChecks(d, Date.now()).find((c) => c.title.includes('stream (TCP) error'));
+  assert.ok(check, 'stream errors raised nothing');
+  assert.equal(check.severity, Severity.WARN);
+  assert.match(check.detail, /firewall that passes UDP and blocks TCP/);
+
+  assert.ok(!healthChecks(baseDiagnostics(), Date.now()).some((c) => c.title.includes('stream (TCP)')));
+});

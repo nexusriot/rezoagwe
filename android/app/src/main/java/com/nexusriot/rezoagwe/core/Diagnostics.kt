@@ -114,9 +114,38 @@ data class NodeDiagnostics(
  * Pure on purpose: every rule here is a claim about the protocol ("auth failures
  * mean a key mismatch"), and a claim like that is worth a test.
  */
-fun healthChecks(d: NodeDiagnostics, nowMs: Long): List<HealthCheck> {
+fun healthChecks(
+    d: NodeDiagnostics,
+    nowMs: Long,
+    device: DeviceReport? = null,
+): List<HealthCheck> {
     val checks = mutableListOf<HealthCheck>()
     val m = d.metrics
+
+    // The phone's own state comes first, because when it is the cause every
+    // check below it is a guess. `deviceReport` was collected for exactly this
+    // — "the usual causes are not in the protocol at all" — and then read by
+    // nothing: with Wi-Fi off the Device card said `network none` while Health
+    // blamed "a peer address that no longer routes, or Wi-Fi dropping" and sent
+    // the user to check a bootstrap that was fine.
+    val offline = device != null && device.transport == "none"
+    if (offline) {
+        checks += HealthCheck(
+            Severity.ERROR,
+            "This device has no network",
+            "Android reports no active connection, so nothing this node sends can leave the " +
+                "device and no peer can reach it. The send errors and missing peers below follow " +
+                "from that, not from the cluster's configuration. Reconnect to Wi-Fi.",
+        )
+    }
+    if (device != null && device.powerSaveMode) {
+        checks += HealthCheck(
+            Severity.WARN,
+            "Battery saver is on",
+            "Power saving can stretch or freeze the gossip timers while the screen is off, and " +
+                "peers evict this node ${d.evictThresholdMs / 1000}s after its last packet.",
+        )
+    }
 
     if (!d.running) {
         checks += HealthCheck(
@@ -255,6 +284,10 @@ fun healthChecks(d: NodeDiagnostics, nowMs: Long): List<HealthCheck> {
             if (last?.onMainThread == true) Severity.ERROR else Severity.WARN,
             "${m.sendErrors} send error(s)",
             when {
+                offline ->
+                    "This device has no network, so nothing could leave it. Nothing here points at " +
+                        "a peer address or at the cluster's configuration." +
+                        (if (last == null) "" else " Last: $last.")
                 last == null ->
                     "Datagrams could not leave the device — usually a peer address that no longer " +
                         "routes, or Wi-Fi dropping while the node stays up."
@@ -289,6 +322,22 @@ fun healthChecks(d: NodeDiagnostics, nowMs: Long): List<HealthCheck> {
         )
     }
 
+    // Counted since the beginning and explained by nothing: on a tablet with a
+    // wrong key, five stream errors against an unreachable seed raised not one
+    // word. The stream is the only path for a value too big for a datagram and
+    // for a whole-store sync on join, so a node whose streams fail is not
+    // slightly degraded.
+    if (m.streamErrors > 0) {
+        checks += HealthCheck(
+            Severity.WARN,
+            "${m.streamErrors} stream (TCP) error(s)",
+            "A stream to a peer or a seed failed. Datagrams and streams share a port number but " +
+                "not a protocol, so a firewall that passes UDP and blocks TCP looks exactly like " +
+                "this. Until it works, a joiner falls back to the bounded datagram state sync, and " +
+                "any entry too large for one datagram cannot replicate at all.",
+        )
+    }
+
     if (d.running && !d.streamListener) {
         checks += HealthCheck(
             Severity.WARN,
@@ -316,8 +365,15 @@ fun healthChecks(d: NodeDiagnostics, nowMs: Long): List<HealthCheck> {
             HealthCheck(
                 Severity.WARN,
                 "No peers learned from ${d.seeds.size} seed(s)",
-                "The seeds ${d.seeds.joinToString(", ")} answered nothing. Check the bootstrap is running, " +
-                    "that this device is on the same network, and that the cluster name and key match.",
+                if (offline) {
+                    "The seeds ${d.seeds.joinToString(", ")} could not be reached because this device " +
+                        "has no network. There is nothing to check about the bootstrap or the key " +
+                        "until it is back."
+                } else {
+                    "The seeds ${d.seeds.joinToString(", ")} answered nothing. Check the bootstrap is " +
+                        "running, that this device is on the same network, and that the cluster name " +
+                        "and key match."
+                },
             )
         }
     }

@@ -5,6 +5,7 @@ import com.nexusriot.rezoagwe.core.ChatTracker
 import com.nexusriot.rezoagwe.core.MAX_PULL_ATTEMPTS
 import com.nexusriot.rezoagwe.core.MAX_TRACKED_AUTHORS
 import com.nexusriot.rezoagwe.core.MAX_TRACKED_GAPS
+import com.nexusriot.rezoagwe.core.ownsChatEntry
 import com.nexusriot.rezoagwe.proto.ChatBacklog
 import com.nexusriot.rezoagwe.proto.ChatEntry
 import com.nexusriot.rezoagwe.proto.ChatMessage
@@ -374,5 +375,37 @@ class ChatSeqTest {
         // Still followed: its next line continues rather than starting over.
         tr.observe(ChatMessage(sender = "10.0.0.2:3137", node = "busy", seq = (MAX_TRACKED_AUTHORS * 2 + 5).toLong()))
         assertTrue("the one author that never stopped talking was evicted", tr.outstanding() > 0)
+    }
+
+    /**
+     * The hardware case: a phone that loses Wi-Fi keeps its node running and
+     * falls back to advertising loopback, so anything it says there is stamped
+     * with that address. When Wi-Fi comes back it advertises its LAN address
+     * again, a peer notices the gap and asks the author for the line — and the
+     * author, which decided "mine" by address, answered that its own line was
+     * gone for good while that line was on its own screen. Measured on a tablet
+     * against a Go node: gaps 2, recovered 0, lost 2.
+     */
+    @Test
+    fun `a line written under another address is still ours`() {
+        assertTrue(
+            "the node disowned a line it wrote while its address had moved",
+            ownsChatEntry("node-a", "127.0.0.1:3137", "node-a", "192.168.1.5:3137"),
+        )
+    }
+
+    @Test
+    fun `another author's line is never ours, whatever address it carries`() {
+        assertFalse(
+            "served another author's line because the address matched",
+            ownsChatEntry("node-b", "192.168.1.5:3137", "node-a", "192.168.1.5:3137"),
+        )
+    }
+
+    /** Entries written before a chat entry carried an id have only the address. */
+    @Test
+    fun `an entry with no author id falls back to the address`() {
+        assertTrue(ownsChatEntry("", "192.168.1.5:3137", "node-a", "192.168.1.5:3137"))
+        assertFalse(ownsChatEntry("", "192.168.1.9:3137", "node-a", "192.168.1.5:3137"))
     }
 }

@@ -339,3 +339,61 @@ func TestOurOwnAddressIsNotAnImpostor(t *testing.T) {
 		t.Fatalf("the node accused itself: %v", got)
 	}
 }
+
+// A node is the only one that can answer a pull for its own seq 7, and it
+// decides which lines are its own. Deciding that by address meant a node whose
+// address had moved disowned everything it had said before the move: a phone
+// that loses Wi-Fi falls back to advertising loopback, writes a line there, and
+// comes back on its old LAN address — then answers the pull for that very line
+// with "gone for good" while the line is on its own screen. The asker counts it
+// lost, which is the one outcome the whole chat-delivery mechanism exists to
+// prevent. Measured on hardware: gaps 2, recovered 0, lost 2.
+func TestOwnChatFindsLinesWrittenUnderAnotherAddress(t *testing.T) {
+	m := NewModel(Config{NodeAddr: "192.168.1.5:3137"})
+	id := m.NodeID
+
+	m.AppendChat(pb.ChatEntry{Seq: 1, Sender: "192.168.1.5:3137", Node: id, Text: "on wifi"})
+	m.AppendChat(pb.ChatEntry{Seq: 2, Sender: "127.0.0.1:3137", Node: id, Text: "while offline"})
+
+	found, gone := m.OwnChat("192.168.1.5:3137", id, []uint64{1, 2})
+	if len(gone) != 0 {
+		t.Fatalf("disowned own lines %v; the node wrote both", gone)
+	}
+	if len(found) != 2 {
+		t.Fatalf("found %d lines, want 2", len(found))
+	}
+	if found[1].Text != "while offline" {
+		t.Fatalf("seq 2 = %q, want the line written under the other address", found[1].Text)
+	}
+}
+
+// Another node's copy of someone else's seq 7 is hearsay and must never be
+// served, however it is addressed.
+func TestOwnChatRefusesAnotherAuthorsLines(t *testing.T) {
+	m := NewModel(Config{NodeAddr: "192.168.1.5:3137"})
+
+	m.AppendChat(pb.ChatEntry{Seq: 9, Sender: "192.168.1.9:3137", Node: "someone-else", Text: "theirs"})
+	// Same address as this node, but a different id: still not ours.
+	m.AppendChat(pb.ChatEntry{Seq: 10, Sender: "192.168.1.5:3137", Node: "someone-else", Text: "also theirs"})
+
+	found, gone := m.OwnChat("192.168.1.5:3137", m.NodeID, []uint64{9, 10})
+	if len(found) != 0 {
+		t.Fatalf("served another author's lines: %+v", found)
+	}
+	if len(gone) != 2 {
+		t.Fatalf("gone = %v, want both reported unavailable", gone)
+	}
+}
+
+// Entries written before a chat entry carried a node id have only the address
+// to go on, and must still be served.
+func TestOwnChatFallsBackToAddressForEntriesWithoutAnID(t *testing.T) {
+	m := NewModel(Config{NodeAddr: "192.168.1.5:3137"})
+
+	m.AppendChat(pb.ChatEntry{Seq: 3, Sender: "192.168.1.5:3137", Text: "from an older build"})
+
+	found, gone := m.OwnChat("192.168.1.5:3137", m.NodeID, []uint64{3})
+	if len(gone) != 0 || len(found) != 1 {
+		t.Fatalf("found=%+v gone=%v, want the line served on the address fallback", found, gone)
+	}
+}

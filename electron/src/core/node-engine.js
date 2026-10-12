@@ -685,9 +685,17 @@ class NodeEngine extends EventEmitter {
   async handleChatPull(req) {
     if (!req.from || req.seqs.length === 0) return;
     const wanted = req.seqs.slice(0, W.MAX_CHAT_PULL);
+    // Ownership is decided by node id, not address: the id is what the
+    // sequence numbering belongs to and it outlives a restart or a change of
+    // address, while the address does not. Matching on the address meant a node
+    // whose address had moved answered a pull for its own seq 7 with "gone for
+    // good" while that line was still in its log, and the asker counted it
+    // lost. Address stays as a fallback for entries written before a chat entry
+    // carried the id.
     const mine = new Map();
     for (const e of this.chatLog) {
-      if (e.seq && e.sender === this.addr) mine.set(e.seq, e);
+      if (!e.seq) continue;
+      if (e.node === this.nodeId || (!e.node && e.sender === this.addr)) mine.set(e.seq, e);
     }
     const messages = [];
     const unavailable = [];
@@ -1193,8 +1201,8 @@ class NodeEngine extends EventEmitter {
     if (applied) {
       this.metrics.kvApplied++;
       const who = this.writerName(u.version.node);
-      if (u.action === KVAction.DELETE) this.logActivity(`${who} deleted ${u.key} (v${u.version.counter})`);
-      else this.logActivity(`${who} set ${u.key} = ${preview(u.value)} (v${u.version.counter})`);
+      if (u.action === KVAction.DELETE) this.logActivity(`${who} deleted ${preview(u.key)} (v${u.version.counter})`);
+      else this.logActivity(`${who} set ${preview(u.key)} = ${preview(u.value)} (v${u.version.counter})`);
       return true;
     }
     // "Stale" and "refused" are not the same event and must not share a
@@ -1577,11 +1585,23 @@ class NodeEngine extends EventEmitter {
   }
 
   /** Adopts the peers a bootstrap reported. */
+  /**
+   * Adopts the peers a bootstrap reported.
+   *
+   * Learning a peer here is announced like learning one any other way. Eviction
+   * always announces a departure, so a roster entry adopted in silence and
+   * never heard from produced a "left" for a node that had never been seen to
+   * join — which reads as a node leaving twice.
+   */
   async applyRoster(roster) {
     let learned = false;
     for (const p of roster.peers) {
-      if (this.addPeer(p.addr)) learned = true;
+      const isNew = this.addPeer(p.addr);
       if (p.nick) this.setPeerNick(p.addr, p.nick);
+      if (isNew) {
+        learned = true;
+        this.announceJoin(p.addr, this.nickOf(p.addr));
+      }
     }
     if (!learned) return;
     await this.helloAllPeers();
@@ -1857,8 +1877,15 @@ function split2(s) {
   return [trimmed.slice(0, i), trimmed.slice(i + 1).trim()];
 }
 
+/**
+ * Renders a key or a value for a one-line activity entry.
+ *
+ * A key and a value are both arbitrary UTF-8, and a newline in either one
+ * breaks the line in two in every pane that shows it, so one entry reads as
+ * two. This was only ever applied to the value, and only the length half of it.
+ */
 function preview(value) {
-  const v = value || '';
+  const v = String(value || '').replace(/\n/g, ' ⏎ ').replace(/\r/g, '').replace(/\t/g, ' ');
   return v.length > 40 ? `${v.slice(0, 37)}...` : v;
 }
 

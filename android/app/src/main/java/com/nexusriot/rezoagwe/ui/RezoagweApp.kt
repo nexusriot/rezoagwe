@@ -370,6 +370,28 @@ private fun Chip(label: String, value: String, tint: Color?) {
     }
 }
 
+/**
+ * Renders a store key for a one-line row.
+ *
+ * A key is arbitrary UTF-8: a newline or a tab in one is legal, and left
+ * unescaped a key holding a newline draws across two lines and reads as two
+ * keys — next to a delete button. The value on the row has always been escaped
+ * this way; the key was the one field that was not. Capped too, since nothing
+ * bounds a key's length and a long one pushes the row's controls off screen.
+ */
+fun displayKey(key: String): String {
+    if (key.isEmpty()) return "(empty key)"
+    val escaped = key.replace("\n", " ⏎ ").replace("\r", "").replace("\t", " ")
+    return if (escaped.length <= 120) escaped else escaped.take(117) + "..."
+}
+
+/** The same treatment for a value preview, so a row renders consistently. */
+fun displayValue(value: String): String {
+    if (value.isEmpty()) return "(empty)"
+    val escaped = value.replace("\n", " ⏎ ").replace("\r", "").replace("\t", " ")
+    return if (escaped.length <= 120) escaped else escaped.take(117) + "..."
+}
+
 fun formatUptime(seconds: Long): String {
     val h = seconds / 3600
     val m = (seconds % 3600) / 60

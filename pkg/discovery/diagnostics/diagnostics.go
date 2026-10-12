@@ -85,29 +85,29 @@ type IDConflict struct {
 // Snapshot is everything the rules read. It is a plain struct so a test can
 // fabricate any cluster condition without running one.
 type Snapshot struct {
-	Addr           string           `json:"addr"`
-	BindAddr       string           `json:"bind_addr"`
-	AdvertiseAddr  string           `json:"advertise_addr,omitempty"`
-	LocalIPv4      string           `json:"local_ipv4,omitempty"`
-	Nick           string           `json:"nick"`
-	NodeID         string           `json:"node_id"`
-	Cluster        string           `json:"cluster"`
-	KeyFingerprint string           `json:"key_fingerprint"`
-	PSKSet         bool             `json:"psk_set"`
-	Version        string           `json:"version,omitempty"`
-	UptimeSec      int64            `json:"uptime_sec"`
-	StreamListener bool             `json:"stream_listener"`
-	Seeds          []string         `json:"seeds"`
-	Peers          []Peer           `json:"peers"`
-	ChatGaps       []ChatGap        `json:"chat_gaps,omitempty"`
-	Strangers      []Stranger       `json:"strangers"`
+	Addr           string     `json:"addr"`
+	BindAddr       string     `json:"bind_addr"`
+	AdvertiseAddr  string     `json:"advertise_addr,omitempty"`
+	LocalIPv4      string     `json:"local_ipv4,omitempty"`
+	Nick           string     `json:"nick"`
+	NodeID         string     `json:"node_id"`
+	Cluster        string     `json:"cluster"`
+	KeyFingerprint string     `json:"key_fingerprint"`
+	PSKSet         bool       `json:"psk_set"`
+	Version        string     `json:"version,omitempty"`
+	UptimeSec      int64      `json:"uptime_sec"`
+	StreamListener bool       `json:"stream_listener"`
+	Seeds          []string   `json:"seeds"`
+	Peers          []Peer     `json:"peers"`
+	ChatGaps       []ChatGap  `json:"chat_gaps,omitempty"`
+	Strangers      []Stranger `json:"strangers"`
 	// IDConflicts are node ids seen claimed by more than one address, and
 	// Impostors peer addresses seen claiming this node's own id.
-	IDConflicts []IDConflict `json:"id_conflicts,omitempty"`
-	Impostors   []string     `json:"impostors,omitempty"`
-	Metrics        metrics.Snapshot `json:"-"`
-	Gauges         metrics.Gauges   `json:"gauges"`
-	Topology       topology.Graph   `json:"topology"`
+	IDConflicts []IDConflict     `json:"id_conflicts,omitempty"`
+	Impostors   []string         `json:"impostors,omitempty"`
+	Metrics     metrics.Snapshot `json:"-"`
+	Gauges      metrics.Gauges   `json:"gauges"`
+	Topology    topology.Graph   `json:"topology"`
 
 	GossipInterval    time.Duration `json:"-"`
 	HeartbeatInterval time.Duration `json:"-"`
@@ -256,6 +256,18 @@ func Checks(d Snapshot, now time.Time) []Check {
 			detail += fmt.Sprintf(" Last: %s to %s (%s).", e.Kind, e.Addr, e.Message)
 		}
 		add(SeverityWarn, fmt.Sprintf("%d send error(s)", m.SendErrors), detail)
+	}
+	// Counted since the beginning and explained by nothing. The stream is the
+	// only path for a value too big for a datagram and for a whole-store sync
+	// on join, so a node whose streams fail is not slightly degraded: an
+	// oversized entry cannot reach that peer by any path, and the replicas stay
+	// divergent for as long as the key lives.
+	if m.StreamErrors > 0 {
+		add(SeverityWarn, fmt.Sprintf("%d stream (TCP) error(s)", m.StreamErrors),
+			"A stream to a peer or a seed failed. Datagrams and streams share a port number but not "+
+				"a protocol, so a firewall that passes UDP and blocks TCP looks exactly like this. "+
+				"Until it works, a joiner falls back to the bounded datagram state sync, and any "+
+				"entry too large for one datagram cannot replicate at all.")
 	}
 	if !d.StreamListener {
 		detail := "Another process holds the TCP port, so large state syncs fall back to datagrams " +

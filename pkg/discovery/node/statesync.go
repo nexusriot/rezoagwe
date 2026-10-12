@@ -144,6 +144,11 @@ func (n *Node) discoverFromBootstrap() {
 }
 
 // applyRoster adopts the peers a bootstrap reported.
+//
+// Learning a peer here is announced like learning one any other way. Eviction
+// always announces a departure, so a roster entry adopted in silence and never
+// heard from produced a "left" for a node that had never been seen to join —
+// which reads as a node leaving twice.
 func (n *Node) applyRoster(roster pb.BootstrapRoster) {
 	learned := false
 	for _, p := range roster.Peers {
@@ -152,6 +157,7 @@ func (n *Node) applyRoster(roster pb.BootstrapRoster) {
 		}
 		if n.Model.AddPeer(p.Addr) {
 			learned = true
+			n.announceJoin(p.Addr, n.Model.NickOf(p.Addr))
 		}
 	}
 	if !learned {

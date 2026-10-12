@@ -1037,3 +1037,86 @@ test('a key held at one version with two values is reported, not hidden', async 
   assert.equal(diff.local, diff.remote, 'both sides should report the identical version');
   await c.stopAll();
 });
+
+// A node is the only one that can answer a pull for its own seq 7, and it
+// decides which lines are its own. Deciding that by address meant a node whose
+// address had moved disowned everything it had said before the move: a phone
+// that loses Wi-Fi falls back to advertising loopback, writes a line there, and
+// comes back on its LAN address — then tells the asker its own line is gone for
+// good while that line is on its own screen. Measured on hardware against the
+// Go node: gaps 2, recovered 0, lost 2.
+test('a node still serves chat lines it wrote under another address', async () => {
+  const c = cluster();
+  const a = await c.make('alice');
+  const b = await c.make('bob');
+  await link(a, b);
+
+  await a.sendChat('first');
+  await settle();
+
+  // Off the air, with the address underneath the node changed.
+  c.net.partition(a.addr, b.addr);
+  const onAir = a.addr;
+  // `addr` is derived from the advertise host, which is exactly what moves when
+  // a phone loses Wi-Fi and falls back to loopback.
+  const onAirHost = a.config.advertiseHost;
+  a.config.advertiseHost = '127.0.0.2';
+  await a.sendChat('said while the address had moved');
+  a.config.advertiseHost = onAirHost;
+  c.net.heal(onAir, b.addr);
+
+  await a.sendChat('third');
+  await settle();
+  assert.equal(b.metrics.chatGapsFound, 1, 'the loss should have been named');
+
+  await b.pullChatGaps();
+  await settle();
+
+  assert.equal(b.metrics.chatLost, 0, 'the author still held the line');
+  assert.equal(b.metrics.chatRecovered, 1);
+  assert.ok(
+    b.chatLog.some((e) => e.text === 'said while the address had moved'),
+    'the line never arrived',
+  );
+  await c.stopAll();
+});
+
+// Every path that learns a peer announces it, and eviction always announces a
+// departure. The roster path announced nothing, so a peer adopted from a
+// bootstrap roster and never heard from again produced a "left" for a node that
+// had never been seen to join — a node leaving twice, in the one log a user
+// actually watches.
+test('a peer learned from a bootstrap roster is announced', async () => {
+  const c = cluster();
+  const a = await c.make('alice');
+
+  await a.applyRoster({ peers: [{ addr: '127.0.0.1:3999', nick: 'ghost' }] });
+  assert.ok(
+    a.chatLog.some((e) => e.kind === 'system' && e.text.includes('127.0.0.1:3999') && e.text.includes('joined')),
+    `the roster peer was adopted in silence: ${JSON.stringify(a.chatLog)}`,
+  );
+
+  // Only learning is news: a second roster with the same peer says nothing.
+  const before = a.chatLog.length;
+  await a.applyRoster({ peers: [{ addr: '127.0.0.1:3999', nick: 'ghost' }] });
+  assert.equal(a.chatLog.length, before);
+  await c.stopAll();
+});
+
+// The activity feed is a one-line-per-event log, and both a key and a value are
+// arbitrary UTF-8. A newline in either broke the entry in two in every pane
+// that shows it, so one event read as two. Only the value was ever previewed.
+test('an activity entry stays on one line whatever the key holds', async () => {
+  const c = cluster();
+  const a = await c.make('alice');
+  const b = await c.make('bob');
+  await link(a, b);
+
+  await a.set('line1\nline2', 'first\nsecond');
+  await settle();
+
+  const line = b.activity().find((l) => l.includes('line1'));
+  assert.ok(line, `no activity entry named the key: ${JSON.stringify(b.activity())}`);
+  assert.ok(!/[\n\t]/.test(line), `entry still breaks the line: ${JSON.stringify(line)}`);
+  await c.stopAll();
+});

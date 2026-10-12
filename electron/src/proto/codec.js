@@ -49,9 +49,15 @@ function deriveKey(psk, cluster) {
  * A short, shareable identity for the framing key. Two nodes that cannot talk
  * compare fingerprints to tell "the key differs" from "the network drops
  * packets", without revealing the key.
+ *
+ * It is a hash *of* the key, not a prefix of it, for two reasons that are
+ * really one. A prefix is four bytes of the live framing key, put on screen and
+ * on the clipboard by *Copy report* — the opposite of "without revealing the
+ * key". And it has to be the digest Go prints, or the comparison this exists
+ * for says two correctly configured nodes disagree.
  */
 function keyFingerprint(psk, cluster) {
-  return deriveKey(psk, cluster).subarray(0, 4).toString('hex');
+  return crypto.createHash('sha256').update(deriveKey(psk, cluster)).digest().subarray(0, 4).toString('hex');
 }
 
 class Codec {

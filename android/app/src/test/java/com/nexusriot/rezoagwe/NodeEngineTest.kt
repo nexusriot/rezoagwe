@@ -409,6 +409,33 @@ class NodeEngineTest {
         )
     }
 
+    /**
+     * Every path that learns a peer announces it, and eviction always announces
+     * a departure. The roster path announced nothing, so a peer adopted from a
+     * bootstrap roster and never heard from again produced a "left" for a node
+     * that had never been seen to join — a node leaving twice, in the one log a
+     * user actually watches.
+     */
+    @Test
+    fun aPeerLearnedFromTheRosterIsAnnounced() {
+        val bootPort = freePort()
+        val boot = BootstrapServer(BootstrapConfig(port = bootPort), dataFile = null, scope = scope)
+        servers += boot
+        boot.start()
+
+        val a = engine(freePort(), "alice", seeds = listOf("127.0.0.1:$bootPort"))
+        a.start()
+        waitFor("alice to register") { boot.roster.value.any { it.addr == a.addr } }
+
+        val b = engine(freePort(), "bob", seeds = listOf("127.0.0.1:$bootPort"))
+        b.start()
+        waitFor("bob to learn alice from the roster") { b.peerList.value.any { it.addr == a.addr } }
+
+        waitFor("the join to be announced") {
+            b.chat.value.any { it.kind == ChatKind.SYSTEM && it.text.contains(a.addr) && it.text.contains("joined") }
+        }
+    }
+
     /** Slash commands are engine-level, so every front end understands the same vocabulary. */
     @Test
     fun submitHandlesCommands() {

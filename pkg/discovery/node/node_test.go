@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/nexusriot/rezoagwe/pkg/discovery/model"
 	pb "github.com/nexusriot/rezoagwe/pkg/proto"
@@ -701,4 +702,72 @@ func TestARefusedRemoteWriteIsNotCountedAsStale(t *testing.T) {
 	if got := n.Metrics.KVRefused.Load(); got != 1 {
 		t.Fatalf("KVRefused = %d, want 1 — a stale update is not a refusal", got)
 	}
+}
+
+// Every path that learns a peer announces it, and eviction always announces a
+// departure. The roster path announced nothing, so a node adopted from a
+// bootstrap roster and never heard from again produced a "left" for a node that
+// had never been seen to join — which reads, in the one log a user actually
+// watches, as a node leaving twice.
+//
+// Seen on a real cluster: `17:07:04 desktop (…) left` from a clean Goodbye,
+// then `17:07:22 desktop (…) left` again. In between, the node hit zero peers,
+// re-asked its seeds (which is the only time it does), and silently re-adopted
+// an address bootstrap had not yet aged out.
+func TestAPeerLearnedFromARosterIsAnnounced(t *testing.T) {
+	net := transport.NewMemNet(31)
+	n := newTestNode(t, net, "10.0.0.1:3137")
+
+	n.applyRoster(pb.BootstrapRoster{Peers: []pb.BootstrapPeer{
+		{Addr: "10.0.0.2:3137", Nick: "bea"},
+	}})
+
+	joined := false
+	for _, e := range n.Model.ChatLog() {
+		if e.Kind == pb.ChatSystem && strings.Contains(e.Text, "10.0.0.2:3137") &&
+			strings.Contains(e.Text, "joined") {
+			joined = true
+		}
+	}
+	if !joined {
+		t.Fatalf("a peer adopted from the roster was not announced; log = %+v", n.Model.ChatLog())
+	}
+
+	// And a second roster carrying the same peer says nothing more: only
+	// learning is news.
+	before := len(n.Model.ChatLog())
+	n.applyRoster(pb.BootstrapRoster{Peers: []pb.BootstrapPeer{
+		{Addr: "10.0.0.2:3137", Nick: "bea"},
+	}})
+	if after := len(n.Model.ChatLog()); after != before {
+		t.Fatalf("re-adopting a known peer added %d line(s)", after-before)
+	}
+}
+
+// The activity feed is a one-line-per-event log, and both a key and a value are
+// arbitrary UTF-8. A newline in either broke the entry in two in every pane
+// that shows it, so one event read as two — and the length cap sliced by byte,
+// which cuts a multi-byte rune in half. Only the value was ever previewed, and
+// only for length.
+func TestActivityPreviewKeepsAnEventOnOneLine(t *testing.T) {
+	if got := preview("line1\nline2\ttabbed"); strings.ContainsAny(got, "\n\t") {
+		t.Fatalf("preview(%q) = %q — still breaks the line", "line1\nline2\ttabbed", got)
+	}
+	if got := preview(strings.Repeat("日", 100)); !utf8.ValidString(got) {
+		t.Fatalf("preview cut a rune in half: %q", got)
+	}
+
+	net := transport.NewMemNet(41)
+	a, b := newPairedNodes(t, net)
+	a.Set("line1\nline2", "first\nsecond", 0)
+	waitFor(t, "the write to reach b", func() bool { _, ok := b.Model.Store.Get("line1\nline2"); return ok })
+
+	waitFor(t, "an activity line naming the key", func() bool {
+		for _, line := range b.Activity() {
+			if strings.Contains(line, "line1") {
+				return !strings.ContainsAny(line, "\n\t")
+			}
+		}
+		return false
+	})
 }

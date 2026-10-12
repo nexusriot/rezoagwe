@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gdamore/tcell/v2"
 
@@ -264,5 +265,78 @@ func TestStatusBarShowsPeersAndKeys(t *testing.T) {
 	}
 	if !strings.Contains(status, "keys:1") {
 		t.Fatalf("status = %q, want the key count", status)
+	}
+}
+
+// A key is arbitrary UTF-8, and the list draws one line per row. The value has
+// always been escaped here; the key was the one field that was not, so a key
+// holding a newline read as two keys — the same trap the store's own
+// documentation warns about for key listings.
+func TestKeyListEscapesControlCharactersInAKey(t *testing.T) {
+	c := newRunningController(t)
+	c.node.Set("line1\nline2\ttabbed", "two-line key", 0)
+
+	runHandler(t, c.fillStore)
+
+	var main string
+	onUI(t, c, func() { main, _ = c.view.List.GetItemText(0) })
+
+	if strings.ContainsAny(main, "\n\t") {
+		t.Fatalf("row label %q still carries a control character", main)
+	}
+	if !strings.Contains(main, "⏎") {
+		t.Fatalf("row label %q does not show the newline", main)
+	}
+}
+
+// And acting on that row has to reach the real key, not the drawn one.
+func TestSelectedKeyIsTheRealKeyNotTheLabel(t *testing.T) {
+	c := newRunningController(t)
+	const key = "line1\nline2"
+	c.node.Set(key, "v", 0)
+
+	runHandler(t, c.fillStore)
+
+	var got string
+	onUI(t, c, func() { got = c.currentSelectedKey() })
+	if got != key {
+		t.Fatalf("selected key = %q, want %q — edit/delete would act on the wrong key", got, key)
+	}
+}
+
+// A key may legally end in the string used to mark an expiry. Reading the key
+// back out of the label trimmed that marker off and resolved to a key that
+// does not exist.
+func TestSelectedKeyIsNotConfusedByAKeyEndingInTheExpiryMarker(t *testing.T) {
+	c := newRunningController(t)
+	const key = "report" + ttlMarker
+	c.node.Set(key, "v", 0)
+
+	runHandler(t, c.fillStore)
+
+	var got string
+	onUI(t, c, func() { got = c.currentSelectedKey() })
+	if got != key {
+		t.Fatalf("selected key = %q, want %q", got, key)
+	}
+}
+
+// Slicing a UTF-8 string by byte cuts a multi-byte rune in half, and tcell
+// draws the broken tail as a replacement glyph: a long unicode value came out
+// mangled rather than merely shortened.
+func TestLongUnicodeIsTruncatedOnARuneBoundary(t *testing.T) {
+	long := strings.Repeat("日", 200)
+
+	for name, got := range map[string]string{
+		"previewValue": previewValue(long),
+		"truncate":     truncate(long, 28),
+		"displayKey":   displayKey(long),
+	} {
+		if strings.ContainsRune(got, '�') {
+			t.Errorf("%s produced a replacement glyph: %q", name, got)
+		}
+		if !utf8.ValidString(got) {
+			t.Errorf("%s produced invalid UTF-8: %q", name, got)
+		}
 	}
 }

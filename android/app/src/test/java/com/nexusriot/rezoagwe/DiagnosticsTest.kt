@@ -10,6 +10,7 @@ import com.nexusriot.rezoagwe.core.Severity
 import com.nexusriot.rezoagwe.core.StoreDiagnostics
 import com.nexusriot.rezoagwe.core.TopologyBuilder
 import com.nexusriot.rezoagwe.core.asReport
+import com.nexusriot.rezoagwe.core.DeviceReport
 import com.nexusriot.rezoagwe.core.IdConflict
 import com.nexusriot.rezoagwe.core.healthChecks
 import org.junit.Assert.assertEquals
@@ -409,5 +410,80 @@ class DiagnosticsTest {
             "the advice does not say what the age must exceed: ${check.detail}",
             check.detail.contains("longest"),
         )
+    }
+
+    /**
+     * `deviceReport` is collected because "the usual causes are not in the
+     * protocol at all: no network, a metered link, or Doze" — and then it was
+     * read by nothing. With Wi-Fi off on a tablet the Device card said
+     * `network none` while Health blamed "a peer address that no longer routes,
+     * or Wi-Fi dropping while the node stays up" and told the reader to check a
+     * bootstrap that was perfectly fine. The phone's own state has to be an
+     * input to the checks, not just something to display.
+     */
+    @Test
+    fun `no network is named as the cause rather than guessed at`() {
+        val d = healthy().copy(
+            peers = emptyList(),
+            metrics = MetricsSnapshot(
+                sendErrors = 22,
+                lastSendError = SendFailure(addr = "10.0.0.5:9999", message = "ENETUNREACH"),
+            ),
+        )
+        val offline = DeviceReport(transport = "none")
+
+        val checks = healthChecks(d, now, offline)
+        val titles = checks.map { it.title }
+        assertTrue("no check named the missing network: $titles", titles.any { it.contains("no network") })
+        assertEquals(
+            "a device with no network is an error, not a warning",
+            Severity.ERROR,
+            checks.first { it.title.contains("no network") }.severity,
+        )
+
+        // And the checks that used to guess now defer to it rather than sending
+        // the reader after the bootstrap and the key.
+        val seeds = checks.first { it.title.contains("seed") }
+        assertTrue("the seed check still blames the configuration: ${seeds.detail}",
+            seeds.detail.contains("no network"))
+        assertFalse(seeds.detail.contains("cluster name"))
+
+        val sends = checks.first { it.title.contains("send error") }
+        assertTrue("the send-error check still guesses: ${sends.detail}",
+            sends.detail.contains("no network"))
+    }
+
+    /** On a device that *is* connected, nothing changes. */
+    @Test
+    fun `a connected device raises no network check`() {
+        val online = DeviceReport(transport = "Wi-Fi", validated = true)
+        assertFalse(healthChecks(healthy(), now, online).any { it.title.contains("no network") })
+        assertFalse(healthChecks(healthy(), now, null).any { it.title.contains("no network") })
+    }
+
+    /** Doze is the Android-specific reason a node stops gossiping with nothing wrong in the protocol. */
+    @Test
+    fun `battery saver is raised, since it stops the gossip timers`() {
+        val saving = DeviceReport(transport = "Wi-Fi", powerSaveMode = true)
+        val check = healthChecks(healthy(), now, saving).firstOrNull { it.title.contains("Battery saver") }
+        assertNotNull("battery saver was collected and never surfaced", check)
+        assertEquals(Severity.WARN, check!!.severity)
+    }
+
+    /**
+     * Counted since the beginning and explained by nothing: on a tablet with a
+     * wrong key, five stream errors against an unreachable seed raised not one
+     * word. The stream is the only path for a value too big for a datagram and
+     * for a whole-store sync on join.
+     */
+    @Test
+    fun `stream errors are explained, not just counted`() {
+        val d = healthy().copy(metrics = MetricsSnapshot(streamErrors = 5))
+        val check = healthChecks(d, now).firstOrNull { it.title.contains("stream (TCP) error") }
+        assertNotNull("stream errors raised nothing", check)
+        assertEquals(Severity.WARN, check!!.severity)
+        assertTrue(check.detail.contains("firewall that passes UDP and blocks TCP"))
+
+        assertFalse(healthChecks(healthy(), now).any { it.title.contains("stream (TCP)") })
     }
 }

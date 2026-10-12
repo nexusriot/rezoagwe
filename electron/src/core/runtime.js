@@ -62,6 +62,7 @@ class Runtime extends EventEmitter {
   async guard(fn) {
     try {
       await fn();
+      this.lastError = '';
       return { ok: true };
     } catch (e) {
       this.lastError = e.message || String(e);
@@ -117,9 +118,18 @@ class Runtime extends EventEmitter {
     return updated;
   }
 
-  /** The full current state, for a renderer that has just connected or reloaded. */
+  /**
+   * The full current state, for a renderer that has just connected or reloaded.
+   *
+   * `lastError` is in here because autostart runs before the window has
+   * finished loading: the toast `guard()` emits for a failed bind is sent to a
+   * renderer that does not exist yet and is dropped. The app then opened on
+   * "STOPPED" with no reason anywhere, which is exactly the case — a port
+   * already taken — a user is most likely to hit and least able to guess.
+   */
   snapshot() {
     return {
+      lastError: this.lastError || '',
       settings: this.settings,
       status: this.engine.status(),
       entries: this.engine.entries(),

@@ -314,9 +314,14 @@ screens.keys = () => {
       rows.append(h('div', { class: 'kv-row' },
         h('div', { class: 'kv-main' },
           h('div', { class: 'kv-key' },
-            h('span', { text: entry.key }),
+            // A key is arbitrary UTF-8, and a newline or tab in one is legal.
+            // Unescaped, CSS collapsed it to a space, so two different keys
+            // drew identically — next to a delete button. The value on this
+            // row has always been escaped; the key was the one field that was
+            // not.
+            h('span', { text: S.displayKey(entry.key) }),
             ttl === null ? null : h('span', { class: 'pill ttl', text: `expires in ${S.formatUptime(ttl)}` })),
-          h('div', { class: 'kv-value', text: entry.value.replace(/\n/g, ' ⏎ ') || '(empty)' }),
+          h('div', { class: 'kv-value', text: S.displayValue(entry.value) }),
           h('div', { class: 'kv-meta', text: `v${entry.version.counter}` })),
         h('div', { class: 'kv-actions' },
           h('button', {
@@ -391,7 +396,11 @@ screens.chat = () => {
       return;
     }
     for (const entry of state.chat) {
-      const own = entry.sender && entry.sender === state.status.addr;
+      // By id, not address: a node whose address moved would otherwise see its
+      // own earlier lines attributed to a stranger wearing its nickname.
+      const own = entry.node
+        ? entry.node === state.status.nodeId
+        : Boolean(entry.sender) && entry.sender === state.status.addr;
       const who = own ? 'you' : entry.nick || entry.sender || '?';
       const kind = entry.kind || '';
       let body;
@@ -1276,6 +1285,10 @@ async function boot() {
   Object.assign(state, snapshot);
   ui.split = S.splitFits(window.innerWidth, window.innerHeight);
   render();
+
+  // Autostart happens before this renderer exists, so the toast for a failed
+  // bind was sent to nobody. The snapshot carries the error across that gap.
+  if (snapshot.lastError) toast('error', snapshot.lastError);
 
   // Ages are only true for an instant; without a tick the peer list shows how
   // stale a peer was when the screen opened.

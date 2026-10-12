@@ -73,7 +73,7 @@ fun ChatScreen(node: NodeEngine) {
                 .weight(1f)
                 .fillMaxWidth(),
         ) {
-            items(messages) { entry -> ChatLine(entry, status.addr) }
+            items(messages) { entry -> ChatLine(entry, status.addr, node.nodeId) }
         }
         Row(
             modifier = Modifier
@@ -104,9 +104,13 @@ fun ChatScreen(node: NodeEngine) {
 }
 
 @Composable
-private fun ChatLine(entry: ChatEntry, selfAddr: String) {
+private fun ChatLine(entry: ChatEntry, selfAddr: String, selfId: String) {
     val stamp = TIME.format(Date(entry.ts * 1000))
-    val own = entry.sender == selfAddr
+    // By id, not address: this node's address is recomputed from the current
+    // interface, so a line written while Wi-Fi was down — when the node
+    // advertises loopback — would come back attributed to a stranger with this
+    // node's own nickname.
+    val own = entry.node == selfId || (entry.node.isEmpty() && entry.sender == selfAddr)
     val name = when {
         own -> "you"
         entry.nick.isNotEmpty() -> entry.nick

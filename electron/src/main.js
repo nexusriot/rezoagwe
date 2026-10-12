@@ -209,7 +209,9 @@ function registerIpc() {
   handle('bootstrap:stop', () => runtime.stopBootstrap());
 
   handle('diag:snapshot', () => {
-    const d = runtime.engine.diagnostics();
+    // The engine knows it is not running; only the runtime knows whether that
+    // is because nobody started it or because starting it failed.
+    const d = { ...runtime.engine.diagnostics(), lastError: runtime.lastError || '' };
     return { diagnostics: d, checks: healthChecks(d, Date.now()), bootstrap: runtime.bootstrap.status() };
   });
   handle('diag:consistency', () => runtime.engine.checkConsistency());

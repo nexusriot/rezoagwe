@@ -1,6 +1,7 @@
 package proto
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -213,5 +214,35 @@ func TestKeyVersionCarriesItsValueHashAndOmitsItWhenEmpty(t *testing.T) {
 	}
 	if legacy.ValueHash != "" {
 		t.Errorf("value hash = %q, want empty", legacy.ValueHash)
+	}
+}
+
+// The fingerprint is the one thing two machines that cannot talk are told to
+// compare, and all three implementations print it. It therefore has to be the
+// same function everywhere — the Android and desktop ports printed the first
+// four bytes of the framing key instead of a digest of it, so a phone and a Go
+// node holding the *same* key reported a mismatch, which is the loudest
+// possible false alarm from a check whose whole job is to be believed. It is a
+// hash of the key rather than a prefix for a second reason: a prefix is four
+// bytes of live key material on screen and on the clipboard.
+func TestKeyFingerprintVectors(t *testing.T) {
+	cases := []struct{ psk, cluster, want string }{
+		{"", "rezoagwe", "a4b7437d"},
+		{"s3cret", "prod", "f3e8452a"},
+		{"demo", "hwtest", "b526a31e"},
+	}
+	for _, c := range cases {
+		if got := NewCodec(c.psk, c.cluster).KeyFingerprint(); got != c.want {
+			t.Errorf("KeyFingerprint(%q, %q) = %s, want %s", c.psk, c.cluster, got, c.want)
+		}
+	}
+}
+
+// It must not be a prefix of the key, which is what the ports did.
+func TestKeyFingerprintIsNotKeyMaterial(t *testing.T) {
+	key := DeriveKey("demo", "hwtest")
+	fp := NewCodec("demo", "hwtest").KeyFingerprint()
+	if fp == hex.EncodeToString(key[:4]) {
+		t.Fatal("the fingerprint is the first four bytes of the framing key")
 	}
 }

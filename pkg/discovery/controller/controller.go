@@ -34,6 +34,14 @@ type Controller struct {
 	filterMu sync.RWMutex
 	filter   string
 
+	// rowKeys is the real key behind each visible list row, in row order.
+	// The label cannot be read back for it: it is escaped for display and may
+	// carry the TTL marker, and a key is arbitrary UTF-8 — one that happens to
+	// end in the marker, or to contain a newline, would resolve to a different
+	// key or to none, and the edit/delete/history actions would act on it.
+	rowsMu  sync.RWMutex
+	rowKeys []string
+
 	feedMu       sync.RWMutex
 	showActivity bool
 
@@ -635,11 +643,17 @@ func describeDifference(d node.KeyDifference) string {
 }
 
 // truncate shortens a label to fit a fixed column.
+//
+// By runes, not bytes. Slicing a UTF-8 string by byte cuts a multi-byte rune
+// in half and tcell draws the broken tail as a replacement glyph, so a long
+// unicode label came out mangled rather than merely shortened — and a key is
+// arbitrary UTF-8, which is exactly what the consistency report names here.
 func truncate(s string, n int) string {
-	if len(s) <= n {
+	r := []rune(s)
+	if len(r) <= n {
 		return s
 	}
-	return s[:n-1] + "…"
+	return string(r[:n-1]) + "…"
 }
 
 func (c *Controller) help() *tcell.EventKey {
@@ -934,25 +948,42 @@ func (c *Controller) fillDetails() {
 // previewValue returns a one-line, length-capped preview of value for the
 // secondary list text.
 func previewValue(v string) string {
-	v = strings.ReplaceAll(v, "\n", " ⏎ ")
-	v = strings.ReplaceAll(v, "\r", "")
-	v = strings.ReplaceAll(v, "\t", " ")
-	if len(v) > 80 {
-		v = v[:77] + "..."
-	}
 	if v == "" {
 		return "(empty)"
 	}
-	return v
+	return truncate(escapeControl(v), 80)
+}
+
+// displayKey renders a key for the list.
+//
+// A key is arbitrary UTF-8: a newline or a tab in one is legal, and unescaped
+// it breaks a list that draws one line per row — the key reads as two keys, or
+// as a different key than the one the row acts on. The value has always been
+// escaped here; the key was the one field that was not.
+func displayKey(k string) string {
+	if k == "" {
+		return "(empty key)"
+	}
+	return truncate(escapeControl(k), 80)
+}
+
+// escapeControl makes a string safe to draw on one line.
+func escapeControl(s string) string {
+	s = strings.ReplaceAll(s, "\n", " ⏎ ")
+	s = strings.ReplaceAll(s, "\r", "")
+	s = strings.ReplaceAll(s, "\t", " ")
+	return s
 }
 
 // currentSelectedKey returns the key under the cursor in the keys list, or "".
 func (c *Controller) currentSelectedKey() string {
-	if c.view.List.GetItemCount() == 0 {
+	idx := c.view.List.GetCurrentItem()
+	c.rowsMu.RLock()
+	defer c.rowsMu.RUnlock()
+	if idx < 0 || idx >= len(c.rowKeys) {
 		return ""
 	}
-	main, _ := c.view.List.GetItemText(c.view.List.GetCurrentItem())
-	return strings.TrimSuffix(main, ttlMarker)
+	return c.rowKeys[idx]
 }
 
 // ttlMarker flags a key that expires, so the list shows at a glance which
@@ -977,6 +1008,7 @@ func (c *Controller) fillStore() {
 	filter := strings.ToLower(c.getFilter())
 
 	type row struct {
+		key       string
 		label     string
 		secondary string
 	}
@@ -987,7 +1019,7 @@ func (c *Controller) fillStore() {
 			!strings.Contains(strings.ToLower(e.Value), filter) {
 			continue
 		}
-		label := e.Key
+		label := displayKey(e.Key)
 		secondary := previewValue(e.Value)
 		if e.ExpiresAt > 0 {
 			label += ttlMarker
@@ -997,25 +1029,34 @@ func (c *Controller) fillStore() {
 			}
 			secondary = fmt.Sprintf("%s  [expires in %s]", secondary, remaining)
 		}
-		rows = append(rows, row{label: label, secondary: secondary})
+		rows = append(rows, row{key: e.Key, label: label, secondary: secondary})
 	}
-	sort.Slice(rows, func(i, j int) bool { return rows[i].label < rows[j].label })
+	// Sorted by the real key, not the label: two keys that differ only in a
+	// control character render the same, and ordering by what is drawn would
+	// put them in an order the store does not have.
+	sort.Slice(rows, func(i, j int) bool { return rows[i].key < rows[j].key })
+
+	keys := make([]string, len(rows))
+	for i, r := range rows {
+		keys[i] = r.key
+	}
 
 	c.view.App.QueueUpdateDraw(func() {
-		prev := ""
-		if c.view.List.GetItemCount() > 0 {
-			prev, _ = c.view.List.GetItemText(c.view.List.GetCurrentItem())
-		}
+		prev := c.currentSelectedKey()
 		c.view.List.Clear()
-		newIdx := -1
-		for i, r := range rows {
+		for _, r := range rows {
 			c.view.List.AddItem(r.label, r.secondary, 0, nil)
-			if r.label == prev {
-				newIdx = i
-			}
 		}
-		if newIdx >= 0 {
-			c.view.List.SetCurrentItem(newIdx)
+		c.rowsMu.Lock()
+		c.rowKeys = keys
+		c.rowsMu.Unlock()
+		// Keeping the cursor on the same *key* rather than the same label: a
+		// label is not unique once it is escaped and capped.
+		for i, k := range keys {
+			if k == prev {
+				c.view.List.SetCurrentItem(i)
+				break
+			}
 		}
 	})
 }

@@ -1,6 +1,7 @@
 package com.nexusriot.rezoagwe.proto
 
 import java.nio.ByteBuffer
+import java.security.MessageDigest
 import java.security.SecureRandom
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
@@ -136,9 +137,18 @@ class Codec(
          * Two devices that cannot talk compare fingerprints to tell "the key
          * differs" from "the network drops packets", without either revealing
          * the key itself.
+         *
+         * It is a hash *of* the key, not a prefix of it, for two reasons that
+         * are really one. A prefix is four bytes of the live framing key, put
+         * on screen and on the clipboard by *Copy report* — which is the
+         * opposite of "without revealing the key". And it has to be the digest
+         * Go prints, or the comparison this exists for says two correctly
+         * configured nodes disagree.
          */
-        fun keyFingerprint(psk: String, cluster: String): String =
-            deriveKey(psk, cluster).take(4).joinToString("") { "%02x".format(it) }
+        fun keyFingerprint(psk: String, cluster: String): String {
+            val sum = MessageDigest.getInstance("SHA-256").digest(deriveKey(psk, cluster))
+            return sum.take(4).joinToString("") { "%02x".format(it) }
+        }
 
         private fun constantTimeEquals(a: ByteArray, b: ByteArray): Boolean {
             if (a.size != b.size) return false

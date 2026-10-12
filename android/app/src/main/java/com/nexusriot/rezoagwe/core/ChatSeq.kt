@@ -64,6 +64,27 @@ data class ChatGapStat(
 /** One request to make: which author, where it lives, and which lines to ask for. */
 data class ChatPullPlan(val addr: String, val seqs: List<Long>)
 
+/**
+ * Whether a logged line is one this node wrote, and may therefore serve from a
+ * pull.
+ *
+ * It is the node id that decides, not the address. The id is what the sequence
+ * numbering belongs to and it outlives a restart and a change of address; the
+ * address is recomputed from whatever interface the device has right now. A
+ * phone that loses Wi-Fi falls back to advertising loopback, and anything it
+ * says there is stamped with that address — so matching on the address meant
+ * the node disowned those lines the moment Wi-Fi came back, and answered the
+ * pull for its own seq 7 with "gone for good" while that line was on its own
+ * screen. The asker then counts it lost, which is the one outcome this whole
+ * mechanism exists to prevent.
+ *
+ * Address is the fallback for entries written before a chat entry carried an
+ * id, and only then: an entry that names a *different* author is hearsay
+ * whatever address it arrived under.
+ */
+fun ownsChatEntry(entryNode: String, entrySender: String, selfId: String, selfAddr: String): Boolean =
+    if (entryNode.isNotEmpty()) entryNode == selfId else entrySender.isNotEmpty() && entrySender == selfAddr
+
 private class ChatSenderState(
     var addr: String,
     var last: Long,

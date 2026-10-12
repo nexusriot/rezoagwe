@@ -684,8 +684,12 @@ class NodeEngine(
     private fun handleChatPull(req: ChatPull) {
         if (req.from.isEmpty() || req.seqs.isEmpty()) return
         val wanted = req.seqs.take(MAX_CHAT_PULL)
+        // See `ownsChatEntry`: by node id, not by this node's current address.
+        val self = addr
         val mine = synchronized(lock) {
-            chatLog.filter { it.seq != 0L && it.sender == addr }.associateBy { it.seq }
+            chatLog
+                .filter { it.seq != 0L && ownsChatEntry(it.node, it.sender, nodeId, self) }
+                .associateBy { it.seq }
         }
         val messages = mutableListOf<ChatMessage>()
         val gone = mutableListOf<Long>()
@@ -932,8 +936,8 @@ class NodeEngine(
         if (outcome.applied) {
             metrics.kvApplied.incrementAndGet()
             val who = writerName(u.version.node)
-            if (u.deleted) logActivity("$who deleted ${u.key} (v${u.version.counter})")
-            else logActivity("$who set ${u.key} = ${preview(u.value)} (v${u.version.counter})")
+            if (u.deleted) logActivity("$who deleted ${preview(u.key)} (v${u.version.counter})")
+            else logActivity("$who set ${preview(u.key)} = ${preview(u.value)} (v${u.version.counter})")
             return true
         }
         // "Stale" and "refused" are not the same event and must not share a
@@ -1487,11 +1491,23 @@ class NodeEngine(
         for (seed in config.seeds) if (seed.isNotEmpty()) send(seed, Kind.BOOTSTRAP_DISCOVER, req)
     }
 
+    /**
+     * Adopts the peers a bootstrap reported.
+     *
+     * Learning a peer here is announced like learning one any other way.
+     * Eviction always announces a departure, so a roster entry adopted in
+     * silence and never heard from produced a "left" for a node that had never
+     * been seen to join — which reads as a node leaving twice.
+     */
     private fun applyRoster(roster: BootstrapRoster) {
         var learned = false
         for (p in roster.peers) {
-            if (addPeer(p.addr)) learned = true
+            val isNew = addPeer(p.addr)
             if (p.nick.isNotEmpty()) setNick(p.addr, p.nick)
+            if (isNew) {
+                learned = true
+                announceJoin(p.addr, nickOf(p.addr))
+            }
         }
         if (!learned) return
         helloAllPeers()
@@ -1789,6 +1805,17 @@ class NodeEngine(
             return if (i < 0) trimmed to "" else trimmed.substring(0, i) to trimmed.substring(i + 1).trim()
         }
 
-        fun preview(value: String): String = if (value.length > 40) value.take(37) + "..." else value
+        /**
+         * Renders a key or a value for a one-line activity entry.
+         *
+         * A key and a value are both arbitrary UTF-8, and a newline in either
+         * one breaks the line in two in every pane that shows it, so one entry
+         * reads as two. This was only ever applied to the value, and only the
+         * length half of it.
+         */
+        fun preview(value: String): String {
+            val v = value.replace("\n", " ⏎ ").replace("\r", "").replace("\t", " ")
+            return if (v.length > 40) v.take(37) + "..." else v
+        }
     }
 }

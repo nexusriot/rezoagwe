@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net"
+	"strings"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -147,9 +148,9 @@ func (n *Node) applyRemote(u pb.KVUpdate) bool {
 		n.Metrics.KVApplied.Add(1)
 		who := n.Model.WriterName(u.Version.Node)
 		if u.Action == pb.KVDelete {
-			n.logActivity("%s deleted %s (v%d)", who, u.Key, u.Version.Counter)
+			n.logActivity("%s deleted %s (v%d)", who, preview(u.Key), u.Version.Counter)
 		} else {
-			n.logActivity("%s set %s = %s (v%d)", who, u.Key, preview(u.Value), u.Version.Counter)
+			n.logActivity("%s set %s = %s (v%d)", who, preview(u.Key), preview(u.Value), u.Version.Counter)
 		}
 		return true
 	}
@@ -296,7 +297,7 @@ func (n *Node) handleChatPull(body []byte) {
 	if len(req.Seqs) > pb.MaxChatPull {
 		req.Seqs = req.Seqs[:pb.MaxChatPull]
 	}
-	entries, gone := n.Model.OwnChat(n.cfg.AdvertiseAddr, req.Seqs)
+	entries, gone := n.Model.OwnChat(n.cfg.AdvertiseAddr, n.Model.NodeID, req.Seqs)
 	reply := pb.ChatBacklog{From: n.cfg.AdvertiseAddr, Unavailable: gone}
 	for _, e := range entries {
 		reply.Messages = append(reply.Messages, pb.ChatMessage{
@@ -583,10 +584,20 @@ func (n *Node) serveStream(conn net.Conn) {
 }
 
 // preview shortens a value for a one-line activity entry.
+// preview renders a key or a value for a one-line activity entry.
+//
+// A key and a value are both arbitrary UTF-8. A newline in either one breaks
+// the line in two in every pane that shows it, so one entry reads as two — and
+// slicing by byte rather than by rune cuts a multi-byte character in half.
+// Both were only ever applied to the value, and only the length half of it.
 func preview(v string) string {
 	const max = 40
-	if len(v) > max {
-		return v[:max-3] + "..."
+	v = strings.ReplaceAll(v, "\n", " ⏎ ")
+	v = strings.ReplaceAll(v, "\r", "")
+	v = strings.ReplaceAll(v, "\t", " ")
+	r := []rune(v)
+	if len(r) > max {
+		return string(r[:max-3]) + "..."
 	}
 	return v
 }

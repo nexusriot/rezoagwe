@@ -127,10 +127,28 @@ test('the replay cache is pruned rather than grown forever', () => {
   assert.equal(codec.seen.size, 1);
 });
 
-test('the key fingerprint identifies a key without revealing it', () => {
-  assert.equal(keyFingerprint('', 'rezoagwe'), '557630ce');
+// The fingerprint is the one thing two machines that cannot talk are told to
+// compare, and the Go node, this client and the Android app all print it, so it
+// has to be the same function in all three. It was not: this port and the
+// Android one printed the first four bytes of the framing key while Go printed
+// a digest of it, and a desktop and a Go node holding the *same* key reported a
+// mismatch. The vector this test used to pin — '557630ce' — was that key
+// prefix, so the test asserted the bug, under a name that described the fix.
+test('the key fingerprint matches the Go node', () => {
+  assert.equal(keyFingerprint('', 'rezoagwe'), 'a4b7437d');
+  assert.equal(keyFingerprint('s3cret', 'prod'), 'f3e8452a');
+  assert.equal(keyFingerprint('demo', 'hwtest'), 'b526a31e');
   assert.notEqual(keyFingerprint('a', 'c'), keyFingerprint('b', 'c'));
   assert.equal(keyFingerprint('a', 'c').length, 8);
+});
+
+// And it must not be a prefix of the key: it goes on screen and onto the
+// clipboard with *Copy report*.
+test('the key fingerprint is not key material', () => {
+  assert.notEqual(
+    keyFingerprint('demo', 'hwtest'),
+    deriveKey('demo', 'hwtest').subarray(0, 4).toString('hex'),
+  );
 });
 
 test('decodeJSON reports a malformed body rather than throwing a parse error', () => {

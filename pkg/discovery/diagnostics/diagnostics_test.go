@@ -547,3 +547,27 @@ func TestTombstoneAdviceStatesWhatBoundsTheAge(t *testing.T) {
 		t.Errorf("the advice does not say what the age must exceed: %q", c.Detail)
 	}
 }
+
+// Counted since the beginning and explained by nothing. The stream is the only
+// path for a value too big for a datagram and for a whole-store sync on join,
+// so a node whose streams fail is not slightly degraded: an oversized entry
+// cannot reach that peer by any path, and the replicas stay divergent for as
+// long as the key lives.
+func TestStreamErrorsAreExplainedNotJustCounted(t *testing.T) {
+	d := healthy()
+	d.Metrics.StreamErrors = 5
+
+	c := findCheck(t, Checks(d, now), "stream (TCP) error")
+	if c.Severity != SeverityWarn {
+		t.Fatalf("severity = %v, want warn", c.Severity)
+	}
+	if !strings.Contains(c.Detail, "firewall that passes UDP and blocks TCP") {
+		t.Fatalf("detail does not name the usual cause: %q", c.Detail)
+	}
+
+	for _, got := range Checks(healthy(), now) {
+		if strings.Contains(got.Title, "stream (TCP)") {
+			t.Fatalf("a healthy node raised %q", got.Title)
+		}
+	}
+}
