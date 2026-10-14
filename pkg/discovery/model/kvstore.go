@@ -9,6 +9,7 @@ import (
 	"sort"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	pb "github.com/nexusriot/rezoagwe/pkg/proto"
 )
@@ -121,7 +122,47 @@ var (
 	// reporting success, and leaving it on one replica forever with nothing
 	// able to repair it. Refusing the write is the only honest answer.
 	ErrUnshippable = errors.New("value is too large to replicate to any peer")
+	// ErrNotRepresentable is the same fact about a different limit of the
+	// wire. Bodies are JSON, and every JSON encoder replaces a byte that is
+	// not valid UTF-8 with U+FFFD — silently, with no error to notice.
+	//
+	// So a value of arbitrary bytes is held intact here and mangled on every
+	// replica, under the *same version*: anti-entropy compares versions, finds
+	// them equal, and is right to do nothing, which makes this the one kind of
+	// divergence no repair path can reach. The consistency check does see it,
+	// because the fingerprint folds a hash of the value, and then has nothing
+	// to offer. Persistence marshals the same way, so a restart destroys the
+	// last intact copy.
+	//
+	// A key is worse still. It is mangled the same way and the result is a
+	// *different key*: the entry exists under one name here and another
+	// everywhere else, and a later delete tombstones only one of them.
+	//
+	// Refusing is the honest answer for exactly the reason ErrUnshippable
+	// refuses: storing it, reporting success and leaving the cluster
+	// permanently split is the alternative. Callers with bytes to store
+	// encode them — base64 — which is a decision for the caller to make
+	// knowingly rather than for the encoder to make silently.
+	ErrNotRepresentable = errors.New("not valid UTF-8, so it cannot survive the wire intact")
 )
+
+// representable reports whether a key and value can cross the wire unchanged.
+//
+// It is checked on every path, including deletes, because a delete carries a
+// key and a mangled key tombstones something else. Remote updates are checked
+// too, although a JSON decoder cannot produce an invalid string: that makes
+// this an invariant of the store rather than of whoever remembered to call it,
+// and the in-memory paths — imports, tests, a future transport — go through
+// the same door.
+func representable(key, value string, checkValue bool) error {
+	if !utf8.ValidString(key) {
+		return fmt.Errorf("key is %w", ErrNotRepresentable)
+	}
+	if checkValue && !utf8.ValidString(value) {
+		return fmt.Errorf("value is %w", ErrNotRepresentable)
+	}
+	return nil
+}
 
 // WriteOptions modifies a write. The zero value is an unconditional write with
 // no expiry.
@@ -132,6 +173,28 @@ type WriteOptions struct {
 	// current version matches. A zero Version requires the key to be absent
 	// (or tombstoned/expired), which is what makes "claim this lock" work.
 	Expect *pb.Version
+}
+
+// KVEventSource says what caused a mutation, which is the first thing a
+// watcher wants to know: a local write is this process's own doing, a remote
+// one arrived from a peer, and an expiry happened on every replica at once
+// without anything being sent.
+type KVEventSource string
+
+const (
+	KVSourceLocal  KVEventSource = "local"
+	KVSourceRemote KVEventSource = "remote"
+	KVSourceExpiry KVEventSource = "expiry"
+)
+
+// KVEvent is one mutation, as it would be replicated, plus how it arrived.
+//
+// Tombstone GC deliberately raises nothing. It reclaims a key that has already
+// been invisible for as long as the configured age, so an event for it would
+// tell a watcher a key was "deleted" long after the delete it is still holding.
+type KVEvent struct {
+	Source KVEventSource `json:"source"`
+	Update pb.KVUpdate   `json:"update"`
 }
 
 // KVStore is a version-aware KV store with last-write-wins merge. Every local
@@ -145,6 +208,7 @@ type KVStore struct {
 	store    map[string]kvEntry
 	history  map[string][]HistoryEntry
 	onChange func()
+	onMutate func([]KVEvent)
 	limits   Limits
 
 	// now is overridable so expiry and GC can be tested without sleeping.
@@ -232,6 +296,34 @@ func (kv *KVStore) SetOnChange(f func()) {
 	kv.mu.Unlock()
 }
 
+// SetOnMutate registers a callback invoked (outside the lock) with every
+// mutation the store accepts, whatever caused it.
+//
+// It lives here rather than at the six call sites that mutate a store because
+// a watch that is assembled by remembering to publish is a watch that is
+// complete until the next mutation path is added. Everything that changes an
+// entry goes through this file; nothing that changes an entry can miss this.
+func (kv *KVStore) SetOnMutate(f func([]KVEvent)) {
+	kv.mu.Lock()
+	kv.onMutate = f
+	kv.mu.Unlock()
+}
+
+// mutated captures the mutation callback under the lock, for the caller to
+// invoke after unlocking — the same contract as changed.
+func (kv *KVStore) mutated() func([]KVEvent) {
+	return kv.onMutate
+}
+
+// emit delivers events to a captured callback, skipping the work entirely when
+// nobody registered one.
+func emit(f func([]KVEvent), events []KVEvent) {
+	if f == nil || len(events) == 0 {
+		return
+	}
+	f(events)
+}
+
 func (kv *KVStore) NodeID() string {
 	kv.mu.RLock()
 	defer kv.mu.RUnlock()
@@ -310,6 +402,12 @@ func (kv *KVStore) Delete(key string) pb.KVUpdate {
 }
 
 func (kv *KVStore) mutate(key, value string, remove bool, opt WriteOptions) (pb.KVUpdate, error) {
+	// Before the lock: this reads nothing the store owns, and a caller handing
+	// over bytes that cannot be replicated should not have to wait on writers
+	// to be told so.
+	if err := representable(key, value, !remove); err != nil {
+		return pb.KVUpdate{}, err
+	}
 	kv.mu.Lock()
 	now := kv.now().Unix()
 	if !remove {
@@ -343,6 +441,7 @@ func (kv *KVStore) mutate(key, value string, remove bool, opt WriteOptions) (pb.
 	kv.store[key] = e
 	kv.recordLocked(key, e, true)
 	cb := kv.changed()
+	watch := kv.mutated()
 	kv.mu.Unlock()
 	if cb != nil {
 		cb()
@@ -351,14 +450,16 @@ func (kv *KVStore) mutate(key, value string, remove bool, opt WriteOptions) (pb.
 	if remove {
 		action = pb.KVDelete
 	}
-	return pb.KVUpdate{
+	u := pb.KVUpdate{
 		Action:    action,
 		Key:       key,
 		Value:     e.Value,
 		Version:   ver,
 		ExpiresAt: e.ExpiresAt,
 		DeletedAt: e.DeletedAt,
-	}, nil
+	}
+	emit(watch, []KVEvent{{Source: KVSourceLocal, Update: u}})
+	return u, nil
 }
 
 // Apply merges a remote update under last-write-wins and reports whether it
@@ -381,6 +482,9 @@ func (kv *KVStore) Apply(u pb.KVUpdate) bool {
 //
 // A nil error with applied=false is the genuinely-stale case.
 func (kv *KVStore) ApplyWithReason(u pb.KVUpdate) (bool, error) {
+	if err := representable(u.Key, u.Value, u.Action != pb.KVDelete); err != nil {
+		return false, err
+	}
 	kv.mu.Lock()
 	if u.Version.Counter > kv.clock {
 		kv.clock = u.Version.Counter
@@ -408,10 +512,12 @@ func (kv *KVStore) ApplyWithReason(u pb.KVUpdate) (bool, error) {
 	kv.store[u.Key] = e
 	kv.recordLocked(u.Key, e, false)
 	cb := kv.changed()
+	watch := kv.mutated()
 	kv.mu.Unlock()
 	if cb != nil {
 		cb()
 	}
+	emit(watch, []KVEvent{{Source: KVSourceRemote, Update: entryUpdate(u.Key, e)}})
 	return true, nil
 }
 
@@ -722,6 +828,7 @@ func (kv *KVStore) SweepExpired() int {
 	kv.mu.Lock()
 	now := kv.now().Unix()
 	n := 0
+	var events []KVEvent
 	for k, e := range kv.store {
 		if e.Deleted || !e.expired(now) {
 			continue
@@ -731,15 +838,21 @@ func (kv *KVStore) SweepExpired() int {
 		e.DeletedAt = now
 		kv.store[k] = e
 		n++
+		if kv.onMutate != nil {
+			events = append(events, KVEvent{Source: KVSourceExpiry, Update: entryUpdate(k, e)})
+		}
 	}
 	var cb func()
+	var watch func([]KVEvent)
 	if n > 0 {
 		cb = kv.changed()
+		watch = kv.mutated()
 	}
 	kv.mu.Unlock()
 	if cb != nil {
 		cb()
 	}
+	emit(watch, events)
 	return n
 }
 

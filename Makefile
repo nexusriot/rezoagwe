@@ -29,8 +29,10 @@
 APP        := rezoagwe
 BIN_BOOT   := rezoagwe-bootstrap
 BIN_DISC   := rezoagwe-discovery
+BIN_CTL    := rezoagwectl
 PKG_BOOT   := ./cmd/bootstrap
 PKG_DISC   := ./cmd/discovery
+PKG_CTL    := ./cmd/ctl
 GO         ?= go
 VERSION    ?= 0.4.6
 # The version is injected into both binaries: renaming the output file is not
@@ -49,6 +51,9 @@ define go_build_pair
 	CGO_ENABLED=$(4) GOOS=$(1) GOARCH=$(2) $(if $(5),GOARM=$(5),) \
 		$(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(DIST_DIR)/$(BIN_DISC)-$(VERSION)-$(3)$(6) $(PKG_DISC)
 	@echo ">> $(DIST_DIR)/$(BIN_DISC)-$(VERSION)-$(3)$(6)"
+	CGO_ENABLED=$(4) GOOS=$(1) GOARCH=$(2) $(if $(5),GOARM=$(5),) \
+		$(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(DIST_DIR)/$(BIN_CTL)-$(VERSION)-$(3)$(6) $(PKG_CTL)
+	@echo ">> $(DIST_DIR)/$(BIN_CTL)-$(VERSION)-$(3)$(6)"
 endef
 
 # build_deb: $(1)=deb-arch $(2)=GOARCH $(3)=GOARM(optional)
@@ -62,7 +67,9 @@ define build_deb
 		$(GO) build -trimpath -ldflags "$(LDFLAGS)" -o "$(BUILD_DIR)/$(APP)_$(VERSION)_$(1)/usr/bin/$(BIN_BOOT)" $(PKG_BOOT)
 	CGO_ENABLED=0 GOOS=linux GOARCH=$(2) $(if $(3),GOARM=$(3),) \
 		$(GO) build -trimpath -ldflags "$(LDFLAGS)" -o "$(BUILD_DIR)/$(APP)_$(VERSION)_$(1)/usr/bin/$(BIN_DISC)" $(PKG_DISC)
-	@chmod 0755 "$(BUILD_DIR)/$(APP)_$(VERSION)_$(1)/usr/bin/$(BIN_BOOT)" "$(BUILD_DIR)/$(APP)_$(VERSION)_$(1)/usr/bin/$(BIN_DISC)"
+	CGO_ENABLED=0 GOOS=linux GOARCH=$(2) $(if $(3),GOARM=$(3),) \
+		$(GO) build -trimpath -ldflags "$(LDFLAGS)" -o "$(BUILD_DIR)/$(APP)_$(VERSION)_$(1)/usr/bin/$(BIN_CTL)" $(PKG_CTL)
+	@chmod 0755 "$(BUILD_DIR)/$(APP)_$(VERSION)_$(1)/usr/bin/$(BIN_BOOT)" "$(BUILD_DIR)/$(APP)_$(VERSION)_$(1)/usr/bin/$(BIN_DISC)" "$(BUILD_DIR)/$(APP)_$(VERSION)_$(1)/usr/bin/$(BIN_CTL)"
 	@./packaging/layout.sh "$(BUILD_DIR)/$(APP)_$(VERSION)_$(1)"
 	@sed -i "s/_version_/$(VERSION)/g" "$(BUILD_DIR)/$(APP)_$(VERSION)_$(1)/DEBIAN/control"
 	@sed -i "s/^Architecture: .*/Architecture: $(1)/" "$(BUILD_DIR)/$(APP)_$(VERSION)_$(1)/DEBIAN/control"
@@ -99,6 +106,8 @@ help:
 	@echo "  make electron-dist      - desktop deb + AppImage"
 	@echo "  make electron-clean     - remove electron/dist/ and the generated icon"
 	@echo "  make test | test-race | vet | fmt | tidy | clean"
+	@echo "  make bench              - benchmarks for the replication primitives"
+	@echo "  make fuzz               - fuzz the wire codec (FUZZTIME=5m for longer)"
 	@echo "  make e2e                - hermetic multi-node run in Docker"
 	@echo "  make chart              - re-export rezo_agwe.png from rezo_agwe.drawio"
 
@@ -195,6 +204,23 @@ test:
 test-race:
 	$(GO) test -race -count=1 ./...
 
+# Benchmarks for the primitives whose cost decides a roadmap argument:
+# anti-entropy's digest and reconcile, the consistency check's fingerprint, and
+# the whole-store copy every flush pays for.
+.PHONY: bench
+bench:
+	$(GO) test ./pkg/discovery/model/ ./pkg/proto/ -run '^$$' -bench . -benchmem
+
+# The codec is the only thing here that parses bytes chosen by somebody else,
+# on a UDP port anything on the network can reach. FUZZTIME=5m for a long run.
+FUZZTIME ?= 30s
+.PHONY: fuzz
+fuzz:
+	@for target in FuzzDecode FuzzEscapedLen FuzzDecodeWithSkew; do \
+		echo ">> $$target ($(FUZZTIME))"; \
+		$(GO) test ./pkg/proto/ -run "^$$target$$" -fuzz "^$$target$$" -fuzztime $(FUZZTIME) || exit 1; \
+	done
+
 # The unit tests run a cluster inside one process over an in-memory network,
 # which is the only way to test a partition deterministically — and the reason
 # they cannot catch anything that only goes wrong between real processes on a
@@ -213,7 +239,7 @@ chart:
 
 .PHONY: clean
 clean:
-	rm -rf $(BUILD_DIR) $(DIST_DIR) $(BIN_BOOT) $(BIN_DISC)
+	rm -rf $(BUILD_DIR) $(DIST_DIR) $(BIN_BOOT) $(BIN_DISC) $(BIN_CTL)
 	rm -rf electron/dist electron/build/icon.png electron/build/icons
 
 .PHONY: all

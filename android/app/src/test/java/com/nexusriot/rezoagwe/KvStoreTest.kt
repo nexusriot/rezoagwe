@@ -316,4 +316,57 @@ class KvStoreTest {
             noisy.fingerprint().buckets,
         )
     }
+
+    // Found on a three-node cluster of real hardware: a value holding an
+    // unpaired surrogate written on the desktop client reached the Go node as
+    // U+FFFD and this one as "?" — three different values at one version, which
+    // anti-entropy compares and is right to call agreement. Nothing can then
+    // repair it.
+    private val lone = "blob-" + '\uD800' + "-end"
+
+    @Test
+    fun refusesAValueThatCannotSurviveTheWire() {
+        val kv = KvStore("n1")
+        assertEquals(Refusal.NOT_REPRESENTABLE, kv.admit("k", lone))
+        assertNull(kv.write("k", lone))
+        assertNull("a refused value was stored anyway", kv.get("k"))
+    }
+
+    @Test
+    fun refusesAKeyThatCannotSurviveTheWire() {
+        val kv = KvStore("n1")
+        assertNull(kv.write(lone, "fine"))
+        assertTrue(kv.entries().isEmpty())
+    }
+
+    // A delete carries a key and no value, so it skips the value checks — and a
+    // mangled key tombstones a different key on every other replica.
+    @Test
+    fun refusesADeleteWithAnUnrepresentableKey() {
+        val kv = KvStore("n1")
+        assertNull(kv.remove(lone))
+        kv.write("ordinary", "v")
+        assertNotNull("an ordinary delete must still work", kv.remove("ordinary"))
+    }
+
+    @Test
+    fun refusesARemoteUpdateThatCannotSurviveTheWire() {
+        val kv = KvStore("n1")
+        val outcome = kv.applyWithReason(
+            KVUpdate(action = KVAction.SET, key = "k", value = lone, version = Version(9, "peer")),
+        )
+        assertFalse(outcome.applied)
+        assertEquals(Refusal.NOT_REPRESENTABLE, outcome.refusal)
+    }
+
+    // The refusal is about bytes that cannot arrive as they left, not about
+    // bytes that look unusual.
+    @Test
+    fun stillAcceptsAwkwardButValidValues() {
+        val kv = KvStore("n1")
+        for (value in listOf("", "plain", "h\u00e9llo", "\uD83D\uDE42", "\u65E5\u672C\u8A9E", "\u0000\u0001", "a\nb", "\uFFFD")) {
+            assertNotNull("refused ${value.toByteArray().toList()}", kv.write("k:$value", value))
+            assertEquals(value, kv.get("k:$value"))
+        }
+    }
 }

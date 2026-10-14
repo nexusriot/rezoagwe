@@ -3,13 +3,16 @@
 _Distributed key-value store with an embedded chat, written in Go —
 with Android and desktop apps that speak the same protocol._
 
-Two cooperating binaries:
+Three binaries:
 
 * **`rezoagwe-bootstrap`** — rendezvous service. Knows only the *set of
   node addresses*; never sees KV data or chat.
 * **`rezoagwe-discovery`** — full peer node. Owns a local KV replica,
   participates in chat, gossips peer membership, reconciles divergence
   with anti-entropy, and runs a `tview` TUI (or none, with `-headless`).
+* **`rezoagwectl`** — a client, not a peer. Drives a running node through its
+  HTTP gateway: it holds no replica, joins no cluster and appears in nobody's
+  peer list. Looking at a cluster should not mean becoming a member of it.
 
 A new node contacts bootstrap **once at startup** to learn the initial
 roster. From then on, peers gossip among themselves.
@@ -96,6 +99,48 @@ claiming something the protocol stopped doing.
   diagnostics error, because the two mean opposite things: one is
   last-write-wins working, the other is a replica that cannot converge
   until a limit moves
+- **Nothing is stored that cannot be replicated intact**: bodies are JSON, and
+  every JSON encoder silently replaces a byte that is not valid UTF-8 with
+  `U+FFFD` — so a binary value used to be held intact by the node that wrote it
+  and mangled on every replica, *at the same version*, which anti-entropy is
+  right to call agreement and can therefore never repair. A key fared worse: it
+  became a different key. Such a write is now refused (`422`) with the
+  workaround named, the way an unreplicably large value already was. Everything
+  valid still crosses the wire byte for byte — control characters, quotes,
+  newlines, emoji
+- **Repair** (`POST /repair`, `rezoagwectl repair`): the consistency check
+  named the keys replicas disagreed on and stopped there. This is the cure —
+  it makes one node's copy authoritative by re-stamping it, so last-write-wins
+  carries it everywhere. Which node is a judgement about the data that nothing
+  in the protocol can make, so it is an explicit operator action
+- **`-advertise auto`**: the rendezvous service is the only component that sees
+  where a node's packets really come from, and it used that address only to
+  pick a reply path. It now reports it, so a node can be told "you advertise
+  `:3137`, the cluster sees you at `10.0.0.4`" — with the exact flag value to
+  use — instead of being guessed at by a loopback heuristic. `auto` adopts it
+- **Watch**: `GET /kv?watch=1` streams every mutation as server-sent events —
+  local writes, updates merged from peers, and TTL expiries, which replicate
+  nothing and so could not be noticed any other way. The stream opens with the
+  store as it stands, taken *after* the subscription, so a write racing the
+  call is delivered rather than lost. A subscriber that falls behind is told how
+  many events it missed rather than quietly skipping them
+- **LAN discovery** (`-mdns`): find peers with no seed configured at all. The
+  node advertises itself over multicast DNS and adopts what answers in its own
+  cluster. It also stops advertising `:3137` to a LAN, which is the single most
+  common reason a cluster never forms
+- **Chat relay**: a broadcast reaches only the peers its *author* knew, and peer
+  tables are routinely asymmetric. A node that can see, from gossip, that the
+  author could not reach one of its own peers forwards the line there — but only
+  on that evidence, so a healthy mesh forwards nothing
+- **Scheduled snapshots** (`-snapshot-dir`): the state file is a replica, not a
+  backup — it is rewritten in place on every flush, so a key deleted by mistake
+  is gone from it within 250 ms. Periodic timestamped exports with rotation are
+  the backup, and `POST /snapshot` takes one before a risky change
+- **Timings, not just totals**: histograms for the gossip round, state sync and
+  stream exchanges, plus how late each gossip tick actually fired. A node whose
+  loop falls behind its peers' eviction threshold is evicted while working
+  perfectly, and every counter stays clean while it happens — the diagnostics
+  now name it
 - **Key history**: the recorded versions of a key, and who wrote each
 - Robust join: an unreachable or lossy bootstrap can't stall startup, and
   the node keeps retrying while it knows no peers; several seeds can be
@@ -144,6 +189,8 @@ make android          # debug APK into dist/
 make electron         # run the desktop client
 make electron-test    # its unit suite (a whole cluster in one process)
 make test-race        # the full test suite under the race detector
+make bench            # benchmarks for the replication primitives
+make fuzz             # fuzz the wire codec (FUZZTIME=5m for longer)
 make e2e              # hermetic multi-node run in Docker
 make help             # full list of targets
 ```
@@ -157,7 +204,9 @@ that restarts with its state file intact, one configured tighter than the rest
 so the cluster has something to disagree about, one alone in its own cluster
 with limits small enough to trip in a single request, and two strangers that
 share the network but differ in the key or the cluster name. A Go suite in a
-further container drives all of it through the HTTP gateway. Nothing is published to
+further container drives all of it through the HTTP gateway, including a watch
+stream held open against one node while another is written to — which is the
+one route whose behaviour does not exist inside a single process. Nothing is published to
 the host, no node persists anything outside its container, and the stack comes
 down whether the run passes or fails.
 
@@ -180,8 +229,8 @@ conversation twice.
 
 ### Debian packages
 
-A single `.deb` installs both `/usr/bin/rezoagwe-bootstrap` and
-`/usr/bin/rezoagwe-discovery`. `make debs` builds every architecture; to package
+A single `.deb` installs `/usr/bin/rezoagwe-bootstrap`,
+`/usr/bin/rezoagwe-discovery` and `/usr/bin/rezoagwectl`. `make debs` builds every architecture; to package
 one directly:
 
 ```
@@ -242,6 +291,35 @@ loopback:
 ./rezoagwe-discovery -bootstrap 10.0.0.9:9999 -node :3137 -advertise 10.0.0.4:3137
 ```
 
+**On one LAN, `-mdns` replaces the seeds entirely.** The node advertises itself
+over multicast DNS, adopts whatever answers in its own cluster, and — because
+`-mdns` means "I am on a LAN" — stops advertising a bare `:3137` that every
+peer would resolve to its own loopback:
+
+```
+./rezoagwe-discovery -mdns -bootstrap "" -nick alice
+./rezoagwe-discovery -mdns -bootstrap "" -node :3138 -nick bob
+```
+
+It is a convenience, not a security boundary: the cluster name in the published
+record is a hint, and a node still has to produce a valid MAC before anything
+it says is believed. Multicast does not cross subnets and is often blocked on
+guest Wi-Fi, so a cluster spanning networks still needs a rendezvous.
+
+**Back the store up on a timer.** The state file is a replica, not a backup —
+it is rewritten in place on every flush, so a key deleted by mistake is gone
+from it within 250 ms:
+
+```
+./rezoagwe-discovery -snapshot-dir /var/lib/rezoagwe/snapshots \
+    -snapshot-interval 1h -snapshot-keep 24
+```
+
+Snapshots are exports, so they carry versions: restoring one through
+`POST /import` merges it under last-write-wins rather than forcing stale data
+back over what the cluster has moved on to. `POST /import?mode=seed` is the
+other choice, and it wins.
+
 If a cluster will not form, ask the node why:
 
 ```
@@ -259,6 +337,45 @@ clusters sharing a network, but provides no secrecy.
 The flags above are the ones a first run needs. For every flag both binaries
 accept — store limits, tombstone GC, TLS, logging — see
 [DESIGN.md §15](DESIGN.md#15-command-line-reference).
+
+### `rezoagwectl`
+
+A client, not a peer. Every other front end here — the TUI, the phone, the
+desktop app — joins the cluster to look at it: it gossips, holds a replica and
+appears in everyone's peer list. `rezoagwectl` talks to a node's HTTP gateway
+and nothing else.
+
+```bash
+export REZOAGWE_SERVER=http://127.0.0.1:8080   # and REZOAGWE_TOKEN if set
+rezoagwectl put colour blue                    # prints the version it landed at
+rezoagwectl get colour
+printf 'a\nb\n' | rezoagwectl put notes       # a value from stdin
+rezoagwectl -ttl 60s put session/abc token
+rezoagwectl -if-match '*' put lock mine        # claim; exit 3 if someone has it
+rezoagwectl ls app/
+rezoagwectl watch app/                         # stream changes until Ctrl+C
+rezoagwectl peers ; rezoagwectl doctor ; rezoagwectl check
+rezoagwectl repair colour                      # make THIS node's copy win
+rezoagwectl repair -divergent                  # ...for every key the check names
+rezoagwectl export backup.json ; rezoagwectl -seed import backup.json
+rezoagwectl say "deploying now" ; rezoagwectl chat
+```
+
+Exit codes are the point of the compare-and-swap commands: **0** ok, **1**
+error, **2** no such key, **3** version mismatch, **4** replicas disagree. A
+cron job can branch on `rezoagwectl check` without reading the report, and a
+lock loop can tell "someone got there first" from "this will never work".
+
+`-json` gives machine-readable output where there is a choice; `get` prints the
+raw value with no trailing newline, so `$(rezoagwectl get k)` is the value.
+Flags work before or after the command, and a key that begins with a dash goes
+after `--`.
+
+**`repair` is the one command here that can make a cluster worse.** It
+overwrites the named keys on every replica with this node's copy. That is the
+cure for a split anti-entropy cannot resolve — two replicas holding different
+values at the same version — and a way to destroy good data if pointed at the
+wrong node. See [DESIGN.md §14.2](DESIGN.md#142-repair-the-cure-the-check-never-had).
 
 ### Desktop app
 
@@ -333,7 +450,17 @@ curl -X POST --data-binary @backup.json 'localhost:8080/import?mode=seed'
 curl localhost:8080/topology                    # the cluster as a graph
 curl 'localhost:8080/diagnostics?format=text'   # what is wrong, in prose
 curl localhost:8080/consistency                 # 409 if replicas disagree
+curl -N 'localhost:8080/kv?watch=1'             # stream every change
+curl -X POST localhost:8080/snapshot            # write a backup now
+curl -X POST -d '{"keys":["colour"]}' localhost:8080/repair   # this node's copy wins
 ```
+
+`?watch=1` turns `GET /kv` into a server-sent event stream: an opening
+`snapshot` event with the store as it stands, then a `kv` event per mutation
+carrying the update and where it came from (`local`, `remote` or `expiry`).
+Add `&prefix=` to scope it. A subscriber that falls behind gets a `dropped`
+event saying how many it missed, because a watch with a silent hole in it is
+worse than no watch.
 
 **The gateway is a write surface.** Anything that can reach the port can
 rewrite the whole cluster through `POST /import?mode=seed`, so bind it to

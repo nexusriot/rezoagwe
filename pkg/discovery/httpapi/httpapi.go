@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/nexusriot/rezoagwe/pkg/discovery/diagnostics"
 	"github.com/nexusriot/rezoagwe/pkg/discovery/model"
@@ -128,6 +129,8 @@ func (s *Server) mux() http.Handler {
 	mux.HandleFunc("POST /chat", s.handleChatPost)
 	mux.HandleFunc("GET /export", s.handleExport)
 	mux.HandleFunc("POST /import", s.handleImport)
+	mux.HandleFunc("POST /snapshot", s.handleSnapshot)
+	mux.HandleFunc("POST /repair", s.handleRepair)
 	mux.HandleFunc("GET /topology", s.handleTopology)
 	mux.HandleFunc("GET /diagnostics", s.handleDiagnostics)
 	mux.HandleFunc("GET /consistency", s.handleConsistency)
@@ -270,6 +273,53 @@ func (s *Server) handleActivity(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.node.Activity())
 }
 
+// handleRepair makes this node's copy of the named keys authoritative.
+//
+// A write surface in the strongest sense: it overwrites those keys on every
+// replica. The keys have to be named — or `?divergent=true` has to be passed,
+// which names them from this node's own consistency check — because "repair
+// everything" on the wrong node is how a cluster is overwritten with stale
+// data, and nothing in the protocol can tell which replica was right.
+func (s *Server) handleRepair(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Query().Get("divergent") == "true" {
+		consistency, repair := s.node.RepairDivergent()
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"consistency": consistency,
+			"repair":      repair,
+		})
+		return
+	}
+
+	body, ok := readBody(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		Keys []string `json:"keys"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, "malformed body: %s", err)
+		return
+	}
+	if len(req.Keys) == 0 {
+		writeErr(w, http.StatusBadRequest,
+			"name the keys to repair, or pass ?divergent=true to use this node's consistency check")
+		return
+	}
+	writeJSON(w, http.StatusOK, s.node.Repair(req.Keys))
+}
+
+// handleSnapshot writes an out-of-band snapshot, for a backup taken before a
+// risky change rather than on the timer.
+func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
+	path, err := s.node.WriteSnapshot()
+	if err != nil {
+		writeErr(w, http.StatusConflict, "%s", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"path": path})
+}
+
 func (s *Server) handleTopology(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.node.Topology())
 }
@@ -316,6 +366,10 @@ type kvItem struct {
 
 func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 	prefix := r.URL.Query().Get("prefix")
+	if watch := r.URL.Query().Get("watch"); watch != "" && watch != "0" && watch != "false" {
+		s.handleWatch(w, r, prefix)
+		return
+	}
 	entries := s.node.Entries()
 	out := make([]kvItem, 0, len(entries))
 	for _, e := range entries {
@@ -330,6 +384,98 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// watchPing is how often an idle stream writes a comment. A watch on a quiet
+// prefix is indistinguishable from a dead connection otherwise, and anything
+// between the client and the node will eventually reclaim one.
+const watchPing = 20 * time.Second
+
+// handleWatch streams store mutations as server-sent events.
+//
+// The subscription is opened *before* the baseline is read, so a write that
+// lands between the two is delivered rather than lost. That can re-send an
+// entry the snapshot already carried; every event names its version, so a
+// client discards the duplicate with a comparison it has to make anyway. The
+// other order drops the write silently, which is the bug this endpoint exists
+// to stop people writing by hand against a poll.
+func (s *Server) handleWatch(w http.ResponseWriter, r *http.Request, prefix string) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeErr(w, http.StatusInternalServerError, "streaming unsupported")
+		return
+	}
+
+	watcher := s.node.Watch(prefix)
+	defer watcher.Close()
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	// Nothing here is a byte stream a proxy should buffer up for efficiency.
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+
+	entries := s.node.Entries()
+	baseline := make([]kvItem, 0, len(entries))
+	for _, e := range entries {
+		if prefix != "" && !strings.HasPrefix(e.Key, prefix) {
+			continue
+		}
+		baseline = append(baseline, kvItem{
+			Key:       e.Key,
+			Value:     e.Value,
+			Version:   formatVersion(e.Version),
+			ExpiresAt: e.ExpiresAt,
+		})
+	}
+	if !writeEvent(w, "snapshot", baseline) {
+		return
+	}
+	flusher.Flush()
+
+	ping := time.NewTicker(watchPing)
+	defer ping.Stop()
+	ctx := r.Context()
+	// Drops are reported on the stream itself. A client told nothing cannot
+	// tell a key that did not change from one it was too slow to hear about.
+	reported := uint64(0)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev, open := <-watcher.C:
+			if !open {
+				return
+			}
+			if dropped := watcher.Dropped(); dropped > reported {
+				reported = dropped
+				if !writeEvent(w, "dropped", map[string]uint64{"events": dropped}) {
+					return
+				}
+			}
+			if !writeEvent(w, "kv", ev) {
+				return
+			}
+			flusher.Flush()
+		case <-ping.C:
+			if _, err := io.WriteString(w, ": ping\n\n"); err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}
+}
+
+// writeEvent frames one server-sent event, reporting whether the client is
+// still there.
+func writeEvent(w http.ResponseWriter, name string, v interface{}) bool {
+	payload, err := json.Marshal(v)
+	if err != nil {
+		return false
+	}
+	_, err = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", name, payload)
+	return err == nil
 }
 
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
@@ -408,6 +554,14 @@ func writeRefusal(w http.ResponseWriter, key string, err error) {
 	switch {
 	case errors.Is(err, model.ErrVersionMismatch):
 		writeErr(w, http.StatusPreconditionFailed, "version mismatch for %s", key)
+	case errors.Is(err, model.ErrNotRepresentable):
+		// 422, not 400: the request is well-formed, and the body is exactly
+		// the bytes the client meant to send. What cannot be processed is
+		// storing them — every replica would hold something else.
+		writeErr(w, http.StatusUnprocessableEntity,
+			"%s (key %q): bodies are JSON on the wire, and a byte that is not valid UTF-8 "+
+				"becomes U+FFFD on every replica while this node keeps the original. "+
+				"Encode binary values (base64) before writing them.", err, key)
 	case errors.Is(err, model.ErrUnshippable):
 		writeErr(w, http.StatusRequestEntityTooLarge,
 			"value for %s is too large to replicate: at most %d bytes once encoded",
@@ -436,7 +590,15 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	s.node.Delete(key)
+	// The result is not discarded here for the same reason it is not discarded
+	// on a PUT: a delete the store will not take is a delete that did not
+	// happen, and answering 204 tells the client otherwise. A key that is not
+	// valid UTF-8 is the case that reaches this — the tombstone would land on
+	// a different key on every replica.
+	if _, err := s.node.Delete(key); err != nil {
+		writeRefusal(w, key, err)
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -476,6 +638,16 @@ func (s *Server) handleChatPost(w http.ResponseWriter, r *http.Request) {
 	text := strings.TrimSpace(string(body))
 	if text == "" {
 		writeErr(w, http.StatusBadRequest, "empty message")
+		return
+	}
+	// Chat crosses the wire as JSON too, so the same bytes are mangled the
+	// same way (§5.9). This is the only path that can carry arbitrary ones:
+	// every other front end feeds this from a keyboard, which is UTF-8 by
+	// construction.
+	if !utf8.ValidString(text) {
+		writeErr(w, http.StatusUnprocessableEntity,
+			"message is not valid UTF-8; it would reach every peer with the invalid bytes "+
+				"replaced by U+FFFD while this node kept the original")
 		return
 	}
 	// Submit, not SendChat: the HTTP client gets the same slash commands the

@@ -10,12 +10,14 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"net"
 	"sort"
 	"sync"
 	"time"
 
 	log "github.com/sirupsen/logrus"
 
+	"github.com/nexusriot/rezoagwe/pkg/discovery/mdns"
 	"github.com/nexusriot/rezoagwe/pkg/discovery/model"
 	"github.com/nexusriot/rezoagwe/pkg/metrics"
 	pb "github.com/nexusriot/rezoagwe/pkg/proto"
@@ -84,6 +86,13 @@ type Config struct {
 	// Limits bound what the store will hold. The zero value is unbounded.
 	Limits model.Limits
 
+	// Snapshot configures periodic export to disk. The zero value disables it.
+	Snapshot SnapshotConfig
+
+	// MDNS advertises this node on the LAN and adopts the peers it finds, so a
+	// single-LAN cluster forms with no seeds configured at all.
+	MDNS bool
+
 	// Transport is injectable so tests can run a whole cluster in memory over a
 	// lossy network. Nil means real UDP + TCP on NodeAddr.
 	Transport transport.Transport
@@ -125,6 +134,33 @@ func (c *Config) applyDefaults() {
 	if c.AdvertiseAddr == "" {
 		c.AdvertiseAddr = c.NodeAddr
 	}
+	// -mdns says "I am on a LAN", and ":3137" is exactly the address that
+	// cannot be used on one: every peer resolves it to its own loopback. The
+	// mDNS record has to carry a real address to be worth publishing, so the
+	// node would otherwise be known by two names — the one it tells peers and
+	// the one it tells the LAN — and gossip would hand it its own address back
+	// as a peer it did not recognise. Observed on a real LAN: a two-node
+	// cluster in which both nodes listed themselves.
+	if c.MDNS {
+		if host, port, err := net.SplitHostPort(c.AdvertiseAddr); err == nil && unspecifiedHost(host) {
+			if local := LocalIPv4(); local != "" {
+				c.AdvertiseAddr = net.JoinHostPort(local, port)
+			}
+		}
+	}
+	if c.Snapshot.Dir != "" {
+		c.Snapshot.applyDefaults()
+	}
+}
+
+// unspecifiedHost reports whether a host part names no particular address —
+// the empty host of ":3137", or an explicit 0.0.0.0 / [::].
+func unspecifiedHost(host string) bool {
+	if host == "" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsUnspecified()
 }
 
 // Node is a running peer.
@@ -168,6 +204,20 @@ type Node struct {
 
 	rndMu sync.Mutex
 	rnd   *rand.Rand
+
+	// watchers are live subscriptions to store mutations. The engine already
+	// knew the instant a key changed and told nobody but the UI, which is why
+	// every consumer polled.
+	watchMu  sync.Mutex
+	watchers map[uint64]*Watcher
+	watchSeq uint64
+
+	// mdns is nil unless LAN discovery is enabled.
+	mdns *mdns.Server
+
+	// seen is where a rendezvous service last saw this node's packets come
+	// from, which is the one fact about a node that it cannot observe itself.
+	seen seenAt
 }
 
 // New builds a node. It does not touch the network until Start.
@@ -206,7 +256,9 @@ func New(cfg Config, ev Events) (*Node, error) {
 		strangers: make(map[string]int64),
 		chatGaps:  newChatTracker(),
 		chatSeq:   m.ChatSeq(),
+		watchers:  make(map[uint64]*Watcher),
 	}
+	m.Store.SetOnMutate(n.publishMutations)
 	// The log on disk knows how far each author had got. Without this the
 	// tracker starts blank and the first line from any author sets a fresh
 	// baseline, so anything said while this node was down is lost in silence.
@@ -219,6 +271,7 @@ func New(cfg Config, ev Events) (*Node, error) {
 			ValueBytes: n.Model.Store.ValueBytes(),
 			Clock:      n.Model.Store.Clock(),
 			UptimeSec:  int64(n.Uptime().Seconds()),
+			Watchers:   n.WatcherCount(),
 		}
 	})
 	return n, nil
@@ -249,6 +302,18 @@ func (n *Node) Start() {
 	n.loop(n.heartbeatLoop)
 	n.loop(n.evictLoop)
 	n.loop(n.sweepLoop)
+	if n.cfg.Snapshot.Dir != "" {
+		n.loop(n.snapshotLoop)
+	}
+	if n.cfg.MDNS {
+		// A LAN that will not carry multicast is a reason to run without
+		// discovery, not a reason to refuse to start: the node still has its
+		// seeds.
+		if err := n.startMDNS(); err != nil {
+			log.Errorf("lan discovery: %s", err)
+			n.logActivity("LAN discovery unavailable: %s", err)
+		}
+	}
 }
 
 func (n *Node) loop(f func()) {
@@ -400,11 +465,21 @@ func (n *Node) helloAllPeers() {
 func (n *Node) gossipLoop() {
 	t := time.NewTicker(n.cfg.GossipInterval)
 	defer t.Stop()
+	// Lateness is measured against when the tick was *due*, not against the
+	// previous tick: a ticker drops ticks rather than queueing them, so
+	// comparing consecutive arrivals hides exactly the overrun this is here to
+	// catch. A node whose round takes longer than its peers' eviction
+	// threshold is evicted while working perfectly, and until now the only
+	// evidence was a peer list that emptied for no reason.
+	due := time.Now().Add(n.cfg.GossipInterval)
 	for {
 		select {
 		case <-n.stop:
 			return
-		case <-t.C:
+		case at := <-t.C:
+			n.Metrics.GossipLate.Observe(at.Sub(due))
+			due = at.Add(n.cfg.GossipInterval)
+			started := time.Now()
 			peers := n.Model.GetNodes()
 			if len(peers) == 0 {
 				continue
@@ -425,6 +500,7 @@ func (n *Node) gossipLoop() {
 			// it appears, because most gaps are a reordering that closes on
 			// its own within milliseconds.
 			n.pullChatGaps()
+			n.Metrics.GossipRound.Observe(time.Since(started))
 		}
 	}
 }

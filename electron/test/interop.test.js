@@ -164,6 +164,43 @@ test('the Electron client joins a real Go cluster and replicates both ways', { s
   });
 
   // 6. Chat shares one vocabulary across every front end.
+  // A value that cannot cross the wire unchanged has to be refused by *both*
+  // implementations, or one of them creates a split the other cannot see.
+  //
+  // Found on a three-node cluster of real hardware: this client accepted a
+  // value holding an unpaired surrogate, the Go node stored U+FFFD and the
+  // Android node stored "?" — three values at one version, which anti-entropy
+  // compares and is right to call agreement. Worse, this client hashed the
+  // normalised form, so the consistency check reported agreement with a peer
+  // holding something else.
+  const lone = `lone-${String.fromCharCode(0xd800)}-end`;
+  assert.equal(await engine.set('corner/lone', lone, 0).then(() => 'accepted', () => 'refused'), 'refused',
+    'this client accepted a value that cannot reach a peer intact');
+  assert.equal(engine.store.get('corner/lone'), undefined, 'a refused value was stored anyway');
+
+  // And the Go node refuses the same thing through its gateway, with a status
+  // a client can act on rather than a silent success.
+  const goRefusal = await http('PUT', '/kv/corner/lone', Buffer.from('lone-\xed\xa0\x80-end', 'binary'));
+  assert.equal(goRefusal.status, 422, `the Go node answered ${goRefusal.status} for an unrepresentable value`);
+  assert.equal((await http('GET', '/kv/corner/lone')).status, 404, 'the Go node stored it anyway');
+
+  // Everything that *can* cross the wire still must, byte for byte: the
+  // refusal is about bytes that cannot arrive as they left, not unusual ones.
+  for (const [key, value] of Object.entries({
+    'corner/emoji': '🙂 ünïcödé 日本語',
+    'corner/control': '\u0000\u0001\u0002',
+    'corner/quotes': '"q" \\b\\',
+    'corner/newlines': 'one\ntwo\r\nthree',
+    'corner/replacement': '\ufffd',
+  })) {
+    await engine.set(key, value, 0);
+    // eslint-disable-next-line no-await-in-loop
+    await waitFor(`${key} to reach the Go node unchanged`, async () => {
+      const { status, text } = await http('GET', `/kv/${encodeURIComponent(key).replace(/%2F/g, '/')}`);
+      return status === 200 && text === value;
+    });
+  }
+
   await engine.submit('hello from the desktop client');
   await waitFor('the chat line to reach Go', async () => {
     const { text } = await http('GET', '/chat');

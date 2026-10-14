@@ -174,7 +174,23 @@ type ChatMessage struct {
 	// its whole conversation and having every line after it ignored as a
 	// duplicate.
 	Node string `json:"node,omitempty"`
+	// Hops counts how many peers have forwarded this line. A broadcast only
+	// ever reached the peers its *author* knew, and peer tables are routinely
+	// asymmetric — topology already reports links only one end claims — so a
+	// node the author had not yet learned about never heard the line at all.
+	// Unlike the store, chat has no digest to notice.
+	//
+	// Zero is an original broadcast, and a peer that predates this field
+	// simply does not forward. Deduplication by (author, Seq) is what stops a
+	// relayed line circulating; MaxChatHops is the backstop for when it
+	// cannot, not the primary bound.
+	Hops uint8 `json:"hops,omitempty"`
 }
+
+// MaxChatHops bounds forwarding. Three is past the diameter of any peer graph
+// gossip keeps connected: a line that has not reached a node in three
+// forwards is not going to, and something is wrong with membership instead.
+const MaxChatHops = 3
 
 // ChatPull asks a sender to re-send its own broadcasts by sequence number.
 //
@@ -495,4 +511,18 @@ type BootstrapPeer struct {
 
 type BootstrapRoster struct {
 	Peers []BootstrapPeer `json:"peers"`
+	// SeenAt is the source address the rendezvous service observed this
+	// request arriving from — the asker's own address, as the network sees it
+	// rather than as the asker believes it.
+	//
+	// It is what a node cannot work out for itself. A node bound to a wildcard
+	// knows every address its machine has and not which one its packets leave
+	// by, so "you are advertising something nobody can reach" has until now
+	// been a local guess about loopback. Bootstrap is the one component that
+	// sees the truth, and it was throwing it away.
+	//
+	// Only the host is dependable. A datagram arrives from the node's own
+	// bound socket, so the port is right too; a stream is dialled with an
+	// ephemeral source port, so the port there means nothing. Compare hosts.
+	SeenAt string `json:"seen_at,omitempty"`
 }

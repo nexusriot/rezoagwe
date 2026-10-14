@@ -94,6 +94,7 @@ data class Reconciliation(
  * ever receive — and those need opposite answers.
  */
 enum class Refusal {
+    NOT_REPRESENTABLE,
     UNSHIPPABLE,
     TOO_LARGE,
     TOO_MANY_KEYS,
@@ -102,12 +103,44 @@ enum class Refusal {
 
     /** What to tell someone looking at the screen. */
     fun explain(): String = when (this) {
+        NOT_REPRESENTABLE ->
+            "not valid text — it holds an unpaired surrogate, which every peer would " +
+                "store as something else. Encode binary values (base64) first"
         UNSHIPPABLE ->
             "too large to replicate to any peer — no setting makes a value this big travel"
         TOO_LARGE -> "larger than this node's configured value limit"
         TOO_MANY_KEYS -> "the store is at its configured key limit"
         VERSION_MISMATCH -> "the key no longer holds the expected version"
     }
+}
+
+/**
+ * Whether a string survives a round trip through the wire unchanged.
+ *
+ * Bodies are JSON and a Kotlin String is UTF-16, so it may hold an unpaired
+ * surrogate that no JSON encoder can represent. Every implementation
+ * substitutes something different for it — this one writes "?", the Go node
+ * writes U+FFFD, the desktop client keeps the original — so one write lands as
+ * three different values at the *same version*, which anti-entropy compares and
+ * is right to call agreement. Nothing can then repair it.
+ *
+ * Measured on a three-node cluster: a value written on the desktop client
+ * reached the Go node as U+FFFD and this one as "?", and the split was
+ * permanent.
+ */
+fun representable(s: String): Boolean {
+    var i = 0
+    while (i < s.length) {
+        val c = s[i]
+        if (c.isHighSurrogate()) {
+            if (i + 1 >= s.length || !s[i + 1].isLowSurrogate()) return false
+            i++
+        } else if (c.isLowSurrogate()) {
+            return false
+        }
+        i++
+    }
+    return true
 }
 
 /**
@@ -168,6 +201,11 @@ class KvStore(
      * success.
      */
     private fun admitLocked(key: String, value: String, now: Long): Refusal? {
+        // Before anything about size: a key or value that cannot cross the wire
+        // unchanged is refused outright, whatever its length. The key matters
+        // more than the value — a mangled key becomes a *different* key, so the
+        // entry exists under one name here and another everywhere else.
+        if (!representable(key) || !representable(value)) return Refusal.NOT_REPRESENTABLE
         // Measured as the value will be written on the wire, not as it sits in
         // memory: an unpaired surrogate is escaped, and a raw length check
         // would wave it through to strand itself.
@@ -249,6 +287,10 @@ class KvStore(
         val update: KVUpdate
         synchronized(lock) {
             val now = nowSec()
+            // A delete carries a key and no value, so it skips admits entirely
+            // — and a key that cannot survive the wire tombstones a different
+            // key on every other replica.
+            if (!representable(key)) return null
             if (!remove && !admits(key, value, now)) return null
             val expect = opt.expect
             if (expect != null) {

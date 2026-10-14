@@ -13,11 +13,72 @@ const {
  * receive — and those need opposite answers.
  */
 const REFUSAL = Object.freeze({
+  NOT_REPRESENTABLE: 'not-representable',
   UNSHIPPABLE: 'unshippable',
   TOO_LARGE: 'too-large',
   TOO_MANY_KEYS: 'too-many-keys',
   VERSION_MISMATCH: 'version-mismatch',
 });
+
+/**
+ * Whether a string survives a round trip through the wire unchanged.
+ *
+ * Bodies are JSON, and a JavaScript string is UTF-16: it may hold an unpaired
+ * surrogate, which no JSON encoder can represent. Every implementation
+ * substitutes something different for it — Go writes U+FFFD, the Kotlin port
+ * writes "?", and this one keeps the original — so one write lands as three
+ * different values at the *same version*, which anti-entropy compares and is
+ * right to call agreement. Nothing can then repair it.
+ *
+ * Measured on a three-node cluster: a value written here reached the Go node as
+ * U+FFFD and the Android node as "?", and the split was permanent.
+ */
+function representable(s) {
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c >= 0xd800 && c <= 0xdbff) {
+      // A high surrogate must be followed by a low one.
+      const next = s.charCodeAt(i + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return false;
+      i++;
+    } else if (c >= 0xdc00 && c <= 0xdfff) {
+      return false; // a low surrogate with nothing before it
+    }
+  }
+  return true;
+}
+
+/**
+ * The bytes a string really occupies, as WTF-8.
+ *
+ * Identical to UTF-8 for every well-formed string, which is what keeps this
+ * hash byte-for-byte equal to the Go and Kotlin ones. It differs only for an
+ * unpaired surrogate, which Buffer.from(s, 'utf8') silently replaces with
+ * U+FFFD — so a node holding one used to report the hash of a value it does
+ * not hold, and the consistency check called it agreement with a peer holding
+ * something else.
+ */
+function wtf8(s) {
+  const out = [];
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c >= 0xd800 && c <= 0xdbff) {
+      const next = s.charCodeAt(i + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        out.push(Buffer.from(s.slice(i, i + 2), 'utf8'));
+        i++;
+        continue;
+      }
+    }
+    if (c >= 0xd800 && c <= 0xdfff) {
+      // Encode the surrogate itself, as the three bytes it occupies.
+      out.push(Buffer.from([0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f)]));
+      continue;
+    }
+    out.push(Buffer.from(s[i], 'utf8'));
+  }
+  return Buffer.concat(out);
+}
 
 /**
  * Which bucket a key name folds into. The one definition, so a digest and a
@@ -100,6 +161,11 @@ class KvStore {
    * for a while owed them none at all, since a refusal came back as success.
    */
   admit(key, value, nowSec = this.nowSec()) {
+    // Before anything about size: a key or value that cannot cross the wire
+    // unchanged is refused outright, whatever its length. The key matters more
+    // than the value — a mangled key becomes a *different* key, so the entry
+    // exists under one name here and another everywhere else.
+    if (!representable(key) || !representable(value)) return REFUSAL.NOT_REPRESENTABLE;
     // Measured as the value will be written on the wire, not as it sits in
     // memory: an unpaired surrogate is escaped to six characters, and a raw
     // length check would wave it through to strand itself.
@@ -164,7 +230,10 @@ class KvStore {
    */
   static valueHash(e) {
     if (e.deleted || !e.value) return '';
-    return createHash('sha256').update(e.value, 'utf8').digest('hex');
+    // wtf8, not update(value, 'utf8'): the latter substitutes U+FFFD for an
+    // unpaired surrogate, so a node holding one reported the hash of a value it
+    // did not hold and the consistency check called that agreement.
+    return createHash('sha256').update(wtf8(e.value)).digest('hex');
   }
 
   static visible(e, nowSec) {
@@ -197,6 +266,10 @@ class KvStore {
 
   mutate(key, value, remove, opt) {
     const now = this.nowSec();
+    // A delete carries a key and no value, so it skips admit entirely — and a
+    // key that cannot survive the wire tombstones a different key on every
+    // other replica.
+    if (!representable(key)) return null;
     if (!remove && !this.admits(key, value, now)) return null;
     if (opt.expect) {
       const current = this.store.get(key);
@@ -514,4 +587,4 @@ class KvStore {
   }
 }
 
-module.exports = { KvStore, HISTORY_PER_KEY, REFUSAL, bucketOf };
+module.exports = { KvStore, HISTORY_PER_KEY, REFUSAL, bucketOf, representable, wtf8 };

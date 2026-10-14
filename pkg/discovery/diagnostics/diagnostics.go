@@ -9,6 +9,7 @@ package diagnostics
 
 import (
 	"fmt"
+	"net"
 	"sort"
 	"strings"
 	"time"
@@ -85,22 +86,31 @@ type IDConflict struct {
 // Snapshot is everything the rules read. It is a plain struct so a test can
 // fabricate any cluster condition without running one.
 type Snapshot struct {
-	Addr           string     `json:"addr"`
-	BindAddr       string     `json:"bind_addr"`
-	AdvertiseAddr  string     `json:"advertise_addr,omitempty"`
-	LocalIPv4      string     `json:"local_ipv4,omitempty"`
-	Nick           string     `json:"nick"`
-	NodeID         string     `json:"node_id"`
-	Cluster        string     `json:"cluster"`
-	KeyFingerprint string     `json:"key_fingerprint"`
-	PSKSet         bool       `json:"psk_set"`
-	Version        string     `json:"version,omitempty"`
-	UptimeSec      int64      `json:"uptime_sec"`
-	StreamListener bool       `json:"stream_listener"`
-	Seeds          []string   `json:"seeds"`
-	Peers          []Peer     `json:"peers"`
-	ChatGaps       []ChatGap  `json:"chat_gaps,omitempty"`
-	Strangers      []Stranger `json:"strangers"`
+	Addr           string `json:"addr"`
+	BindAddr       string `json:"bind_addr"`
+	AdvertiseAddr  string `json:"advertise_addr,omitempty"`
+	LocalIPv4      string `json:"local_ipv4,omitempty"`
+	Nick           string `json:"nick"`
+	NodeID         string `json:"node_id"`
+	Cluster        string `json:"cluster"`
+	KeyFingerprint string `json:"key_fingerprint"`
+	PSKSet         bool   `json:"psk_set"`
+	Version        string `json:"version,omitempty"`
+	UptimeSec      int64  `json:"uptime_sec"`
+	StreamListener bool   `json:"stream_listener"`
+	// MDNS reports whether LAN discovery is running, which changes what "no
+	// peers" means and therefore what to do about it.
+	MDNS bool `json:"mdns,omitempty"`
+	// SeenAt is where a rendezvous service observed this node's packets coming
+	// from, and AdvertiseMismatch is that address when it names a different
+	// host from the one the node advertises. Empty means they agree, or that
+	// no bootstrap has answered yet.
+	SeenAt            string     `json:"seen_at,omitempty"`
+	AdvertiseMismatch string     `json:"advertise_mismatch,omitempty"`
+	Seeds             []string   `json:"seeds"`
+	Peers             []Peer     `json:"peers"`
+	ChatGaps          []ChatGap  `json:"chat_gaps,omitempty"`
+	Strangers         []Stranger `json:"strangers"`
 	// IDConflicts are node ids seen claimed by more than one address, and
 	// Impostors peer addresses seen claiming this node's own id.
 	IDConflicts []IDConflict     `json:"id_conflicts,omitempty"`
@@ -287,9 +297,21 @@ func Checks(d Snapshot, now time.Time) []Check {
 
 	if settled && len(d.Peers) == 0 {
 		if len(d.Seeds) == 0 {
-			add(SeverityWarn, "No peers and no seeds",
-				"A node with no bootstrap seed only ever learns peers that contact it first. Give it "+
-					"-bootstrap, or run a rendezvous service and point the others at it.")
+			if d.MDNS {
+				// Telling a node that is already looking to configure a seed
+				// is advice it has taken: discovery is on and has found
+				// nothing, which is a different problem with different causes.
+				add(SeverityWarn, "LAN discovery has found nobody",
+					"Nothing on this network answered as a member of this cluster. Either no other "+
+						"node is running, or the ones that are differ in -cluster or -psk, or the "+
+						"network does not carry multicast — which is common on guest Wi-Fi and "+
+						"between subnets. A -bootstrap seed works where multicast does not.")
+			} else {
+				add(SeverityWarn, "No peers and no seeds",
+					"A node with no bootstrap seed only ever learns peers that contact it first. Give it "+
+						"-bootstrap, run a rendezvous service and point the others at it, or use -mdns "+
+						"to find them on the LAN.")
+			}
 		} else {
 			add(SeverityWarn, fmt.Sprintf("No peers learned from %d seed(s)", len(d.Seeds)),
 				fmt.Sprintf("The seeds %s answered nothing. Check the bootstrap is running, that this "+
@@ -298,7 +320,27 @@ func Checks(d Snapshot, now time.Time) []Check {
 		}
 	}
 
-	if loopback(d.Addr) {
+	// The rendezvous service is the one component that sees where this node's
+	// packets actually come from, so when it has told us, that outranks both
+	// heuristics below: they can say "that address looks wrong" and only this
+	// can say which address is right.
+	if d.AdvertiseMismatch != "" {
+		advertised := d.Addr
+		suggestion := d.AdvertiseMismatch
+		if host, _, err := net.SplitHostPort(d.AdvertiseMismatch); err == nil {
+			if _, port, err := net.SplitHostPort(d.BindAddr); err == nil {
+				// A stream is dialled from an ephemeral port, so the port
+				// observed means nothing; the port this node binds is the one
+				// peers need.
+				suggestion = net.JoinHostPort(host, port)
+			}
+		}
+		add(SeverityError, "Advertising an address the cluster does not see this node at",
+			fmt.Sprintf("Peers are told to reach this node at %s, and the rendezvous service received "+
+				"its packets from %s. Every peer resolves what it is told, so they are reaching "+
+				"somewhere else — usually their own loopback. Pass -advertise %s.",
+				advertised, d.AdvertiseMismatch, suggestion))
+	} else if loopback(d.Addr) {
 		add(SeverityWarn, "Advertising a loopback address",
 			fmt.Sprintf("Peers are told to reach this node at %s, which resolves to whichever machine "+
 				"reads it — their own. Pass -advertise with an address that routes.", d.Addr))
@@ -349,6 +391,33 @@ func Checks(d Snapshot, now time.Time) []Check {
 		add(SeverityInfo, fmt.Sprintf("%d link(s) claimed by one end only", len(one)),
 			"Gossip carries each node's own peer list, so a link either end has not yet reported "+
 				"stays unconfirmed. Normal shortly after a node joins.")
+	}
+
+	// A node whose gossip loop runs late is evicted by peers that are perfectly
+	// happy with it. This was measured on a tablet: a ~100 MB store delayed the
+	// loop past the 15 s eviction window and the phone flapped in and out of
+	// the cluster until the large keys were deleted. Nothing warned about it,
+	// because every counter in the system was clean — the node was doing all
+	// the right work, just too slowly to stay a member while doing it.
+	if late := d.Metrics.GossipLate.Max; late > 0 && d.EvictThreshold > 0 {
+		worst := time.Duration(late * float64(time.Second))
+		round := time.Duration(d.Metrics.GossipRound.Max * float64(time.Second))
+		switch {
+		case worst >= d.EvictThreshold:
+			add(SeverityError, fmt.Sprintf("Gossip ran %s late, past the %s eviction threshold",
+				worst.Round(time.Millisecond), d.EvictThreshold),
+				fmt.Sprintf("A tick this late means peers stopped hearing from this node for longer "+
+					"than they wait before evicting it, so it drops out of clusters that are working. "+
+					"The slowest round itself took %s. The usual cause is a store large enough that "+
+					"walking it delays the loop — see -max-value-bytes.",
+					round.Round(time.Millisecond)))
+		case worst >= d.EvictThreshold/2:
+			add(SeverityWarn, fmt.Sprintf("Gossip ran %s late", worst.Round(time.Millisecond)),
+				fmt.Sprintf("Peers evict after %s of silence, and the worst tick used %.0f%% of that "+
+					"budget before the round even started. The slowest round took %s.",
+					d.EvictThreshold, 100*late/d.EvictThreshold.Seconds(),
+					round.Round(time.Millisecond)))
+		}
 	}
 
 	if d.TombstoneTTL == 0 && d.Gauges.Tombstones > 0 {
@@ -426,6 +495,14 @@ func Report(d Snapshot, now time.Time) string {
 		m.AuthFailures, m.ReplayDrops, m.SkewDrops, m.MalformedDrops)
 	fmt.Fprintf(&b, "anti-entropy    %d rounds, %d pushed, %d pulled\n",
 		m.AERounds, m.AEPushed, m.AEPulled)
+	if m.GossipRound.Count > 0 {
+		fmt.Fprintf(&b, "timings         gossip round p50 %s / max %s, late max %s",
+			secs(m.GossipRound.Quantile(0.5)), secs(m.GossipRound.Max), secs(m.GossipLate.Max))
+		if m.StateSync.Count > 0 {
+			fmt.Fprintf(&b, ", state sync max %s", secs(m.StateSync.Max))
+		}
+		b.WriteString("\n")
+	}
 
 	fmt.Fprintf(&b, "\npeers (%d)\n", len(d.Peers))
 	for _, p := range d.Peers {
@@ -511,6 +588,11 @@ func loopback(addr string) bool {
 	}
 	return host == "" || host == "127.0.0.1" || host == "localhost" || host == "::1" ||
 		strings.HasPrefix(host, "127.")
+}
+
+// secs renders a duration in seconds at a readable precision.
+func secs(v float64) string {
+	return time.Duration(v * float64(time.Second)).Round(time.Millisecond).String()
 }
 
 func orNone(s string) string {

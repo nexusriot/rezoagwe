@@ -571,3 +571,137 @@ func TestStreamErrorsAreExplainedNotJustCounted(t *testing.T) {
 		}
 	}
 }
+
+// A node whose gossip loop runs late is evicted by peers that have nothing
+// against it. Every counter stays clean while it happens, which is why this
+// check reads a timing rather than a total.
+func TestGossipLatenessPastEvictionIsAnError(t *testing.T) {
+	d := healthy()
+	d.Metrics.GossipLate.Max = 18 // seconds, past the 15 s eviction threshold
+	d.Metrics.GossipRound.Max = 17
+
+	check := findCheck(t, Checks(d, now), "Gossip ran")
+	if check.Severity != SeverityError {
+		t.Errorf("severity = %q, want error", check.Severity)
+	}
+	if !strings.Contains(check.Detail, "evicting") {
+		t.Errorf("detail does not say what goes wrong: %q", check.Detail)
+	}
+}
+
+func TestGossipLatenessHalfTheBudgetIsAWarning(t *testing.T) {
+	d := healthy()
+	d.Metrics.GossipLate.Max = 9 // over half of 15 s, under the whole
+	d.Metrics.GossipRound.Max = 8
+
+	check := findCheck(t, Checks(d, now), "Gossip ran")
+	if check.Severity != SeverityWarn {
+		t.Errorf("severity = %q, want warn", check.Severity)
+	}
+}
+
+// A tick a few milliseconds late is a scheduler, not a problem.
+func TestOrdinaryGossipLatenessIsSilent(t *testing.T) {
+	d := healthy()
+	d.Metrics.GossipLate.Max = 0.002
+	d.Metrics.GossipRound.Max = 0.01
+
+	for _, c := range Checks(d, now) {
+		if strings.Contains(c.Title, "Gossip ran") {
+			t.Fatalf("a 2 ms overrun was reported: %q", c.Title)
+		}
+	}
+}
+
+func TestReportIncludesTimings(t *testing.T) {
+	d := healthy()
+	d.Metrics.GossipRound = metrics.HistogramSnapshot{
+		Bounds: []float64{0.001, 1}, Counts: []uint64{1, 0, 0}, Count: 1, Sum: 0.001, Max: 0.001,
+	}
+	d.Metrics.GossipLate.Max = 0.5
+	out := Report(d, now)
+	if !strings.Contains(out, "timings") {
+		t.Errorf("report has no timings line:\n%s", out)
+	}
+	if !strings.Contains(out, "late max 500ms") {
+		t.Errorf("report does not name the worst lateness:\n%s", out)
+	}
+}
+
+// Telling a node that is already looking on the LAN to configure a seed is
+// advice it has taken.
+func TestNoPeersWithLANDiscoverySaysSomethingUseful(t *testing.T) {
+	d := healthy()
+	d.Peers = nil
+	d.Seeds = nil
+	d.Gauges.Peers = 0
+	d.MDNS = true
+	d.Topology = topology.Build(topology.Input{SelfAddr: d.Addr, Now: now})
+
+	check := findCheck(t, Checks(d, now), "LAN discovery")
+	if check.Severity != SeverityWarn {
+		t.Errorf("severity = %q, want warn", check.Severity)
+	}
+	if strings.Contains(check.Detail, "Give it -bootstrap") {
+		t.Error("it still recommends the thing this node is replacing")
+	}
+	if !strings.Contains(check.Detail, "multicast") {
+		t.Errorf("detail does not name the usual cause: %q", check.Detail)
+	}
+}
+
+func TestNoPeersWithoutLANDiscoveryStillRecommendsSeeds(t *testing.T) {
+	d := healthy()
+	d.Peers = nil
+	d.Seeds = nil
+	d.Gauges.Peers = 0
+	d.Topology = topology.Build(topology.Input{SelfAddr: d.Addr, Now: now})
+
+	check := findCheck(t, Checks(d, now), "No peers and no seeds")
+	if !strings.Contains(check.Detail, "-mdns") {
+		t.Errorf("detail does not mention LAN discovery as an option: %q", check.Detail)
+	}
+}
+
+// The rendezvous service is the only thing that sees where a node's packets
+// really come from. When it has told us, that outranks the local heuristics —
+// they can say an address looks wrong, this one says which is right.
+func TestAnObservedAdvertiseMismatchNamesTheAddressToUse(t *testing.T) {
+	d := healthy()
+	d.Addr = "127.0.0.1:3137"
+	d.BindAddr = "127.0.0.1:3137"
+	d.SeenAt = "10.0.0.4:51234"
+	d.AdvertiseMismatch = "10.0.0.4:51234"
+
+	check := findCheck(t, Checks(d, now), "does not see this node at")
+	if check.Severity != SeverityError {
+		t.Errorf("severity = %q, want error", check.Severity)
+	}
+	// The ephemeral source port of a stream means nothing; the port the node
+	// binds is the one peers need.
+	if !strings.Contains(check.Detail, "-advertise 10.0.0.4:3137") {
+		t.Errorf("detail does not suggest the bound port: %q", check.Detail)
+	}
+	// And it must not also raise the loopback guess about the same thing.
+	mustNotFind(t, Checks(d, now), "Advertising a loopback address")
+}
+
+// Without an observation the old heuristic still has to work: most nodes never
+// reach a rendezvous service that reports one.
+func TestLoopbackIsStillCaughtWithoutAnObservation(t *testing.T) {
+	d := healthy()
+	d.Addr = "127.0.0.1:3137"
+	d.BindAddr = "127.0.0.1:3137"
+
+	check := findCheck(t, Checks(d, now), "Advertising a loopback address")
+	if check.Severity != SeverityWarn {
+		t.Errorf("severity = %q, want warn", check.Severity)
+	}
+}
+
+// Agreement is silence. A node doing the right thing must not be told off.
+func TestAnAgreeingObservationRaisesNothing(t *testing.T) {
+	d := healthy()
+	d.SeenAt = "10.0.0.1:51234"
+	mustNotFind(t, Checks(d, now), "does not see this node at")
+}

@@ -123,7 +123,7 @@ func (s *Server) packetLoop() {
 				log.Debugf("drop %s packet from %s: %s", kind, pkt.From, err)
 				continue
 			}
-			s.handle(kind, body, func(reply []byte) {
+			s.handle(kind, body, pkt.From, func(reply []byte) {
 				s.tr.Send(replyAddr(pkt.From, body, kind), reply)
 			})
 		}
@@ -174,7 +174,13 @@ func (s *Server) serveStream(conn net.Conn) {
 		log.Debugf("drop stream frame: %s", err)
 		return
 	}
-	s.handle(kind, body, func(reply []byte) {
+	// The observed address of a stream carries an ephemeral source port, which
+	// is why only its host is ever compared (see pb.BootstrapRoster.SeenAt).
+	from := ""
+	if remote := conn.RemoteAddr(); remote != nil {
+		from = remote.String()
+	}
+	s.handle(kind, body, from, func(reply []byte) {
 		if err := transport.WriteFrameTo(conn, streamTimeout, reply); err != nil {
 			log.Debugf("write stream reply: %s", err)
 		}
@@ -183,7 +189,10 @@ func (s *Server) serveStream(conn net.Conn) {
 
 // handle processes one authenticated message, calling reply with an encoded
 // response when there is one.
-func (s *Server) handle(kind pb.MessageKind, body []byte, reply func([]byte)) {
+//
+// from is the source address the transport observed, which is reported back in
+// the roster: it is the one thing about a node that only this service knows.
+func (s *Server) handle(kind pb.MessageKind, body []byte, from string, reply func([]byte)) {
 	switch kind {
 	case pb.KindBootstrapRegister:
 		var reg pb.BootstrapRegister
@@ -207,7 +216,9 @@ func (s *Server) handle(kind pb.MessageKind, body []byte, reply func([]byte)) {
 		if req.From != "" && s.Model.RegisterNode(req.From, "") {
 			s.notify()
 		}
-		pkt, err := s.codec.Encode(pb.KindBootstrapRoster, s.Model.Roster(req.From))
+		roster := s.Model.Roster(req.From)
+		roster.SeenAt = from
+		pkt, err := s.codec.Encode(pb.KindBootstrapRoster, roster)
 		if err != nil {
 			log.Errorf("encode roster: %s", err)
 			return

@@ -8,11 +8,25 @@ This complements the *Known limitations & next steps* table in
 [DESIGN.md](DESIGN.md#11-known-limitations--next-steps); each open item notes
 the code it touches.
 
+Item 1 is next. The three Tier 0 items that sat ahead of it have shipped — see
+*Unreleased* below — so the numbering is once again the whole backlog.
+
 ## Shipped
 
 The repository is at **0.4.6** — the version the Makefile stamps into the Go
 binaries and their `.deb`, the desktop client's `package.json`, and the Android
 app's `versionName`; a test keeps the four in step.
+
+Unreleased on top of it: the **Tier 0–3 round** below — eleven items — and the
+**hardware round** after it, which found that one of those eleven had only
+landed in the Go implementation. Eight
+features off the backlog, and three ahead of them that came out of reading the
+code for those eight: a data-loss defect, the cure the consistency check never
+had, and the address only the rendezvous service can see.
+
+All Go-side. The Kotlin and JavaScript ports are unchanged and remain at wire
+parity: both fields this round added are optional, and a port that ignores them
+simply does not forward a chat line and does not learn where it is seen from.
 
 0.4.6 is what a second hardware round found by running two nodes from copies
 of one state file: they diverged permanently on a shared key — neither version
@@ -55,6 +69,154 @@ the Kotlin and JavaScript ports — which had been carrying the same anti-entrop
 defect all along.
 
 Newest first.
+
+### Unreleased — the Tier 0–3 round
+
+Eleven items in one pass. Several found bugs in themselves on first contact
+with something real, which is recorded here because it is the argument for
+running a feature against a network rather than only a test.
+
+#### Tier 0 — found while reading the code for the rest
+
+**Nothing is stored that cannot be replicated intact** (§5.9). Bodies are JSON,
+and every JSON encoder silently replaces a byte that is not valid UTF-8 with
+`U+FFFD`. A binary value was therefore held intact by the node that wrote it
+and mangled on every replica, *at the same version* — so anti-entropy compared
+versions, found them equal and was right to do nothing. The consistency check
+saw it and had nothing to offer; persistence marshalled the same way, so a
+restart destroyed the last intact copy. Measured: five bytes in, eleven out.
+
+Reading further found the worse half: a *key* is mangled identically and
+becomes a different key, so the entry exists under one name here and another
+everywhere else, and a later delete tombstones only one of them. Both are
+refused now, on every path including deletes, which also turned up an
+unconditional `DELETE` that discarded the store's answer and reported `204`
+regardless — the same bug a `PUT` had before `writeRefusal` existed.
+
+The ceiling test that used invalid UTF-8 to trigger six-byte escaping was
+rewritten around control characters, which are valid, round-trip exactly and
+escape the same way — a better test of a case that is still reachable.
+
+**Repair** (§14.2). The consistency check named the keys replicas disagreed on
+and stopped there; the only remedy was a manual delete and rewrite. `POST
+/repair` re-stamps this node's copy so last-write-wins carries it everywhere,
+tombstones included — the rewrite reads the *replication* view, which is the
+only one that contains them. A key this node does not hold is reported rather
+than deleted everywhere, and the keys must be named or explicitly derived,
+because "repair everything" on the wrong replica overwrites a cluster with
+stale data and nothing in the protocol can tell which side was right. The
+end-to-end suite runs it against the §14.1 twins, after first asserting that no
+amount of anti-entropy resolves their split.
+
+**The reflexive address** (§13). `server.handle` was given the source address
+and used it only to pick a reply path — the one component that can see where a
+node's packets really come from was throwing it away, while the rule for a
+wrong `-advertise` remained a loopback heuristic that could say an address
+looked wrong and never which one was right. The roster now carries it back, the
+diagnostics name the exact flag value to use, and `-advertise auto` adopts it.
+
+Only hosts are compared: a datagram arrives from the node's own bound socket,
+but a stream is dialled from an ephemeral port, and warning about a port the
+node never claimed would be worse than silence. `auto` resolves *before* the
+node is built — `cfg.AdvertiseAddr` is read without a lock by every loop in the
+engine and is the node's identity in its own peer table, so a runtime rewrite
+would have been a race in thirty places and would have left `IsSelf` answering
+about an address the node had stopped using. Which is, exactly, how the mDNS
+work below made a two-node cluster in which both nodes listed themselves.
+
+#### Tiers 1–3
+
+**Watch** (`GET /kv?watch=1`, §16). Every consumer polled, though the engine
+knew the instant a key changed. The events are raised by `KVStore` rather than
+by the six places that mutate it, so expiry — which replicates nothing — is on
+the stream too, and a seventh mutation path cannot be added without one. The
+subscription opens before the baseline is read, so a write racing the call is
+delivered rather than lost. A subscriber that falls behind is told how many
+events it missed: a watch with a silent hole in it is trusted, which makes it
+worse than no watch.
+
+**`rezoagwectl`** — a client, not a peer. Every other front end joins the
+cluster to look at it; this one holds no replica and appears in nobody's peer
+list. Distinct exit codes (2 no such key, 3 version mismatch, 4 replicas
+disagree) are the point: a lock loop can tell "someone got there first" from
+"this will never work", and a cron job can branch on `check` without reading
+the report. `pkg/client` carries the same surface for Go callers.
+
+**LAN discovery** (`-mdns`, §17). The protocol is implemented rather than
+imported — one service type, four record types, no cache — so the dependency
+list stays at four modules. Run against a real network it immediately found a
+phone advertising a nearby-presence service and filed it as a rezoagwe node;
+collection is now scoped to our own service type, and a record without a
+`cluster=` TXT is not a match. It also exposed that a node publishing a real
+address to the LAN while telling peers `:3137` is known by two names, so gossip
+hands it its own address back: a two-node cluster in which both nodes listed
+themselves. `-mdns` now resolves a wildcard `-advertise`.
+
+**Chat relaying** (§5.8). A broadcast reached only the peers its author knew,
+and §12 has always reported that peer tables are asymmetric. The first version
+forwarded whenever it could not prove a peer had been reached, and the
+end-to-end suite caught it: one line in a four-node mesh produced ten duplicate
+deliveries. Forwarding now needs *evidence* of asymmetry from gossip, so a
+healthy mesh forwards nothing — and the repair channel is still never a source,
+because a repair that introduces a line is the failure §5.7 exists to rule out.
+
+**Timings** (§13). Every measurement here was a counter, and a counter cannot
+express a node evicted for being busy rather than gone. Histograms for the
+gossip round, state sync and stream exchanges, plus how late each tick fired
+against when it was *due* — a ticker drops ticks rather than queueing them, so
+consecutive arrivals hide exactly that overrun. The diagnostics rule compares
+the worst against `-evict`.
+
+**Snapshots** (`-snapshot-dir`, §18). The state file is a replica, not a
+backup: rewritten in place on every flush, so a mistaken delete is gone from it
+within 250 ms. Timestamped exports with rotation, and `POST /snapshot` for the
+one before a risky change.
+
+**Benchmarks and fuzzing.** There were none of either. The codec parses bytes
+from an open UDP port and had never been fed any it did not construct itself;
+three fuzz targets now cover decode, the admission size check and the
+skew/replay paths, and CI runs them on every push. The benchmarks exist to
+settle a backlog argument with a number rather than an intuition — see below.
+
+### Unreleased — the hardware round that followed
+
+A Go node, an Android tablet (PRITOM M10, Android 16) and the desktop client in
+one cluster on a real LAN. Pairing, replication, chat, consistency, topology and
+diagnostics all three ways; then corner cases. Two bugs, both in the ports, both
+from the same root.
+
+**The refusal was Go-only.** §5.9 landed in the Go store last round and nowhere
+else, so the Kotlin and JavaScript engines still accepted what the wire cannot
+carry. Written in the desktop client's own UI, a value holding an unpaired
+surrogate reached the Go node as `U+FFFD` and the tablet as `"?"` — three
+implementations, three different values, one version, which anti-entropy
+compares and is right to call agreement. Both ports now refuse it, on writes,
+deletes and remote applies, and the interop suite asserts the two agree with Go
+about which values those are.
+
+**The desktop client's fingerprint described a value it did not hold.**
+`valueHash` hashed `value` re-encoded as UTF-8, which substitutes `U+FFFD` for
+an unpaired surrogate — so it reported the same hash as the Go node while
+holding something else, and the consistency check called that agreement. The
+one tool built to find divergence was blind to this one, which is exactly what
+0.4.6 was released to fix for a different reason. It now hashes WTF-8: identical
+to UTF-8 for every well-formed string, so the three ports stay pinned byte for
+byte, and honest about the surrogate.
+
+The round then used `repair -divergent` (§14.2) to heal the three-way split it
+had created, across all three implementations, and confirmed the bytes matched
+afterwards. Everything else held: 300 KB over the stream path to both ports, TTL
+expiring independently on three replicas, a graceful leave dropped inside five
+seconds against a fifteen-second eviction window, role restore after a
+force-stop, a wrong-key stranger never admitted, and zero auth failures, chat
+gaps or lost lines throughout.
+
+Two test-harness gaps were closed on the way: both ceiling tests used unpaired
+surrogates to trigger six-byte escaping and now use control characters, which
+are valid, round-trip exactly and escape the same way; and the Android interop
+harness silently built `http://http://...` from a scheme-prefixed env var, then
+reported "the Go node never received the write" twenty seconds later when the
+truth was that nothing could ask it.
 
 ### 0.4.6 — the divergence the divergence detector could not see
 
@@ -408,18 +570,25 @@ TTL plus a renewal loop, and it turns two primitives into something usable.
 **Notes:** must be documented as a *local*-CAS lease, not a consensus lock —
 two partitions will each grant it.
 
-### 3. Watch / subscribe — **S–M**
-SSE on `/kv?watch=`, plus a change callback in the engine.
-**Why:** every consumer polls, the TUI included, though the engine knows
-exactly when a key changed. **Notes:** `ev.KVChanged()` already fires at the
-right moment and carries nothing; widening it to `KVChanged(u pb.KVUpdate)` is
-most of the work.
+### 3. Resumable watch — **M**
+A cursor a client can reconnect from, so a dropped connection does not mean a
+re-read of the whole store.
+**Why:** `?watch=1` ships, and its one honest weakness is that a subscriber
+which falls behind loses events. It is *told* how many (§16), which is the
+difference between a gap and a lie, but the events are gone — the queue is
+bounded because publishing runs on a replication path and must not block.
+**Notes:** needs a bounded per-node event log to resume from, which is most of
+the append-only-log work at 9. Do that first or do them together.
+
+### 4. Watch in the Kotlin and JavaScript ports — **S**
+The Go engine raises mutation events from the store; the other two raise
+nothing.
+**Why:** the phone and the desktop app both poll their own engines on a timer,
+which is the thing this round removed from the Go node. **Notes:** both have
+the same single-file store with the same mutation sites, so it is the same
+change twice, with no wire implications at all.
 
 ## Tier 2 — Reach
-
-### 4. mDNS / DNS-SD discovery — **S–M**
-Find peers on a LAN with no seed configured at all — the setup step most likely
-to defeat a new user, and the one the Android app feels most.
 
 ### 5. Prefix-scoped state requests — **S**
 `/kv?prefix=` filters locally after listing everything. A prefix-scoped state
@@ -435,12 +604,19 @@ already routes quitting through a `Goodbye`, so this is a tray icon and a
 
 ## Tier 3 — Security
 
-### 7. Encrypted payloads — **M–L**
+### 7. Encrypted payloads, and an encoding tag — **M–L**
 The frame is authenticated but the body is plaintext. Add AEAD — the nonce is
 already there. **Notes:** the codec change is contained; the coordination is
 not. It is a wire v3 bump across Go, Kotlin and JavaScript together, with a
 decision about whether v2 peers are refused or tolerated during a rollout.
 Sized for that, not for `codec.go`.
+
+Carry the **encoding tag** in the same bump. A value that is not valid UTF-8
+cannot cross a JSON wire intact and is now refused rather than mangled (§5.9),
+which is honest but still a refusal: a caller with bytes to store has to encode
+them. `"enc":"b64"` on `KVUpdate` would carry them. It is a one-field change
+and a three-implementation rollout, so it rides with the one already planned
+rather than spending a second one.
 
 ### 8. Per-node keys — **L**
 One shared psk means any member can impersonate any other. Per-node keypairs
@@ -452,6 +628,13 @@ with signed Hellos would close that.
 Coalescing bounded how *often* the store is rewritten; it is still rewritten
 whole each time. A log with a periodic snapshot makes a flush proportional to
 what changed, and shrinks the 250 ms a hard kill can lose.
+**Why, with a number:** `BenchmarkState` is 8.4 ms and 11.5 MB allocated at
+100k keys, paid per flush, to persist whatever changed in the last 250 ms.
+**Notes:** `writeAtomic` also never fsyncs. The rename is atomic for a reader,
+which is what the comment claims and all it claims, but a power loss can still
+lose a write the filesystem reported as durable — worth fixing in the same
+pass, and cheap. `-snapshot-dir` (§18) is the backup story and is not this:
+it answers "the disk is gone", not "the process was killed".
 
 ### 10. Merkle-tree digests — **M**
 Replace the flat per-key digest with a tree over key ranges, so reconciliation
@@ -461,6 +644,28 @@ partition. **Notes:** deliberately below the data-model work now that the
 budget clamp and per-peer cursors have fixed the convergence problem clusters
 of this size actually hit; `KVStore.Digest`/`Reconcile` isolate the comparison,
 so this swaps the summary type without touching the engine.
+
+`make bench` now puts a number on it rather than an intuition, which was the
+stated reason this was demoted from priority 1 in the first place. On one
+machine, per call:
+
+| | 100 keys | 10k | 100k |
+|---|---|---|---|
+| `Digest` (a 128-key window) | 28 µs | 1.3 ms | **16 ms** |
+| `Reconcile` | 15 µs | 0.19 ms | 2.4 ms |
+| `Fingerprint` (whole store) | 87 µs | 6.4 ms | 71 ms |
+| `State` (every flush) | 7 µs | 0.59 ms | 8.4 ms |
+
+`Digest` is the one on the gossip loop, and it is linear in the *store*, not in
+the window: producing a 128-key digest from 100k keys costs 16 ms because the
+keyspace is walked and sorted to find the window. That is still two orders of
+magnitude inside a 10 s tick, so this remains correctly ranked here — but it is
+also the shape the tree fixes, and the first thing to re-measure at a million
+keys, where 16 ms becomes 160 and the lateness rule (§13) starts firing.
+
+`Fingerprint` at 71 ms and 44 MB allocated is the expensive one, and it is
+correctly off the gossip path: the consistency check is operator-driven. It
+would need the tree too before it could run on a timer.
 
 ### 11. Backpressure on repair traffic — **S**
 `maxPush`/`maxPull` bound one round, but nothing rate-limits successive rounds;

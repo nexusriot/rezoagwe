@@ -489,3 +489,161 @@ func TestImportRefusesAnUnknownMode(t *testing.T) {
 		resp.Body.Close()
 	}
 }
+
+// A binary PUT used to answer 204 and leave the cluster permanently split:
+// this node kept the bytes, every replica got U+FFFD, and the versions matched
+// so nothing could repair it.
+func TestABinaryValueIsRefusedRatherThanMangled(t *testing.T) {
+	n, base := newGateway(t)
+
+	resp := do(t, http.MethodPut, base+"/kv/blob", "\x00\xff\xfe\x80A", nil)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "base64") {
+		t.Errorf("the refusal does not say what to do instead: %s", body)
+	}
+	if _, ok := n.Get("blob"); ok {
+		t.Error("the value was stored despite the refusal")
+	}
+}
+
+func TestABinaryKeyIsRefusedOnEveryMethod(t *testing.T) {
+	_, base := newGateway(t)
+	// %FF is not valid UTF-8 once the path is decoded.
+	for _, method := range []string{http.MethodPut, http.MethodDelete} {
+		resp := do(t, method, base+"/kv/key-%FF", "value", nil)
+		code := resp.StatusCode
+		resp.Body.Close()
+		if code != http.StatusUnprocessableEntity {
+			t.Errorf("%s with a binary key: status = %d, want 422", method, code)
+		}
+	}
+}
+
+// A delete the store will not take is a delete that did not happen; answering
+// 204 is the same bug a PUT had before writeRefusal existed.
+func TestAnUnrepresentableDeleteIsNotReportedAsDone(t *testing.T) {
+	_, base := newGateway(t)
+	resp := do(t, http.MethodDelete, base+"/kv/gone-%FF", "", nil)
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNoContent {
+		t.Error("a refused delete answered 204")
+	}
+}
+
+func TestABinaryChatMessageIsRefused(t *testing.T) {
+	n, base := newGateway(t)
+	resp := do(t, http.MethodPost, base+"/chat", "hello \xff\xfe", nil)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422", resp.StatusCode)
+	}
+	for _, e := range n.Chat() {
+		if strings.Contains(e.Text, "hello") {
+			t.Errorf("the message was sent anyway: %q", e.Text)
+		}
+	}
+}
+
+// Everything that can survive the wire must still go through unchanged — the
+// refusal is about bytes that cannot, not about bytes that look unusual.
+func TestAwkwardButValidValuesRoundTripThroughTheGateway(t *testing.T) {
+	_, base := newGateway(t)
+	for name, value := range map[string]string{
+		"emoji":    "🙂🙃",
+		"accented": "héllo",
+		"control":  "\x00\x01\x02",
+		"quotes":   `"x" \y\`,
+		"newline":  "a\nb",
+	} {
+		resp := do(t, http.MethodPut, base+"/kv/"+name, value, nil)
+		code := resp.StatusCode
+		resp.Body.Close()
+		if code != http.StatusNoContent {
+			t.Errorf("%s: PUT status = %d", name, code)
+			continue
+		}
+		read := do(t, http.MethodGet, base+"/kv/"+name, "", nil)
+		got, _ := io.ReadAll(read.Body)
+		read.Body.Close()
+		if string(got) != value {
+			t.Errorf("%s: read back % x, want % x", name, got, value)
+		}
+	}
+}
+
+func TestRepairRewritesTheNamedKeys(t *testing.T) {
+	n, base := newGateway(t)
+	if _, err := n.Set("colour", "blue", 0); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	before, _ := n.Entry("colour")
+
+	resp := do(t, http.MethodPost, base+"/repair", `{"keys":["colour"]}`, nil)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var report struct {
+		From      string `json:"from"`
+		Rewritten int    `json:"rewritten"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&report); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if report.Rewritten != 1 {
+		t.Errorf("rewrote %d keys, want 1", report.Rewritten)
+	}
+	if report.From == "" {
+		t.Error("the report does not name the node whose copy was made authoritative")
+	}
+	after, _ := n.Entry("colour")
+	if after.Version.Counter <= before.Version.Counter {
+		t.Error("the version did not advance, so nothing would win anywhere")
+	}
+}
+
+// "Repair everything" on the wrong node overwrites a cluster with stale data,
+// so the keys have to be named or explicitly derived.
+func TestRepairWithNoKeysIsRefused(t *testing.T) {
+	_, base := newGateway(t)
+	resp := do(t, http.MethodPost, base+"/repair", `{"keys":[]}`, nil)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "divergent") {
+		t.Errorf("the refusal does not mention the deliberate alternative: %s", body)
+	}
+}
+
+func TestRepairIsAWriteAndAReadOnlyGatewayRefusesIt(t *testing.T) {
+	_, base := guarded(t, Config{ReadOnly: true})
+	resp := do(t, http.MethodPost, base+"/repair", `{"keys":["colour"]}`, nil)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("status = %d, want 403", resp.StatusCode)
+	}
+}
+
+func TestRepairDivergentAnswersBothReports(t *testing.T) {
+	_, base := newGateway(t)
+	resp := do(t, http.MethodPost, base+"/repair?divergent=true", "", nil)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var out map[string]json.RawMessage
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	for _, key := range []string{"consistency", "repair"} {
+		if _, ok := out[key]; !ok {
+			t.Errorf("the answer has no %q section: %v", key, out)
+		}
+	}
+}

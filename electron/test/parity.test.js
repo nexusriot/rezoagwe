@@ -224,11 +224,18 @@ test('a value too large to replicate is refused with no limit configured', () =>
 // memory. A lone surrogate is escaped to six characters, so a string a sixth
 // of the ceiling is already at it, and a raw length check would wave it
 // through to strand itself.
+// A control character is one character held and six written — "\u0000" — so a
+// run of them a quarter of the ceiling is already over it.
+//
+// This used to be written with unpaired surrogates, which escape the same way.
+// Those are refused outright now (NOT_REPRESENTABLE), and the expansion they
+// caused was never the interesting half: a control character is perfectly
+// representable, round-trips exactly, and still sextuples.
 test('the replication ceiling counts escaped length, not raw length', () => {
   const kv = new KvStore('n1');
-  const lone = '\ud800'.repeat(Math.floor(W.MAX_REPLICABLE_VALUE_BYTES / 4));
-  assert.ok(lone.length < W.MAX_REPLICABLE_VALUE_BYTES, 'the test value is not under the ceiling raw');
-  assert.equal(kv.admit('blob', lone), REFUSAL.UNSHIPPABLE,
+  const escaping = '\u0000'.repeat(Math.floor(W.MAX_REPLICABLE_VALUE_BYTES / 4));
+  assert.ok(escaping.length < W.MAX_REPLICABLE_VALUE_BYTES, 'the test value is not under the ceiling raw');
+  assert.equal(kv.admit('blob', escaping), REFUSAL.UNSHIPPABLE,
     'a string that sextuples on the wire slipped past the ceiling');
 });
 

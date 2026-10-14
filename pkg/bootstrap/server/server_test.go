@@ -241,3 +241,53 @@ func TestStaleNodesAreDropped(t *testing.T) {
 		t.Fatalf("nodes = %d after eviction, want 0", n)
 	}
 }
+
+// The rendezvous service is the one component that sees where a node's packets
+// actually come from. It had that address all along and used it only to pick a
+// reply path; reporting it is what turns "that advertised address looks wrong"
+// into "here is the one that is right".
+func TestTheRosterReportsWhereTheAskerWasSeen(t *testing.T) {
+	net := transport.NewMemNet(1)
+	newServer(t, net, "", "")
+	alice := newClient(t, net, "10.0.0.1:3137", "")
+
+	alice.send(t, pb.KindBootstrapDiscover, pb.BootstrapDiscover{From: "10.0.0.1:3137"})
+	roster := alice.awaitRoster(t)
+
+	if roster.SeenAt != "10.0.0.1:3137" {
+		t.Errorf("SeenAt = %q, want the source address the transport observed", roster.SeenAt)
+	}
+}
+
+// A node that advertises something it is not reachable at is the failure this
+// exists for, so the reported address must be what was *observed*, never what
+// the asker claimed.
+//
+// Driven through handle directly: a datagram reply goes to the address the
+// asker claimed (see replyAddr), which in this scenario is exactly the address
+// that does not work — so there is nowhere for a reply to be received from.
+// That is not a flaw in the test, it is why discoverFromBootstrap tries the
+// stream path first, where the answer comes back on the open connection.
+func TestSeenAtIsObservedNotClaimed(t *testing.T) {
+	net := transport.NewMemNet(1)
+	s := newServer(t, net, "", "")
+
+	body, err := json.Marshal(pb.BootstrapDiscover{From: "127.0.0.1:3137"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var roster pb.BootstrapRoster
+	s.handle(pb.KindBootstrapDiscover, body, "10.0.0.1:3137", func(reply []byte) {
+		if _, err := pb.NewCodec("", "").DecodeInto(reply, &roster); err != nil {
+			t.Fatalf("decode roster: %v", err)
+		}
+	})
+
+	if roster.SeenAt == "127.0.0.1:3137" {
+		t.Error("SeenAt echoed the claim instead of reporting the observation")
+	}
+	if roster.SeenAt != "10.0.0.1:3137" {
+		t.Errorf("SeenAt = %q, want the address the packet really came from", roster.SeenAt)
+	}
+}

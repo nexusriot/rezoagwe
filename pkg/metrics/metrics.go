@@ -43,7 +43,13 @@ type Metrics struct {
 	// ChatSelfAttributed counts inbound chat claiming to be written by this
 	// node. Nothing legitimate does that.
 	ChatSelfAttributed atomic.Uint64
-	KVRejectedStale    atomic.Uint64
+	// ChatRelayed counts forwards of someone else's broadcast to a peer the
+	// author appeared not to reach, and ChatRelayCapped the lines that hit the
+	// hop limit instead — which should be none, since deduplication normally
+	// stops a line long before three hops.
+	ChatRelayed     atomic.Uint64
+	ChatRelayCapped atomic.Uint64
+	KVRejectedStale atomic.Uint64
 	// KVRefused counts remote updates this node declined to store at all —
 	// over the value limit, past the key limit, or too large to replicate.
 	// Kept apart from KVRejectedStale because they mean opposite things: a
@@ -64,6 +70,17 @@ type Metrics struct {
 	StreamErrors atomic.Uint64
 
 	HTTPRequests atomic.Uint64
+	// WatchDropped counts events a watcher was too slow to take. A watch that
+	// silently skips a key is worse than no watch at all.
+	WatchDropped atomic.Uint64
+
+	// Timings. Counters say a thing happened; these say whether it is keeping
+	// up, which is a different question and the only one that catches a node
+	// being evicted for being busy rather than for being gone.
+	GossipRound    *Histogram
+	GossipLate     *Histogram
+	StateSync      *Histogram
+	StreamExchange *Histogram
 
 	sentByKind [256]atomic.Uint64
 	recvByKind [256]atomic.Uint64
@@ -116,9 +133,19 @@ type Gauges struct {
 	ValueBytes int    `json:"value_bytes"`
 	Clock      uint64 `json:"clock"`
 	UptimeSec  int64  `json:"uptime_sec"`
+	// Watchers are open watch subscriptions, which is what makes one leaked by
+	// a client visible before it is a memory problem.
+	Watchers int `json:"watchers"`
 }
 
-func New() *Metrics { return &Metrics{} }
+func New() *Metrics {
+	return &Metrics{
+		GossipRound:    NewHistogram(),
+		GossipLate:     NewHistogram(),
+		StateSync:      NewHistogram(),
+		StreamExchange: NewHistogram(),
+	}
+}
 
 func (m *Metrics) Sent(kind pb.MessageKind, n int) {
 	if m == nil {
@@ -283,6 +310,8 @@ type Snapshot struct {
 	ChatDuplicates     uint64
 	ChatUnsolicited    uint64
 	ChatSelfAttributed uint64
+	ChatRelayed        uint64
+	ChatRelayCapped    uint64
 	KVRejectedStale    uint64
 	KVRefused          uint64
 	KVLocalWrites      uint64
@@ -299,6 +328,12 @@ type Snapshot struct {
 	StreamErrors uint64
 
 	HTTPRequests uint64
+	WatchDropped uint64
+
+	GossipRound    HistogramSnapshot `json:"gossip_round"`
+	GossipLate     HistogramSnapshot `json:"gossip_late"`
+	StateSync      HistogramSnapshot `json:"state_sync"`
+	StreamExchange HistogramSnapshot `json:"stream_exchange"`
 
 	Kinds []KindCount
 	Peers []PeerCount
@@ -327,6 +362,8 @@ func (m *Metrics) Snapshot() Snapshot {
 		ChatDuplicates:     m.ChatDuplicates.Load(),
 		ChatUnsolicited:    m.ChatUnsolicited.Load(),
 		ChatSelfAttributed: m.ChatSelfAttributed.Load(),
+		ChatRelayed:        m.ChatRelayed.Load(),
+		ChatRelayCapped:    m.ChatRelayCapped.Load(),
 		KVRejectedStale:    m.KVRejectedStale.Load(),
 		KVRefused:          m.KVRefused.Load(),
 		KVLocalWrites:      m.KVLocalWrites.Load(),
@@ -340,6 +377,11 @@ func (m *Metrics) Snapshot() Snapshot {
 		StateSyncIn:        m.StateSyncIn.Load(),
 		StreamErrors:       m.StreamErrors.Load(),
 		HTTPRequests:       m.HTTPRequests.Load(),
+		WatchDropped:       m.WatchDropped.Load(),
+		GossipRound:        m.GossipRound.Snapshot(),
+		GossipLate:         m.GossipLate.Snapshot(),
+		StateSync:          m.StateSync.Snapshot(),
+		StreamExchange:     m.StreamExchange.Snapshot(),
 	}
 	for i := 0; i < 256; i++ {
 		sent := m.sentByKind[i].Load()
@@ -431,6 +473,8 @@ func (s Snapshot) Prometheus() string {
 	counter("chat_duplicates_total", "Chat lines dropped as already held.", s.ChatDuplicates)
 	counter("chat_unsolicited_total", "Backlog lines dropped because nothing asked for them.", s.ChatUnsolicited)
 	counter("chat_self_attributed_total", "Inbound chat claiming to be written by this node.", s.ChatSelfAttributed)
+	counter("chat_relayed_total", "Chat lines forwarded to a peer the author did not appear to reach.", s.ChatRelayed)
+	counter("chat_relay_capped_total", "Chat lines not forwarded because they hit the hop limit.", s.ChatRelayCapped)
 	counter("kv_rejected_stale_total", "Remote updates rejected as not newer.", s.KVRejectedStale)
 	counter("kv_refused_total", "Remote updates refused by this node's store limits.", s.KVRefused)
 	counter("kv_local_writes_total", "Local writes and deletes.", s.KVLocalWrites)
@@ -444,6 +488,7 @@ func (s Snapshot) Prometheus() string {
 	counter("state_sync_in_total", "Snapshots received.", s.StateSyncIn)
 	counter("stream_errors_total", "Stream (TCP) failures.", s.StreamErrors)
 	counter("http_requests_total", "HTTP gateway requests.", s.HTTPRequests)
+	counter("watch_dropped_total", "Watch events dropped because a subscriber fell behind.", s.WatchDropped)
 
 	gauge := func(name, help string, v uint64) {
 		fmt.Fprintf(&b, "# HELP rezoagwe_%s %s\n", name, help)
@@ -458,6 +503,15 @@ func (s Snapshot) Prometheus() string {
 	gauge("value_bytes", "Bytes of live values currently held.", uint64(s.Gauges.ValueBytes))
 	gauge("lamport_clock", "This node's Lamport counter.", s.Gauges.Clock)
 	gauge("uptime_seconds", "Seconds since this node started.", uint64(s.Gauges.UptimeSec))
+	gauge("watchers", "Open watch subscriptions.", uint64(s.Gauges.Watchers))
+
+	s.GossipRound.prometheus(&b, "gossip_round_seconds",
+		"Time to complete one gossip tick: peer gossip, an anti-entropy round and a chat-gap pull.")
+	s.GossipLate.prometheus(&b, "gossip_lateness_seconds",
+		"How far past its interval each gossip tick actually fired.")
+	s.StateSync.prometheus(&b, "state_sync_seconds", "Time to pull a whole store from a peer.")
+	s.StreamExchange.prometheus(&b, "stream_exchange_seconds",
+		"Time for one request/response exchange over a stream.")
 
 	b.WriteString("# HELP rezoagwe_messages_total Messages by kind and direction.\n")
 	b.WriteString("# TYPE rezoagwe_messages_total counter\n")

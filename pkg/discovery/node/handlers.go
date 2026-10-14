@@ -209,6 +209,7 @@ func (n *Node) handleChat(body []byte) {
 	if !n.acceptChat(m) {
 		return
 	}
+	n.relayChat(m)
 	// Learn about a chat sender we did not know as a peer.
 	if n.Model.AddPeer(m.Sender) {
 		n.announceJoin(m.Sender, m.Nick)

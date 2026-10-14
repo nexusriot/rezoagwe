@@ -22,6 +22,9 @@ class StoreRefusal extends Error {
   /** What to tell someone looking at the screen. */
   static explain(reason) {
     switch (reason) {
+      case REFUSAL.NOT_REPRESENTABLE:
+        return 'not valid text — it holds an unpaired surrogate, which every peer '
+          + 'would store as something else. Encode binary values (base64) first';
       case REFUSAL.UNSHIPPABLE:
         return 'too large to replicate to any peer — no setting makes a value this big travel';
       case REFUSAL.TOO_LARGE:

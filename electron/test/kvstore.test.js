@@ -400,3 +400,75 @@ test('a value carried by a tombstone is not fingerprinted', () => {
   assert.deepEqual(clean.fingerprint().buckets, noisy.fingerprint().buckets,
     'a value carried by a delete made two identical tombstones look divergent');
 });
+
+// Found on a three-node cluster of real hardware: a value written here holding
+// an unpaired surrogate reached the Go node as U+FFFD and the Android node as
+// "?" — three different values at one version, which anti-entropy compares and
+// is right to call agreement. Nothing could then repair it.
+const LONE = `blob-${String.fromCharCode(0xd800)}-end`;
+
+test('a value that cannot survive the wire is refused', () => {
+  const kv = new KvStore('n1');
+  assert.equal(kv.admit('k', LONE), REFUSAL.NOT_REPRESENTABLE);
+  assert.equal(kv.write('k', LONE, {}), null);
+  assert.equal(kv.get('k'), undefined, 'a refused value was stored anyway');
+});
+
+test('a key that cannot survive the wire is refused', () => {
+  const kv = new KvStore('n1');
+  assert.equal(kv.write(LONE, 'fine', {}), null);
+  assert.equal(kv.entries().length, 0);
+});
+
+// A delete carries a key and no value, so it skips admit entirely — and a
+// mangled key tombstones a different key on every other replica.
+test('a delete with an unrepresentable key is refused', () => {
+  const kv = new KvStore('n1');
+  assert.equal(kv.remove(LONE, {}), null);
+  kv.write('ordinary', 'v', {});
+  assert.notEqual(kv.remove('ordinary', {}), null, 'an ordinary delete must still work');
+});
+
+test('a remote update that cannot survive the wire is refused', () => {
+  const kv = new KvStore('n1');
+  const res = kv.applyWithReason({
+    action: KVAction.SET, key: 'k', value: LONE, version: version(9, 'peer'),
+  });
+  assert.equal(res.applied, false);
+  assert.equal(res.refusal, REFUSAL.NOT_REPRESENTABLE);
+});
+
+// The refusal is about bytes that cannot arrive as they left, not about bytes
+// that look unusual.
+test('awkward but valid values are still accepted', () => {
+  const kv = new KvStore('n1');
+  for (const value of ['', 'plain', 'héllo', '🙂', '日本語', '\u0000\u0001', '"q" \\b\\', 'a\nb', '�']) {
+    assert.notEqual(kv.write(`k:${value}`, value, {}), null, `refused ${JSON.stringify(value)}`);
+    assert.equal(kv.get(`k:${value}`), value);
+  }
+});
+
+// The hash has to describe what this node holds. update(value, 'utf8')
+// substitutes U+FFFD for an unpaired surrogate, so a node holding one reported
+// the hash of a value it did not hold — and the check called that agreement
+// with a peer holding something else.
+test('the value hash describes what is stored, not a normalised copy', () => {
+  const { createHash } = require('node:crypto');
+  const normalised = createHash('sha256').update(LONE, 'utf8').digest('hex');
+  const faithful = KvStore.valueHash({ value: LONE, deleted: false });
+  assert.notEqual(faithful, normalised,
+    'a node holding an unpaired surrogate still reports the hash of U+FFFD');
+});
+
+// And for every value that can actually be stored, the hash is unchanged — it
+// is pinned byte for byte against the Go and Kotlin ports.
+test('the value hash is unchanged for every representable value', () => {
+  const { createHash } = require('node:crypto');
+  for (const value of ['plain', 'héllo', '🙂', '日本語', '\u0000\u0001', 'a\nb', '�']) {
+    assert.equal(
+      KvStore.valueHash({ value, deleted: false }),
+      createHash('sha256').update(value, 'utf8').digest('hex'),
+      `hash drifted for ${JSON.stringify(value)}`,
+    );
+  }
+});

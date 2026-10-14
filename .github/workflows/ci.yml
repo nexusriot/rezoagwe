@@ -51,6 +51,12 @@ jobs:
       - name: test
         run: go test -race -count=1 ./...
 
+      # The codec parses bytes chosen by whoever can reach a node's UDP port,
+      # which is the only input here nobody on this side wrote. A short run per
+      # push catches a regression; the corpus is what makes it cumulative.
+      - name: fuzz the wire codec
+        run: make fuzz FUZZTIME=40s
+
   cross-build:
     name: Cross-build
     runs-on: ubuntu-latest

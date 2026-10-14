@@ -62,16 +62,23 @@ func (n *Node) requestStateFromRandomPeer() {
 // response is not capped by the datagram size. A store or chat history larger
 // than a datagram used to sync as nothing at all: the send simply failed.
 func (n *Node) requestStateFrom(peer string) {
+	started := time.Now()
 	req := pb.StateRequest{From: n.cfg.AdvertiseAddr}
 	if n.exchangeStream(peer, pb.KindStateRequest, req) {
+		n.Metrics.StateSync.Observe(time.Since(started))
 		return
 	}
+	// The datagram fallback is fire-and-forget, so there is no round trip to
+	// time: the response arrives later on the packet loop. Timing the send
+	// would record a number that means nothing.
 	n.send(peer, pb.KindStateRequest, req)
 }
 
 // exchangeStream performs one framed request/response round trip and reports
 // whether it succeeded.
 func (n *Node) exchangeStream(peer string, kind pb.MessageKind, v interface{}) bool {
+	started := time.Now()
+	defer func() { n.Metrics.StreamExchange.Observe(time.Since(started)) }()
 	conn, err := n.tr.Dial(peer)
 	if err != nil {
 		log.Debugf("stream dial %s: %s", peer, err)
@@ -150,6 +157,7 @@ func (n *Node) discoverFromBootstrap() {
 // heard from produced a "left" for a node that had never been seen to join —
 // which reads as a node leaving twice.
 func (n *Node) applyRoster(roster pb.BootstrapRoster) {
+	n.recordSeenAt(roster.SeenAt)
 	learned := false
 	for _, p := range roster.Peers {
 		if p.Nick != "" {

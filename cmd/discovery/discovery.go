@@ -24,7 +24,7 @@ var version = "dev"
 func main() {
 	bootstrapAddr := flag.String("bootstrap", ":9999", "bootstrap address, or a comma-separated list of seeds")
 	nodeAddr := flag.String("node", ":3137", "address to bind")
-	advertise := flag.String("advertise", "", "address peers should use to reach this node (default: -node)")
+	advertise := flag.String("advertise", "", "address peers should use to reach this node; \"auto\" asks bootstrap (default: -node)")
 	nick := flag.String("nick", "anon", "chat nickname")
 	data := flag.String("data", "", "state file (default: <config dir>/rezoagwe/<node>.json; \"-\" disables)")
 	psk := flag.String("psk", "", "pre-shared key authenticating every packet")
@@ -38,6 +38,10 @@ func main() {
 	maxKeys := flag.Int("max-keys", 0, "refuse writes that would exceed this many live keys (0 disables)")
 	doctor := flag.Bool("doctor", false, "start a node, join, print a diagnostics report, then exit")
 	tombstoneTTL := flag.Duration("tombstone-ttl", 0, "reclaim tombstones older than this (0 disables GC)")
+	snapshotDir := flag.String("snapshot-dir", "", "write periodic store exports to this directory (0 disables)")
+	snapshotEvery := flag.Duration("snapshot-interval", time.Hour, "how often to write a snapshot")
+	snapshotKeep := flag.Int("snapshot-keep", 24, "how many snapshots to retain")
+	useMDNS := flag.Bool("mdns", false, "find peers on the LAN with no seeds configured")
 	headless := flag.Bool("headless", false, "run without the TUI (pair with -http to drive the node)")
 	debug := flag.Bool("debug", false, "enable debug logging (requires -logfile)")
 	logFile := flag.String("logfile", "", "write logs to this file instead of discarding them")
@@ -66,6 +70,11 @@ func main() {
 		dataPath = "" // persistence disabled
 	}
 
+	autoAdvertise := *advertise == "auto"
+	if autoAdvertise {
+		*advertise = ""
+	}
+
 	cfg := node.Config{
 		BootstrapAddrs: splitSeeds(*bootstrapAddr),
 		NodeAddr:       *nodeAddr,
@@ -77,6 +86,12 @@ func main() {
 		Version:        version,
 		TombstoneTTL:   *tombstoneTTL,
 		Limits:         model.Limits{MaxValueBytes: *maxValue, MaxKeys: *maxKeys},
+		MDNS:           *useMDNS,
+		Snapshot: node.SnapshotConfig{
+			Dir:      *snapshotDir,
+			Interval: *snapshotEvery,
+			Keep:     *snapshotKeep,
+		},
 	}
 	httpCfg := httpapi.Config{
 		Addr:     *httpAddr,
@@ -84,6 +99,22 @@ func main() {
 		TLSCert:  *httpCert,
 		TLSKey:   *httpKey,
 		ReadOnly: *httpReadOnly,
+	}
+
+	// Before anything is built: the advertised address is read without a lock
+	// by every loop in the engine and is the node's own identity in the peer
+	// table, so it has to be settled while nothing is running.
+	if autoAdvertise {
+		resolved, err := node.ResolveAdvertise(cfg, 5*time.Second)
+		switch {
+		case err != nil:
+			fmt.Fprintf(os.Stderr, "-advertise auto: %s; advertising %s instead\n", err, cfg.NodeAddr)
+		case resolved == "":
+			fmt.Fprintf(os.Stderr, "-advertise auto: no seed reported an address; advertising %s instead\n",
+				cfg.NodeAddr)
+		default:
+			cfg.AdvertiseAddr = resolved
+		}
 	}
 
 	if *doctor {

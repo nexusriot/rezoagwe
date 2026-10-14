@@ -52,7 +52,8 @@ engine calls and repaints on engine events.
 rezoagwe/
 ├── cmd/
 │   ├── bootstrap/bootstrap.go       -port/-psk/-cluster/-headless → Controller
-│   └── discovery/discovery.go       -bootstrap/-node/-advertise/-http/-doctor → Controller
+│   ├── discovery/discovery.go       -bootstrap/-node/-advertise/-http/-doctor → Controller
+│   └── ctl/ctl.go                   rezoagwectl: a client, not a peer
 │
 ├── pkg/
 │   ├── proto/
@@ -64,7 +65,11 @@ rezoagwe/
 │   │   ├── udp.go                   one shared socket for datagrams + TCP streams
 │   │   └── mem.go                   in-process network with loss/dup/delay/partitions
 │   │
-│   ├── metrics/metrics.go           counters, per-peer traffic, gauges, Prometheus
+│   ├── metrics/
+│   │   ├── metrics.go               counters, per-peer traffic, gauges, Prometheus
+│   │   └── histogram.go             timings: gossip rounds, lateness, stream exchanges
+│   │
+│   ├── client/client.go             Go client for the gateway, incl. the watch stream
 │   │
 │   ├── bootstrap/
 │   │   ├── model/model.go           roster + persistence + stale eviction
@@ -81,9 +86,15 @@ rezoagwe/
 │       ├── node/antientropy.go      digest exchange and repair
 │       ├── node/statesync.go        stream state sync + bootstrap handshake
 │       ├── node/chat.go             chat, direct messages, slash commands
+│       ├── node/chatseq.go          per-author sequencing and gap repair
+│       ├── node/chatrelay.go        forwarding to peers the author could not reach
+│       ├── node/watch.go            live subscriptions to store mutations
+│       ├── node/snapshot.go         periodic exports with rotation
+│       ├── node/mdnsjoin.go         LAN discovery wired into the peer table
 │       ├── node/consistency.go      fingerprint exchange: are the replicas equal?
 │       ├── node/diagnose.go         assembles the diagnostics snapshot
 │       ├── node/api.go              public operations (Set/CAS/Import/…)
+│       ├── mdns/                    minimal multicast DNS / DNS-SD
 │       ├── topology/topology.go     the cluster graph, from gossiped peer lists
 │       ├── diagnostics/diagnostics.go  counters → causes, as pure rules
 │       ├── httpapi/httpapi.go       REST gateway (token, TLS, read-only)
@@ -524,12 +535,109 @@ it is not retroactive: a peer that predates the field sends `Seq 0`, which
 is never gap-checked, because claiming a gap against a sender that does not
 number its lines would invent losses on every hop.
 
+### 5.8 Relaying, and the node the author never knew about
+
+The sequence in §5.7 lets a receiver notice a gap and ask the author to fill
+it. It cannot help a node the author has never heard of: that node does not
+know the author exists, so it has nothing to find a gap in.
+
+That is not a hypothetical. A broadcast goes to exactly the peers its author
+knew when it was sent, and peer tables are routinely asymmetric — §12's graph
+reports links only one end claims, which is this condition seen from outside.
+The store survives it because anti-entropy repairs whatever gossip missed.
+Chat has no digest behind it.
+
+So a node that accepts a broadcast forwards it to the peers of its own that
+the author's gossiped peer list shows the author could not reach. `Hops`
+counts the forwards and `MaxChatHops` caps them, but the cap is a backstop:
+what actually stops a line circulating is that a duplicate is recognised by
+`(author, Seq)` and dropped before it can be forwarded again.
+
+Two rules make it affordable and safe.
+
+**Forwarding needs evidence of asymmetry, not the absence of evidence of
+symmetry.** An author this node has heard no gossip from is left alone. The
+first version treated silence as "reaches nobody", which is the safe direction
+for delivery and a disaster for traffic: measured on the end-to-end cluster,
+one line in a four-node mesh produced ten duplicate deliveries, every one of
+them correctly dropped on arrival. Waiting for a view costs a window, not a
+line — a node the author has not met still learns of it through gossip, Hello
+tells it where that author's numbering stands, and the §5.7 repair asks for
+what it missed.
+
+**Only an original broadcast is relayed, never a repaired one.** The repair
+channel may only ever fill a gap that was asked for; forwarding out of it would
+make it the one path in the system that *introduces* chat into the cluster,
+which is the failure §5.7 was built to rule out.
+
+### 5.9 What the wire cannot carry
+
+Bodies are JSON, and every JSON encoder replaces a byte that is not valid
+UTF-8 with `U+FFFD`. Silently: there is no error to notice.
+
+A value of arbitrary bytes was therefore held intact by the node that wrote it
+and mangled on every replica — at the **same version**. Anti-entropy compares
+versions, finds them equal and is right to do nothing, which makes this the one
+kind of divergence no repair path can reach. The consistency check does see it,
+because the fingerprint folds a hash of the value (§14), and then has nothing
+to offer. `Persister` marshals the same way, so a restart destroyed the last
+intact copy. Measured: five bytes in, eleven bytes out.
+
+A key is worse. It is mangled the same way and the result is a *different key*:
+the entry exists under one name here and another everywhere else, and a later
+delete tombstones only one of them.
+
+So a write whose key or value is not valid UTF-8 is refused —
+`ErrNotRepresentable`, `Refusal.NOT_REPRESENTABLE`, `REFUSAL.NOT_REPRESENTABLE`,
+`422` at the gateway — for exactly the reason `ErrUnshippable` refuses a value
+too large to replicate (§8.1): storing it, reporting success and leaving the
+cluster permanently split is the alternative. The check runs on every path,
+including deletes, because a delete carries a key; and on remote updates too,
+although a JSON decoder cannot produce an invalid string, so that the invariant
+belongs to the store rather than to whoever remembered to call it.
+
+**All three implementations refuse it, and they have to.** A hardware round
+with a Go node, an Android tablet and the desktop client found that only Go did:
+a value holding an unpaired surrogate, written in the desktop client's own UI,
+reached the Go node as `U+FFFD` and the Android node as `"?"`. Three
+implementations, three different values, one version — which anti-entropy
+compares and is right to call agreement.
+
+What each language can express differs, so each port checks what it can hold. A
+Go string is arbitrary bytes, so it tests `utf8.ValidString`. A Kotlin or
+JavaScript string is UTF-16, where the only unrepresentable form is an unpaired
+surrogate, so those test for one. The three agree on every string any of them
+can hold, which is what the interop suite pins.
+
+The desktop client had a second bug behind the first: `valueHash` hashed
+`value` re-encoded as UTF-8, and that substitutes `U+FFFD` for an unpaired
+surrogate. So a node holding one reported the hash of a value it did not hold,
+and the consistency check — the one tool built to find divergence — called it
+agreement with the peer that actually held `U+FFFD`. It now hashes the WTF-8
+bytes, which are identical to UTF-8 for every well-formed string (so the three
+ports stay pinned byte for byte) and differ only for the surrogate, which is the
+truth about what it holds.
+
+Chat crosses the wire the same way and the gateway refuses an invalid message
+for the same reason. It is the only chat path that can carry arbitrary bytes:
+every other front end feeds chat from a keyboard.
+
+Nothing here refuses a value for looking unusual. Control characters, quotes,
+newlines, combining marks and emoji are all valid UTF-8, all cross the wire
+byte for byte, and all are tested doing so. What is refused is what cannot
+arrive as it left.
+
+The fix that would carry bytes rather than refuse them is an encoding tag on
+`KVUpdate` (`"enc":"b64"`). That is a wire v3 bump across three
+implementations and belongs with the AEAD work, not ahead of it.
+
 ---
 
 ## 6. Concurrency model
 
 * `KVStore` is guarded by a `sync.RWMutex`; every mutation notifies a
-  change callback *after* releasing the lock, so persistence I/O never
+  change callback — and, for watchers, a mutation callback — *after*
+  releasing the lock, so persistence I/O and a slow subscriber never
   blocks a writer.
 * Peers, nicknames and id mappings live in `sync.Map`s.
 * Each inbound datagram is handled on the transport's read goroutine;
@@ -627,7 +735,7 @@ value it holds.
 
 | Method   | Path             | Notes                                              |
 |----------|------------------|----------------------------------------------------|
-| `GET`    | `/kv`            | listing; `?prefix=` filters                        |
+| `GET`    | `/kv`            | listing; `?prefix=` filters; `?watch=1` streams changes as server-sent events (§16) |
 | `GET`    | `/kv/{key}`      | value as text; `ETag` carries the version          |
 | `PUT`    | `/kv/{key}`      | body is the value; `If-Match` makes it a CAS (`*` or an empty value mean "must be absent"), `X-Rezoagwe-TTL` sets an expiry |
 | `DELETE` | `/kv/{key}`      | `If-Match` supported                               |
@@ -642,6 +750,8 @@ value it holds.
 | `GET`    | `/topology`      | the cluster graph (§12)                            |
 | `GET`    | `/diagnostics`   | health findings; `?format=text` for a report (§13) |
 | `GET`    | `/consistency`   | asks every peer what it holds; `409` if they differ (§14) |
+| `POST`   | `/snapshot`      | write a snapshot now; `409` without `-snapshot-dir` (§18) |
+| `POST`   | `/repair`        | make this node's copy of the named keys win everywhere; `?divergent=true` takes the keys from its own consistency check (§14.2) |
 
 A write the store will not take is refused, not reported as a write. The
 result of `Set` was discarded here once, so a value over `-max-value-bytes`,
@@ -650,7 +760,11 @@ version: the client was told it had succeeded and had no way to learn
 otherwise. The three cases need different answers, and now get them —
 `413` for a value too large (for this node's limit, or for any node: see
 below), `507` when the store is at its key limit, `412` for a
-compare-and-swap that lost its race.
+compare-and-swap that lost its race, and `422` for a key or value that cannot
+cross the wire unchanged (§5.9).
+
+A `DELETE` is held to the same standard, for the same reason: a delete the
+store will not take is a delete that did not happen, and `204` says otherwise.
 
 A request body is bounded at 32 MB and a body over it is refused rather
 than truncated. `io.LimitReader` stops at the limit and reports no error,
@@ -797,19 +911,21 @@ replicates through them in both directions.
 | Area             | Limitation                                                        | Possible fix                                  |
 |------------------|-------------------------------------------------------------------|-----------------------------------------------|
 | Consistency      | Last-write-wins by wall-order, not consensus; CAS is checked locally | Raft/Paxos for a real linearizable store    |
+| Repair           | `POST /repair` (§14.2) cures a same-version divergence by making one node's copy win, but *which* node is a judgement about the data that nothing in the protocol can make. Run against the wrong replica it spreads the wrong value | Nothing automatic; the decision is the operator's |
 | Data model       | Every value is an LWW string, so concurrent writes lose data by design | Typed values: PN-counters, OR-sets       |
+| Binary values    | A value that is not valid UTF-8 cannot cross a JSON wire intact, so all three implementations refuse it rather than mangle it (§5.9). Callers with bytes to store must encode them. A node that already holds one — from a state file written before the refusal — keeps it, and reports it honestly rather than silently | An encoding tag on `KVUpdate`, with the wire v3 bump |
 | Liveness         | Heartbeat is best-effort; no quorum membership view                | Acked ping with a suspicion phase             |
 | Security         | The frame is authenticated but the body is plaintext, and one psk means any member can impersonate any other | AEAD payloads; per-node keys |
-| Bootstrap        | Seeds are static                                                   | mDNS / DNS-SD discovery on a LAN              |
+| Bootstrap        | Seeds are static, and `-mdns` only covers one LAN: multicast does not cross subnets and is commonly blocked on guest Wi-Fi | A rendezvous reachable from every subnet, which is what bootstrap already is |
 | State sync       | Pulls from one random peer, so a joiner inherits that peer's gaps  | Pull from several and merge                   |
 | Anti-entropy     | Digest is per-key, so a huge store still costs many rounds even now that each one repairs everything it covers | Merkle tree over key ranges |
-| Persistence      | A `kill -9` can lose up to 250 ms of writes, and the whole store is rewritten per flush | Append-only log + periodic snapshot |
+| Persistence      | A `kill -9` can lose up to 250 ms of writes, the whole store is rewritten per flush (measured: 8.4 ms and 11.5 MB allocated at 100k keys), and the rename is atomic for a reader but never fsynced, so a power loss can lose a write the filesystem reported as durable | Append-only log + periodic snapshot, and fsync before the rename |
 | Store limits     | `-max-value-bytes` / `-max-keys` refuse a peer's update, which is a deliberate divergence. The refusing node now counts it apart from staleness, names the limit in its activity feed and raises a diagnostics error (§5.6), and the consistency check names the keys (§14) — but the limit is still not advertised, so the peer keeps sending into a refusal for as long as both run | Advertise limits in `Hello` so a peer stops sending what this node cannot take |
-| Very large values | The protocol ceiling (§8.1) is what a frame can carry, not what a node can comfortably hold. Measured on a tablet: a store of ~100 MB delayed the gossip loop past the 15 s eviction window, so the phone flapped in and out of the cluster until the large keys were deleted. Nothing warns about this; `-max-value-bytes` is the lever and it is off by default | A size gauge in the diagnostics, and a default value limit |
+| Very large values | The protocol ceiling (§8.1) is what a frame can carry, not what a node can comfortably hold. Measured on a tablet: a store of ~100 MB delayed the gossip loop past the 15 s eviction window, so the phone flapped in and out of the cluster until the large keys were deleted. The diagnostics now name this — gossip lateness is timed and compared against the eviction threshold (§13) — but it is still a report after the fact, and `-max-value-bytes` is the lever and is off by default | A default value limit, and shedding gossip work when the loop is already behind |
 | Desktop renderer  | `app:snapshot` ships every value in full to the renderer on every tick, so one 64 MB value made the window unresponsive and a 154 MB state file on disk. The keys list only ever shows a truncated preview | Send previews, fetch a full value on demand |
 | Tombstones       | GC is age-based and off by default                                 | Track cluster-wide acknowledgement            |
-| Chat             | A dropped line is named and asked for (§5.7), but only the **author** can answer it, and only while the line is still in that node's ring — so a line lost while its author is away for longer than the ring is gone for good, and reported as such. No history beyond that ring, and no attachments | Persist chat beyond the ring; paged history |
-| Watch            | Every consumer polls, though the engine knows exactly when a key changed | SSE on `/kv?watch=`                     |
+| Chat             | A dropped line is named and asked for (§5.7), but only the **author** can answer it, and only while the line is still in that node's ring — so a line lost while its author is away for longer than the ring is gone for good, and reported as such. Relaying (§5.8) closes the window where the author never knew a node existed, but only where gossip has already shown the asymmetry. No history beyond that ring, and no attachments | Persist chat beyond the ring; paged history |
+| Watch            | A subscriber that falls behind loses events. It is told how many (§16), but the events themselves are gone — the queue is bounded because publishing runs on a replication path and must not block | A resumable stream: a cursor a client can reconnect from |
 | Android          | Runs on hardware; the battery cost of the 10 s gossip tick is still unmeasured | Measure it over a night |
 | Store limits UI  | `maxValueBytes` / `maxKeys` are constructor options in the Kotlin and JavaScript engines, but neither Settings screen exposes them; only the Go node has flags | Add the two fields to both settings screens |
 | Desktop          | Closing the window stops the node on Linux and Windows: no tray icon | Tray icon + close-to-tray                     |
@@ -877,6 +993,37 @@ What it needed that the engine did not have:
   about it: stale rejections are normal and alert on nothing, a refusal
   means this replica can never converge. It is the only finding here that
   no amount of waiting clears.
+* **A timing, not a total.** Every other input here is a counter, and a
+  counter cannot express the failure measured on a tablet: a node whose
+  gossip loop runs so far behind that its peers evict it while it is doing
+  all the right work. `metrics.Histogram` times the gossip round and, more
+  usefully, how late each tick fired against when it was *due* — a ticker
+  drops ticks rather than queueing them, so comparing consecutive arrivals
+  hides exactly the overrun this exists to catch. The rule compares the
+  worst lateness against `-evict` and says which is which: past half the
+  budget is a warning, past the whole of it is the reason the peer list
+  keeps emptying for no visible cause.
+* **The address the cluster actually sees.** A node bound to a wildcard knows
+  every address its machine has and not which one its packets leave by, so
+  until now the rule for a wrong `-advertise` was a loopback heuristic: it
+  could say an address looked wrong and never which one was right. The
+  rendezvous service is the one component that sees the truth — it had the
+  source address all along and used it only to pick a reply path — so the
+  roster now carries it back as `SeenAt`. The rule compares *hosts*: a
+  datagram arrives from the node's own bound socket, but a stream is dialled
+  from an ephemeral port, and warning about a port the node never claimed
+  would be worse than silence. A hostname that resolves to the observed
+  address is not a mismatch either. When this fires it outranks both
+  heuristics, and it names the flag value to use. `-advertise auto` adopts it
+  outright, before the node is built — `cfg.AdvertiseAddr` is read without a
+  lock by every loop and is the node's identity in its own peer table, so it
+  has to be settled while nothing is running.
+* **Whether discovery is on.** "No peers and no seeds" is sound advice to a
+  node that has none and useless to one running `-mdns`, which has taken
+  that advice and found nothing. The two have different causes — no other
+  node, a `-cluster`/`-psk` mismatch, or a network that does not carry
+  multicast — so the snapshot carries `MDNS` and the rule says the right
+  one.
 
 Findings are available three ways: `GET /diagnostics` (JSON, or
 `?format=text` for something pasteable), `D` in the TUI, and
@@ -1012,6 +1159,40 @@ otherwise silent, permanent, and invisible to the one tool built to find
 it. The remedy is in the message: stop one node and delete its state file
 so it starts with a fresh identity.
 
+### 14.2 Repair, the cure the check never had
+
+Everything above diagnoses. For a long time nothing could act: the check named
+the keys replicas disagreed on and stopped, and the only remedy was a manual
+delete and rewrite, key by key.
+
+`POST /repair` — `rezoagwectl repair` — makes this node's copy of the named
+keys authoritative. Each key is re-stamped with a fresh version from this
+node's Lamport clock and replicated, so last-write-wins carries it everywhere.
+A live value is rewritten as itself, expiry included; a tombstone is rewritten
+as a fresh tombstone, because a disagreement over whether a key was deleted is
+one worth repairing. The source of the rewrite is the replication view
+(`UpdatesFor`) rather than the read view, which is the only one that contains
+tombstones at all.
+
+Two keys are named in the design rather than inferred:
+
+* **A key this node does not hold is reported, not deleted everywhere.**
+  Deleting it would be a destructive guess about which replica was right.
+* **The keys must be named, or derived explicitly.** `?divergent=true` runs
+  the consistency check and repairs what it names, which means "make my copy
+  win wherever we disagree". That is the right move on the replica an operator
+  trusts and a way to overwrite a whole cluster with stale data on any other,
+  so it is a separate request and never the default.
+
+It is deliberately an operator action and not something anti-entropy does on
+its own. Nothing in the protocol can tell which replica was right — both hold
+the same version, which is what made the divergence unrepairable in the first
+place. That is a judgement about the data, and it needs a person.
+
+The end-to-end suite runs it against the twins of §14.1: two processes started
+from copies of one state file, split on a key at the identical version, which
+the suite first asserts no amount of anti-entropy resolves.
+
 ## 15. Command-line reference
 
 Every flag both binaries accept. The README shows the ones a first run needs;
@@ -1025,7 +1206,7 @@ in any document, and a test now fails if that happens again (§7).
 |---------------------|----------------------|---------------------------------------------------------|
 | `-bootstrap`        | `:9999`              | rendezvous address, or a comma-separated list of seeds  |
 | `-node`             | `:3137`              | address the sockets bind                                |
-| `-advertise`        | `-node`              | address peers are told to use — set this on a LAN (§13) |
+| `-advertise`        | `-node`              | address peers are told to use — set this on a LAN (§13); `auto` asks a seed where it sees this node from (§13) |
 | `-nick`             | `anon`               | chat nickname                                           |
 | `-data`             | `<config dir>/rezoagwe/<node>.json` | state file; `-` disables persistence     |
 | `-psk`              | none                 | pre-shared key authenticating every packet (§3.1)       |
@@ -1038,6 +1219,10 @@ in any document, and a test now fails if that happens again (§7).
 | `-max-value-bytes`  | `0` (unbounded)      | refuse values longer than this, from a peer or a writer |
 | `-max-keys`         | `0` (unbounded)      | refuse writes that would exceed this many live keys     |
 | `-tombstone-ttl`    | `0` (GC off)         | reclaim tombstones older than this (§5.5)               |
+| `-mdns`             | `false`              | find peers on the LAN with no seeds configured (§17)    |
+| `-snapshot-dir`     | off                  | write periodic store exports here (§18)                 |
+| `-snapshot-interval`| `1h`                 | how often to write a snapshot                           |
+| `-snapshot-keep`    | `24`                 | how many snapshots to retain; older ones are removed    |
 | `-doctor`           | `false`              | join, wait out two heartbeats, print diagnostics, exit  |
 | `-headless`         | `false`              | run without the TUI; pair with `-http` to drive it      |
 | `-debug`            | `false`              | debug logging — needs `-logfile`                        |
@@ -1072,7 +1257,113 @@ printing the key.
 
 ---
 
-## 16. Why "rezoagwe"?
+## 16. Watch
+
+`GET /kv?watch=1` streams every mutation as server-sent events. `?prefix=`
+scopes it. The stream opens with a `snapshot` event carrying the store as it
+stands, then a `kv` event per mutation and a `dropped` event when a subscriber
+has fallen behind.
+
+Three decisions carry the whole design.
+
+**The events come from the store, not from the call sites.** `KVStore` raises
+them through `SetOnMutate`, which is reached by local writes, by updates merged
+from peers and by TTL expiry — everything in `kvstore.go` that changes an
+entry. A watch assembled by remembering to publish at each of the six mutation
+sites is a watch that is complete until somebody adds a seventh. Expiry matters
+most here: it replicates nothing, because every replica applies it
+independently, so a subscriber watching messages rather than mutations would
+never learn a key had gone.
+
+Tombstone GC deliberately raises nothing. It reclaims a key that has already
+been invisible for the whole configured age, so an event for it would tell a
+subscriber a key was "deleted" long after the delete it is still holding.
+
+**The subscription opens before the baseline is read.** A write that lands
+between the two is delivered rather than lost. That can re-send an entry the
+snapshot already carried, and every event names its version, so a client
+discards the duplicate with a comparison it has to make anyway. The other
+order drops the write silently — which is the bug this route exists to stop
+people writing by hand against a poll.
+
+**A slow subscriber loses events and is told so.** The queue is bounded and
+publishing happens on whichever goroutine performed the mutation, which is a
+replication path: a watch that could block would let one stalled HTTP client
+stop a node converging. Overruns are counted per subscriber, raised on the
+stream as a `dropped` event, and exported as `rezoagwe_watch_dropped_total`.
+A watch with a silent hole in it is worse than no watch, because it is trusted.
+
+`rezoagwe_watchers` is the open subscription count, which is what makes one
+leaked by a client visible before it is a memory problem.
+
+---
+
+## 17. LAN discovery
+
+`-mdns` advertises the node over multicast DNS as `_rezoagwe._udp.local.` and
+adopts the peers that answer in the same cluster. Seeds are the setup step most
+likely to defeat a new user, and on one LAN the network can answer the question
+the seed exists to answer.
+
+`pkg/discovery/mdns` implements the protocol rather than importing it: what
+this needs is one service type, four record types and no caching, while every
+mDNS library carries a resolver, a cache and conflict resolution. Name
+compression is decoded but never written — a receiver must accept the
+uncompressed form, and a pointer that goes forward or points at itself is
+refused, because a parser that trusts them loops forever on one datagram from
+anywhere on the network.
+
+Two rules keep it honest.
+
+**Only instances under our own service type are collected.** A LAN carries mDNS
+for printers, phones and media players. Taking any SRV record that arrived put
+a stranger's address into the peer table — observed on a real network, where a
+phone advertising a nearby-presence service was collected as a rezoagwe node.
+A record without a `cluster=` TXT is not a match either: every rezoagwe node
+publishes one, and treating "unknown" as "probably ours" is the same bug.
+
+**`-mdns` resolves a wildcard `-advertise`.** A node that will publish a real
+address to the LAN must tell its peers the same one, or it is known by two
+names and gossip hands it its own address back as a peer it does not recognise
+— observed as a two-node cluster in which both nodes listed themselves. An
+explicit `-advertise` is a decision and is left alone.
+
+The cluster name in a published record is a hint, not an authentication: a node
+that lies about it still has to produce a valid MAC before anything it says is
+believed (§3.1). Filtering on it only avoids talking to nodes that would
+certainly refuse us. Multicast does not cross subnets and is commonly blocked
+on guest Wi-Fi, so a cluster spanning networks still needs a rendezvous — and
+when discovery finds nobody, the diagnostics say that rather than recommending
+the seed the operator has already decided against (§13).
+
+---
+
+## 18. Snapshots
+
+`-snapshot-dir` writes a timestamped export on a timer and keeps the newest
+`-snapshot-keep` of them; `POST /snapshot` takes one immediately.
+
+The state file is a replica, not a backup. It is rewritten in place on every
+flush, so a key deleted by mistake is gone from it within 250 ms and a store
+corrupted by a bad import is faithfully preserved. `GET /export` existed, but
+only as a pull — a node that lost its disk took whatever only it held with it
+unless somebody had remembered to call it.
+
+A snapshot is an export, so it carries versions: restoring one through
+`POST /import` merges it under last-write-wins rather than forcing stale data
+back over what the cluster has moved on to. `?mode=seed` is the other choice
+and it wins. Each file is written beside its target and renamed, so a reader
+never sees a half-written snapshot. Rotation only ever considers files matching
+the `rezoagwe-<stamp>.json` form, so a directory shared with anything else
+loses nothing; the stamp is fixed-width, so name order is time order and the
+oldest is found without stat-ing anything.
+
+A failed snapshot is logged and raised in the activity feed. A backup that
+quietly stops happening is the one you find out about when you need it.
+
+---
+
+## 19. Why "rezoagwe"?
 
 [Agwé](https://en.wikipedia.org/wiki/Agw%C3%A9) is the Haitian Vodou
 lwa of the sea — a fitting name for a protocol whose packets drift

@@ -34,7 +34,19 @@ class GoInteropTest {
     private var engine: NodeEngine? = null
 
     private val bootstrap: String? = System.getenv("REZOAGWE_GO_BOOTSTRAP")
+
+    /**
+     * The gateway as host:port. A scheme is stripped rather than rejected,
+     * because every other variable here is a bare address and pasting
+     * "http://..." produced a URL of "http://http://..." — which threw on every
+     * poll, was swallowed by the retry, and failed twenty seconds later saying
+     * the Go node never received the write. It had; nothing could ask it.
+     */
     private val goHttp: String? = System.getenv("REZOAGWE_GO_HTTP")
+        ?.removePrefix("https://")
+        ?.removePrefix("http://")
+        ?.trimEnd('/')
+        ?.ifBlank { null }
     private val psk: String = System.getenv("REZOAGWE_GO_PSK") ?: "demo"
     private val cluster: String = System.getenv("REZOAGWE_GO_CLUSTER") ?: "e2e"
 
@@ -86,11 +98,18 @@ class GoInteropTest {
 
     private fun waitFor(what: String, timeoutMs: Long = 20_000, condition: () -> Boolean) {
         val deadline = System.currentTimeMillis() + timeoutMs
+        var lastFailure: Throwable? = null
         while (System.currentTimeMillis() < deadline) {
-            if (runCatching(condition).getOrDefault(false)) return
+            val outcome = runCatching(condition)
+            if (outcome.getOrDefault(false)) return
+            // Keep the last exception: a condition that *throws* every time is
+            // a broken probe, not an unmet expectation, and reporting it as
+            // "the cluster never did X" sends you to look in the wrong place.
+            outcome.exceptionOrNull()?.let { lastFailure = it }
             Thread.sleep(50)
         }
-        throw AssertionError("timed out waiting for $what")
+        val because = lastFailure?.let { " (every check threw: $it)" } ?: ""
+        throw AssertionError("timed out waiting for $what$because")
     }
 
     private fun httpGet(path: String): String? {

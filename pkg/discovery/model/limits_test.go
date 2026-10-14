@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	pb "github.com/nexusriot/rezoagwe/pkg/proto"
 )
@@ -281,19 +282,27 @@ func TestAValueTooLargeToReplicateIsRefusedWithoutAnyLimitSet(t *testing.T) {
 }
 
 // The ceiling is measured as the value will be written, not as it sits in
-// memory. Bytes that are not valid UTF-8 become U+FFFD — six bytes each — so a
-// blob a sixth of the ceiling is already at it, and a raw length check would
-// wave it through to strand itself.
+// memory. A control character is one byte held and six written — "\u0000" —
+// so a run of them a sixth of the ceiling is already at it, and a raw length
+// check would wave it through to strand itself.
+//
+// This used to be written with bytes that are not valid UTF-8, which expand
+// the same way. Those are refused outright now (ErrNotRepresentable), and the
+// expansion they caused was never the interesting half: a control character is
+// perfectly representable, round-trips exactly, and still sextuples.
 func TestTheReplicationCeilingCountsEscapedBytes(t *testing.T) {
 	kv := NewKVStore("n1")
 
 	// Comfortably under the ceiling by raw length, far over it once encoded.
-	binary := strings.Repeat("\xff", pb.MaxReplicableValueBytes/4)
-	if len(binary) >= pb.MaxReplicableValueBytes {
+	escaping := strings.Repeat("\x00", pb.MaxReplicableValueBytes/4)
+	if len(escaping) >= pb.MaxReplicableValueBytes {
 		t.Fatal("the test value is not under the ceiling by raw length")
 	}
-	if _, err := kv.Write("blob", binary, WriteOptions{}); !errors.Is(err, ErrUnshippable) {
-		t.Fatalf("a blob that sextuples on the wire returned %v, want ErrUnshippable", err)
+	if !utf8.ValidString(escaping) {
+		t.Fatal("the test value is not valid UTF-8, so it would be refused for the wrong reason")
+	}
+	if _, err := kv.Write("blob", escaping, WriteOptions{}); !errors.Is(err, ErrUnshippable) {
+		t.Fatalf("a value that sextuples on the wire returned %v, want ErrUnshippable", err)
 	}
 }
 

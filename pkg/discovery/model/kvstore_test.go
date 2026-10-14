@@ -331,3 +331,59 @@ func keysOf(updates []pb.KVUpdate) []string {
 	}
 	return out
 }
+
+// Tombstone GC reclaims a key that has already been invisible for the whole
+// configured age. An event for it would tell a watcher a key was "deleted"
+// long after the delete it is still holding, so it raises none.
+func TestOnMutateIgnoresTombstoneGC(t *testing.T) {
+	kv := NewKVStore("A")
+	now := time.Now()
+	kv.SetClock(func() time.Time { return now })
+
+	kv.Set("colour", "blue")
+	kv.Delete("colour")
+
+	var seen []KVEvent
+	kv.SetOnMutate(func(events []KVEvent) { seen = append(seen, events...) })
+
+	now = now.Add(2 * time.Hour)
+	if gced := kv.GCTombstones(time.Hour); gced != 1 {
+		t.Fatalf("GCTombstones reclaimed %d, want 1", gced)
+	}
+	if len(seen) != 0 {
+		t.Errorf("GC raised %d event(s): %+v", len(seen), seen)
+	}
+}
+
+func TestOnMutateReportsEverySource(t *testing.T) {
+	kv := NewKVStore("A")
+	now := time.Now()
+	kv.SetClock(func() time.Time { return now })
+
+	var seen []KVEvent
+	kv.SetOnMutate(func(events []KVEvent) { seen = append(seen, events...) })
+
+	kv.Set("local", "v")
+	kv.Apply(pb.KVUpdate{Action: pb.KVSet, Key: "remote", Value: "v",
+		Version: pb.Version{Counter: 99, Node: "B"}})
+	kv.Write("ttl", "v", WriteOptions{ExpiresAt: now.Add(time.Second).Unix()})
+	now = now.Add(time.Hour)
+	kv.SweepExpired()
+
+	want := []KVEventSource{KVSourceLocal, KVSourceRemote, KVSourceLocal, KVSourceExpiry}
+	if len(seen) != len(want) {
+		t.Fatalf("saw %d events, want %d: %+v", len(seen), len(want), seen)
+	}
+	for i, src := range want {
+		if seen[i].Source != src {
+			t.Errorf("event %d source = %q, want %q", i, seen[i].Source, src)
+		}
+	}
+	// A stale apply changes nothing and must raise nothing.
+	before := len(seen)
+	kv.Apply(pb.KVUpdate{Action: pb.KVSet, Key: "remote", Value: "older",
+		Version: pb.Version{Counter: 1, Node: "B"}})
+	if len(seen) != before {
+		t.Errorf("a stale apply raised an event: %+v", seen[before:])
+	}
+}
