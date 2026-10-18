@@ -334,8 +334,8 @@ Nodes only talk to peers with the same `-cluster` **and** `-psk`. Without a
 `-psk` the framing key comes from the cluster name alone: that separates two
 clusters sharing a network, but provides no secrecy.
 
-The flags above are the ones a first run needs. For every flag both binaries
-accept — store limits, tombstone GC, TLS, logging — see
+The flags above are the ones a first run needs. For every flag all three
+binaries accept — store limits, tombstone GC, TLS, logging — see
 [DESIGN.md §15](DESIGN.md#15-command-line-reference).
 
 ### `rezoagwectl`

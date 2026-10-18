@@ -37,11 +37,18 @@ cp -r DEBIAN/ "$folder_name/"
 bin_dir="$folder_name/usr/bin"
 mkdir -p "$bin_dir"
 
+# All three binaries, the same set the Makefile's deb target ships. This script
+# built only two for as long as rezoagwectl existed, so a package made here was
+# missing the client the README says the package installs — the same drift
+# between the two packaging paths that packaging/layout.sh exists to prevent,
+# one directory up. A test now pins the two lists together.
 CGO_ENABLED=0 GOOS=linux GOARCH="$goarch" ${goarm:+GOARM=$goarm} \
   go build -trimpath -ldflags "$ldflags" -o "$bin_dir/rezoagwe-bootstrap" ./cmd/bootstrap
 CGO_ENABLED=0 GOOS=linux GOARCH="$goarch" ${goarm:+GOARM=$goarm} \
   go build -trimpath -ldflags "$ldflags" -o "$bin_dir/rezoagwe-discovery" ./cmd/discovery
-chmod 0755 "$bin_dir/rezoagwe-bootstrap" "$bin_dir/rezoagwe-discovery"
+CGO_ENABLED=0 GOOS=linux GOARCH="$goarch" ${goarm:+GOARM=$goarm} \
+  go build -trimpath -ldflags "$ldflags" -o "$bin_dir/rezoagwectl" ./cmd/ctl
+chmod 0755 "$bin_dir/rezoagwe-bootstrap" "$bin_dir/rezoagwe-discovery" "$bin_dir/rezoagwectl"
 
 ./packaging/layout.sh "$folder_name"
 

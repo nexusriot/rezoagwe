@@ -68,6 +68,46 @@ class SettingsTest {
         assertEquals("", Settings(psk = "   ").sanitized().psk)
     }
 
+    /**
+     * The port field takes digits, so a port no socket can bind is one
+     * keystroke away — and the two ways it fails are not alike. 99999 throws
+     * on bind and leaves the node stopped, which at least says so. 0 binds an
+     * ephemeral port instead, and the node advertises ":0": it still gossips
+     * outward, so its own screen reads CONNECTED with a full peer list while
+     * every peer has dropped it and bootstrap hands ":0" to each new joiner.
+     * Both are refused in favour of the port the user already had, which is
+     * what the desktop client does with the same input.
+     */
+    @Test
+    fun anImpossiblePortIsRefusedInFavourOfThePreviousOne() {
+        val previous = Settings(port = 3137, bootstrapPort = 9999)
+
+        assertEquals(3137, Settings(port = 0).sanitized(previous).port)
+        assertEquals(3137, Settings(port = 99999).sanitized(previous).port)
+        assertEquals(3137, Settings(port = -1).sanitized(previous).port)
+        assertEquals(3137, Settings(port = 65536).sanitized(previous).port)
+        assertEquals(4000, Settings(port = 4000).sanitized(previous).port)
+        assertEquals(65535, Settings(port = 65535).sanitized(previous).port)
+        assertEquals(1, Settings(port = 1).sanitized(previous).port)
+    }
+
+    /** The rendezvous port binds a socket too, so it is held to the same range. */
+    @Test
+    fun anImpossibleBootstrapPortIsRefusedToo() {
+        val previous = Settings(port = 3137, bootstrapPort = 9999)
+
+        assertEquals(9999, Settings(bootstrapPort = 0).sanitized(previous).bootstrapPort)
+        assertEquals(9999, Settings(bootstrapPort = 99999).sanitized(previous).bootstrapPort)
+        assertEquals(9000, Settings(bootstrapPort = 9000).sanitized(previous).bootstrapPort)
+    }
+
+    /** With nothing to fall back to, an impossible port lands on the default rather than being kept. */
+    @Test
+    fun withNoPreviousValueAnImpossiblePortFallsBackToTheDefault() {
+        assertEquals(Settings().port, Settings(port = 0).sanitized().port)
+        assertEquals(Settings().bootstrapPort, Settings(bootstrapPort = 70000).sanitized().bootstrapPort)
+    }
+
     @Test
     fun sanitizingIsIdempotentAndLeavesTheRestAlone() {
         val once = Settings(

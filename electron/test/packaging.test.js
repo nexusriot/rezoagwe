@@ -140,3 +140,41 @@ test('build output is ignored by git, and generated icons with it', () => {
     assert.ok(ignore.includes(pattern), `.gitignore should cover ${pattern}`);
   }
 });
+
+/**
+ * The Go side is packaged two ways as well — `make deb-<arch>` and the root
+ * `build-deb.sh` — and those two drifted: the script built bootstrap and
+ * discovery long after rezoagwectl existed, so a package made with it was
+ * missing the client the README says the package installs, while a package
+ * made with make had it. Neither path errors; you only find out by listing
+ * the .deb. This pins both to the set of commands the repository actually has.
+ */
+test('both Go packaging paths ship every binary in cmd/', () => {
+  const repo = path.join(ROOT, '..');
+  const commands = fs.readdirSync(path.join(repo, 'cmd'))
+    .filter((d) => fs.statSync(path.join(repo, 'cmd', d)).isDirectory())
+    .map((d) => `./cmd/${d}`)
+    .sort();
+  assert.ok(commands.length >= 3, `only ${commands.length} commands found under cmd/`);
+
+  const goDebScript = read('../build-deb.sh');
+  const fromScript = [...goDebScript.matchAll(/go build [^\n]*?(\.\/cmd\/\w+)/g)].map((m) => m[1]).sort();
+  assert.deepEqual(fromScript, commands,
+    'build-deb.sh does not build every command in cmd/');
+
+  // The Makefile reaches them through PKG_* variables, so resolve those first.
+  const vars = new Map(
+    [...rootMakefile.matchAll(/^(PKG_\w+)\s*:?=\s*(\S+)/gm)].map((m) => [m[1], m[2]]),
+  );
+  const buildDeb = rootMakefile.slice(
+    rootMakefile.indexOf('define build_deb'),
+    rootMakefile.indexOf('endef', rootMakefile.indexOf('define build_deb')),
+  );
+  assert.ok(buildDeb.length > 200, 'the Makefile no longer defines build_deb');
+  const fromMake = [...buildDeb.matchAll(/\$\((PKG_\w+)\)/g)]
+    .map((m) => vars.get(m[1]))
+    .filter(Boolean)
+    .sort();
+  assert.deepEqual([...new Set(fromMake)], commands,
+    'the Makefile deb target does not build every command in cmd/');
+});

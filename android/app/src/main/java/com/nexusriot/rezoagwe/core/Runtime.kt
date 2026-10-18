@@ -35,13 +35,25 @@ data class Settings(
      * "e2e" into the cluster field stores "e2e ". Trimming here rather than at
      * each call site is the point — the seeds and the advertised host were
      * already trimmed, and the two fields that mattered most were not.
+     *
+     * A port outside 1..65535 is refused the same way, in favour of the value
+     * the user already had. The field accepts digits, so "99999" is reachable
+     * by one keystroke, and neither end of the range fails usefully: binding
+     * 99999 throws and leaves the node stopped, while 0 binds an *ephemeral*
+     * port and the node then advertises ":0" — an address no peer can dial. It
+     * still gossips outward, so its own screen reports CONNECTED with a full
+     * peer list while every other node has dropped it, and the ":0" it
+     * registers is handed to each new joiner by bootstrap. Refusing the value
+     * is the only answer that cannot be misread.
      */
     fun sanitized(fallback: Settings = Settings()): Settings = copy(
         nick = nick.trim().ifBlank { fallback.nick },
+        port = port.takeIf { it in VALID_PORTS } ?: fallback.port,
         advertiseHost = advertiseHost.trim(),
         seeds = seeds.trim(),
         psk = psk.trim(),
         cluster = cluster.trim().ifBlank { fallback.cluster },
+        bootstrapPort = bootstrapPort.takeIf { it in VALID_PORTS } ?: fallback.bootstrapPort,
     )
 
     fun toNodeConfig() = NodeConfig(
@@ -59,6 +71,11 @@ data class Settings(
         psk = psk,
         cluster = cluster,
     )
+
+    companion object {
+        /** What a socket can actually bind. Port 0 is excluded: see [sanitized]. */
+        val VALID_PORTS = 1..65535
+    }
 }
 
 private const val PREFS = "rezoagwe"
@@ -80,6 +97,11 @@ private const val KEY_NODE_WANTED = "nodeWanted"
 private const val KEY_BOOTSTRAP_WANTED = "bootstrapWanted"
 
 object SettingsStore {
+    /**
+     * Preferences written by an older build — or by a build that did not yet
+     * range-check the port — are repaired on the way in rather than trusted,
+     * so a value that can never bind cannot outlive the version that stored it.
+     */
     fun load(context: Context): Settings {
         val p = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val defaults = Settings()
@@ -92,7 +114,7 @@ object SettingsStore {
             cluster = p.getString("cluster", defaults.cluster)!!,
             bootstrapPort = p.getInt("bootstrapPort", defaults.bootstrapPort),
             tombstoneTtlSec = p.getLong("tombstoneTtlSec", defaults.tombstoneTtlSec),
-        )
+        ).sanitized()
     }
 
     fun save(context: Context, s: Settings) {

@@ -12,7 +12,7 @@ For end-user documentation see [README.md](README.md).
 ## 1. High-level overview
 
 `rezoagwe` is a **distributed key-value store with an embedded chat**. It
-consists of two binaries plus two applications:
+consists of three binaries plus two applications:
 
 * **bootstrap** — a rendezvous service that helps new nodes find the
   existing cluster. It only knows about the *set of node addresses*; it
@@ -20,6 +20,10 @@ consists of two binaries plus two applications:
 * **discovery** — a full peer node. It owns a local copy of the KV store,
   participates in chat, gossips peer membership, reconciles divergence
   with anti-entropy, and replicates writes to every peer it knows about.
+* **ctl** (`rezoagwectl`) — a client, not a peer. It drives a running node
+  through that node's HTTP gateway (§8); it holds no replica, joins no
+  cluster and appears in nobody's peer list. Looking at a cluster should
+  not mean becoming a member of it.
 * **android/** — a Kotlin port of both roles with a Compose UI (§9).
 * **electron/** — a JavaScript port of both roles with a desktop UI (§10).
 
@@ -1195,7 +1199,7 @@ the suite first asserts no amount of anti-entropy resolves.
 
 ## 15. Command-line reference
 
-Every flag both binaries accept. The README shows the ones a first run needs;
+Every flag all three binaries accept. The README shows the ones a first run needs;
 this is the whole surface, because a flag documented nowhere is a flag nobody
 finds — `-timeout` and `-version` existed for several releases with no mention
 in any document, and a test now fails if that happens again (§7).
@@ -1254,6 +1258,34 @@ included — they are both folded into the framing key (§3.1), so a mismatch is
 not a rejected login but a packet that never authenticates. `-doctor` prints
 the key fingerprint precisely so the two ends can be compared without either
 printing the key.
+
+### `rezoagwectl`
+
+The client speaks HTTP to a node's gateway (§8), not the wire protocol, so it
+takes none of the cluster flags above: no `-psk`, no `-cluster`, no port to
+bind. It joins nothing, which is the point — every other front end here looks
+at a cluster by becoming a member of it.
+
+| Flag         | Default                          | What it does                                               |
+|--------------|----------------------------------|------------------------------------------------------------|
+| `-server`    | `http://127.0.0.1:8080`          | gateway address; `$REZOAGWE_SERVER` overrides the default   |
+| `-token`     | `$REZOAGWE_TOKEN`                | bearer token, for a gateway started with `-http-token`      |
+| `-ttl`       | `0` (never expires)              | expiry for `put`, e.g. `60s` (§5.2)                         |
+| `-if-match`  | none                             | make `put`/`del` a compare-and-swap; `*` means "only if absent" (§5.3) |
+| `-seed`      | `false`                          | with `import`: make the file win over what the cluster holds |
+| `-divergent` | `false`                          | with `repair`: take the keys from this node's check (§14.2) |
+| `-json`      | `false`                          | machine-readable output where there is a choice             |
+| `-timeout`   | `30s`                            | per-request timeout                                         |
+
+Flags may come before or after the verb, so `rezoagwectl put k v -ttl 60s` and
+`rezoagwectl -ttl 60s put k v` are the same command — a client driven from a
+shell script gets this wrong otherwise, and silently, because `flag` stops at
+the first positional argument.
+
+Exit codes carry the result so a script need not parse the output: `0` ok,
+`1` error, `2` no such key, `3` version mismatch (a refused compare-and-swap),
+`4` replicas disagree (from `check`). A cron job can branch on `rezoagwectl
+check` without reading the report.
 
 ---
 

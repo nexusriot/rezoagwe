@@ -3,11 +3,12 @@
 #
 # Cross-build targets + Debian packaging.
 #
-# The project produces TWO binaries:
+# The project produces THREE binaries:
 #   * rezoagwe-bootstrap  — bootstrap node (cmd/bootstrap)
 #   * rezoagwe-discovery  — discovery / TUI node (cmd/discovery)
+#   * rezoagwectl         — gateway client, not a peer (cmd/ctl)
 #
-# Supported build types (both binaries are built per type):
+# Supported build types (all three binaries are built per type):
 #
 #   x86_64            linux/amd64            (default toolchain, may link libc)
 #   x86_64-static     linux/amd64            (CGO disabled -> fully static)
@@ -20,7 +21,7 @@
 #   darwin            darwin/amd64 + arm64
 #   windows           windows/amd64
 #
-# Debian packages (.deb via dpkg-deb) — each .deb ships BOTH binaries:
+# Debian packages (.deb via dpkg-deb) — each .deb ships ALL THREE binaries:
 #   deb-amd64  deb-i386  deb-arm64  deb-armhf  deb-riscv64  ->  build/<pkg>.deb
 #
 # Override version:   make debs VERSION=0.0.3
@@ -34,8 +35,8 @@ PKG_BOOT   := ./cmd/bootstrap
 PKG_DISC   := ./cmd/discovery
 PKG_CTL    := ./cmd/ctl
 GO         ?= go
-VERSION    ?= 0.4.6
-# The version is injected into both binaries: renaming the output file is not
+VERSION    ?= 0.4.7
+# The version is injected into every binary: renaming the output file is not
 # the same as building a binary that knows what it is, and the two used to
 # drift apart the moment anyone passed VERSION=.
 LDFLAGS    ?= -s -w -X main.version=$(VERSION)

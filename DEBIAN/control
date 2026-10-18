@@ -8,7 +8,9 @@ Description: Distributed KV store with chat (rendezvous + peer nodes)
  anti-entropy reconciliation, compare-and-swap, key TTLs and an
  authenticated wire, plus an embedded chat.
  .
- Ships two binaries: rezoagwe-bootstrap, the rendezvous service, and
- rezoagwe-discovery, a full peer node with a TUI and an HTTP gateway.
- Both have systemd units, neither is enabled on install.
+ Ships three binaries: rezoagwe-bootstrap, the rendezvous service;
+ rezoagwe-discovery, a full peer node with a TUI and an HTTP gateway;
+ and rezoagwectl, a client that drives a node through that gateway
+ without joining the cluster. The two services have systemd units,
+ neither enabled on install.
 Installed-Size: 12000

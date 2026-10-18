@@ -9,24 +9,29 @@ This complements the *Known limitations & next steps* table in
 the code it touches.
 
 Item 1 is next. The three Tier 0 items that sat ahead of it have shipped — see
-*Unreleased* below — so the numbering is once again the whole backlog.
+*0.4.7* below — so the numbering is once again the whole backlog.
 
 ## Shipped
 
-The repository is at **0.4.6** — the version the Makefile stamps into the Go
+The repository is at **0.4.7** — the version the Makefile stamps into the Go
 binaries and their `.deb`, the desktop client's `package.json`, and the Android
 app's `versionName`; a test keeps the four in step.
 
-Unreleased on top of it: the **Tier 0–3 round** below — eleven items — and the
-**hardware round** after it, which found that one of those eleven had only
-landed in the Go implementation. Eight
-features off the backlog, and three ahead of them that came out of reading the
-code for those eight: a data-loss defect, the cure the consistency check never
-had, and the address only the rendezvous service can see.
+0.4.7 releases three rounds. The **Tier 0–3 round** below is eleven items:
+eight features off the backlog, and three ahead of them that came out of
+reading the code for those eight — a data-loss defect, the cure the
+consistency check never had, and the address only the rendezvous service can
+see. That round is all Go-side; the Kotlin and JavaScript ports are unchanged
+by it and remain at wire parity, because both fields it added are optional and
+a port that ignores them simply does not forward a chat line and does not
+learn where it is seen from.
 
-All Go-side. The Kotlin and JavaScript ports are unchanged and remain at wire
-parity: both fields this round added are optional, and a port that ignores them
-simply does not forward a chat line and does not learn where it is seen from.
+The **hardware round** after it found that one of those eleven had only landed
+in the Go implementation. The **device round** that closes 0.4.7 ran a tablet
+and the desktop client against a Go cluster at the same time; it left the wire
+untouched and fixed what sits either side of it — a port the Android settings
+screen should never have accepted, and a packaging script that shipped two of
+the three binaries.
 
 0.4.6 is what a second hardware round found by running two nodes from copies
 of one state file: they diverged permanently on a shared key — neither version
@@ -70,7 +75,7 @@ defect all along.
 
 Newest first.
 
-### Unreleased — the Tier 0–3 round
+### 0.4.7 — the Tier 0–3 round
 
 Eleven items in one pass. Several found bugs in themselves on first contact
 with something real, which is recorded here because it is the argument for
@@ -178,7 +183,7 @@ three fuzz targets now cover decode, the admission size check and the
 skew/replay paths, and CI runs them on every push. The benchmarks exist to
 settle a backlog argument with a number rather than an intuition — see below.
 
-### Unreleased — the hardware round that followed
+### 0.4.7 — the hardware round that followed
 
 A Go node, an Android tablet (PRITOM M10, Android 16) and the desktop client in
 one cluster on a real LAN. Pairing, replication, chat, consistency, topology and
@@ -217,6 +222,53 @@ are valid, round-trip exactly and escape the same way; and the Android interop
 harness silently built `http://http://...` from a scheme-prefixed env var, then
 reported "the Go node never received the write" twenty seconds later when the
 truth was that nothing could ask it.
+
+### 0.4.7 — the device round, and two packaging paths that disagreed
+
+A full end-to-end run on a physical Android tablet and the Electron client at
+once, both joined over WiFi to a two-node Go cluster — four peers, three
+implementations. The happy path held throughout: writes replicated in every
+direction, chat in every direction, unicode, emoji, control characters, an
+empty value and a 200 KB value over the stream path, TTL expiring independently
+on all four replicas, compare-and-swap returning the documented exit codes, a
+delete propagating as a tombstone, and the consistency check agreeing from the
+Go CLI, the desktop client and the tablet. A partition — WiFi off, a conflicting
+write on each side, WiFi back — healed by itself and converged on one value.
+
+* **The Android settings screen accepted a port no socket can bind.** The
+  desktop client refuses anything outside 1..65535 in favour of the value the
+  user already had, and a Go node exits with `invalid port`; Kotlin trimmed its
+  text fields and range-checked nothing. The two halves fail differently and
+  the second is the dangerous one. `99999` throws on bind and leaves the node
+  stopped, which at least says so. `0` binds an *ephemeral* port, so the node
+  starts, keeps gossiping outward, and reports `CONNECTED` with a full peer
+  list — while advertising `host:0`, an address no peer can dial. Every other
+  node had already dropped it (all three implementations reject a peer address
+  with port 0, which is why the damage stopped there), and the roster it
+  registered into handed `host:0` to each new joiner until it aged out. The
+  value persisted, so the app stayed broken across restarts. Now refused in
+  `Settings.sanitized()`, and repaired on load so a preference written by an
+  older build cannot outlive it.
+* **`build-deb.sh` shipped two of the three binaries.** `make deb-amd64` built
+  `rezoagwectl`; the script beside it did not, so a package made one way was
+  missing the client the README says the package installs, and neither path
+  errored. Found by listing both `.deb`s. This is the drift
+  `packaging/layout.sh` already exists to prevent for the unit files, one
+  directory up.
+* **The docs had not caught up with the third binary.** The Makefile header,
+  `DEBIAN/control` and DESIGN.md §1 all still said the project produces two;
+  DESIGN.md §15, the command-line reference whose own note explains that an
+  undocumented flag is a flag nobody finds, had no entry for `rezoagwectl` and
+  so documented none of its eight. The flag test could not see it because the
+  binary's name was not in the test's list.
+
+Three tests close the three gaps: the Android settings suite now pins the port
+range the way the desktop suite already did, the §15 flag check reads the
+`cmd/` directory instead of a hand-written list and fails when a new binary
+appears, and a packaging test holds both Go `.deb` paths to the same set of
+commands. The chart was re-checked against the code rather than re-exported:
+its bucket count, flush window, length prefix, intervals and architecture count
+all still match.
 
 ### 0.4.6 — the divergence the divergence detector could not see
 

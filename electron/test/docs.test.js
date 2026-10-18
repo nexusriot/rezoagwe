@@ -350,9 +350,18 @@ test('DESIGN.md documents every flag the binaries define, and no others', () => 
     [...read(file).matchAll(/flag\.\w+\("([a-z-]+)"/g)].map((m) => m[1]),
   );
 
+  // Every binary the repository builds, not just the two that were here
+  // first: rezoagwectl shipped with eight flags and no entry in this section
+  // at all, and the loop below could not notice because its name was not in
+  // this list. A new cmd/ directory has to be added here as well.
+  const built = fs.readdirSync(path.join(REPO, 'cmd')).sort();
+  assert.deepEqual(built, ['bootstrap', 'ctl', 'discovery'],
+    'the set of binaries changed — add the new one to DESIGN.md §15 and to this list');
+
   for (const [heading, source] of [
     ['`rezoagwe-discovery`', 'cmd/discovery/discovery.go'],
     ['`rezoagwe-bootstrap`', 'cmd/bootstrap/bootstrap.go'],
+    ['`rezoagwectl`', 'cmd/ctl/ctl.go'],
   ]) {
     const docs = documented(heading);
     const code = defined(source);
