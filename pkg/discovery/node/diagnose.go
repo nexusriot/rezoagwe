@@ -69,6 +69,8 @@ func (n *Node) Diagnostics() diagnostics.Snapshot {
 		MDNS:              n.cfg.MDNS,
 		SeenAt:            n.SeenAt(),
 		AdvertiseMismatch: n.AdvertiseMismatch(),
+		DataPath:          n.Model.DataPath,
+		LoadError:         n.Model.LoadError,
 		Seeds:             append([]string(nil), n.cfg.BootstrapAddrs...),
 		Peers:             peers,
 		Strangers:         strangers,

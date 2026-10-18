@@ -9,7 +9,7 @@ const ELECTRON = path.join(__dirname, '..');
 const REPO = path.join(ELECTRON, '..');
 const read = (p) => fs.readFileSync(path.join(REPO, p), 'utf8');
 
-const DOCS = ['README.md', 'DESIGN.md', 'ROADMAP.md', 'android/README.md', 'electron/README.md'];
+const DOCS = ['README.md', 'DESIGN.md', 'ROADMAP.md', 'MANUAL.md', 'android/README.md', 'electron/README.md'];
 
 /**
  * Documentation, checked the way code is.
@@ -487,4 +487,106 @@ test('the chart image was exported from the chart source', () => {
     png.mtimeMs >= src.mtimeMs - 60_000,
     'rezo_agwe.drawio is newer than rezo_agwe.png: run `make chart` to re-export it',
   );
+});
+
+/**
+ * A wire field the rendezvous service sends must exist in every rendezvous
+ * service, not only in the reference one.
+ *
+ * `seen_at` shipped in Go alone. Nothing failed: both ports ignored an unknown
+ * field and kept talking, so every suite stayed green while a node joining
+ * through the phone or the desktop silently lost the one check that can say
+ * *which* address it should be advertising, and `-advertise auto` against one
+ * fell back to advertising the wildcard. A field that only one implementation
+ * writes is a protocol fork that nothing else can see, which is exactly what a
+ * check has to be pointed at.
+ */
+test('every implementation of the rendezvous service sends the fields DESIGN says it does', () => {
+  const sources = {
+    Go: read('pkg/bootstrap/server/server.go'),
+    Kotlin: read('android/app/src/main/java/com/nexusriot/rezoagwe/core/BootstrapServer.kt'),
+    JavaScript: read('electron/src/core/bootstrap-server.js'),
+  };
+  const wires = {
+    Go: read('pkg/proto/wire.go'),
+    Kotlin: read('android/app/src/main/java/com/nexusriot/rezoagwe/proto/Wire.kt'),
+    JavaScript: read('electron/src/proto/wire.js'),
+  };
+
+  assert.match(read('DESIGN.md'), /SeenAt/, 'DESIGN.md is where this claim lives');
+
+  for (const [port, src] of Object.entries(wires)) {
+    assert.match(src, /seen_at|SeenAt/, `${port} does not define the roster's observed-address field`);
+  }
+  for (const [port, src] of Object.entries(sources)) {
+    assert.match(
+      src, /[Ss]eenAt|seen_at/,
+      `${port}'s rendezvous service never fills in the address it observed`,
+    );
+  }
+});
+
+/**
+ * And the rule that reads it. A service that reports the address is only half
+ * the feature: the port also has to compare it with what the node advertises
+ * and say so, or the finding exists in one implementation and the other two
+ * fall back to guessing at loopback.
+ */
+test('every implementation reports an advertised address the rendezvous contradicts', () => {
+  const rules = {
+    Go: read('pkg/discovery/diagnostics/diagnostics.go'),
+    Kotlin: read('android/app/src/main/java/com/nexusriot/rezoagwe/core/Diagnostics.kt'),
+    JavaScript: read('electron/src/core/diagnostics.js'),
+  };
+  for (const [port, src] of Object.entries(rules)) {
+    assert.match(
+      src, /does not see this node at/,
+      `${port} cannot produce the one finding that names the right address`,
+    );
+    assert.match(src, /[Aa]dvertiseMismatch/, `${port} never reads the observed address`);
+  }
+});
+
+/**
+ * A node that cannot read its state file starts anyway — losing the store is
+ * bad and refusing to start is worse — but it starts with an empty replica
+ * *and a new identity*, and then rewrites the file that was the evidence. Its
+ * earlier writes are outranked until anti-entropy refills it and every chat
+ * line it has said reads as coming from a different author.
+ *
+ * The desktop client reported this from the start; Go logged it to a logger
+ * that is discarded without `-logfile`, and the Kotlin port caught the
+ * exception and returned null. The mirror image of the `seen_at` gap: a finding
+ * that exists in one implementation and not the other two, invisible to every
+ * suite because each port is only ever tested against itself.
+ */
+test('every implementation reports a state file it could not read', () => {
+  // Each port wraps a long message differently — Go concatenates across lines,
+  // Kotlin uses `+` between quoted pieces, JavaScript template literals. Join
+  // the pieces back up so the check is about what the message says and not
+  // about where its author happened to break the line.
+  const joined = (src) => src.replace(/\s+/g, ' ').replace(/['"`] ?\+? ?['"`]/g, '');
+  const rules = {
+    Go: joined(read('pkg/discovery/diagnostics/diagnostics.go')),
+    Kotlin: joined(read('android/app/src/main/java/com/nexusriot/rezoagwe/core/Diagnostics.kt')),
+    JavaScript: joined(read('electron/src/core/diagnostics.js')),
+  };
+  for (const [port, src] of Object.entries(rules)) {
+    assert.match(src, /State file could not be read/, `${port} loses a corrupt state file in silence`);
+    assert.match(
+      src, /new identity/,
+      `${port} does not say the node also lost its identity, which is the part nobody guesses`,
+    );
+  }
+
+  // And the layer underneath has to keep the reason, or the rule has nothing
+  // to fire on.
+  const loaders = {
+    Go: read('pkg/discovery/model/model.go'),
+    Kotlin: read('android/app/src/main/java/com/nexusriot/rezoagwe/core/Persistence.kt'),
+    JavaScript: read('electron/src/core/node-engine.js'),
+  };
+  for (const [port, src] of Object.entries(loaders)) {
+    assert.match(src, /[Ll]oadError/, `${port} does not record why the state file failed to load`);
+  }
 });

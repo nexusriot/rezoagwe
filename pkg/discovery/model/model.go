@@ -61,6 +61,17 @@ type Model struct {
 	AdvertiseAddr  string
 	NodeID         string
 	DataPath       string
+	// LoadError is why the state file could not be read, when there was one.
+	//
+	// A node that cannot read its state file does not fail to start — losing
+	// the store is bad and refusing to start is worse — but it starts with an
+	// empty replica *and a freshly minted identity*, and then rewrites the
+	// unreadable file with that new state. Its earlier writes are outranked
+	// until anti-entropy refills it, and every line it has ever said in chat
+	// now reads as coming from a different author. None of that is visible
+	// anywhere unless this is reported: the log is discarded without -logfile,
+	// and the file that was the evidence is gone.
+	LoadError string
 
 	nickMu   sync.RWMutex
 	nodeNick string
@@ -108,6 +119,7 @@ func NewModel(cfg Config) *Model {
 		state, found, err = m.persister.Load()
 		if err != nil {
 			log.Errorf("load persisted state from %s: %s", cfg.DataPath, err)
+			m.LoadError = err.Error()
 			found = false
 		}
 	}

@@ -17,6 +17,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
@@ -36,14 +37,20 @@ fun SettingsScreen() {
     val scope = rememberCoroutineScope()
     val saved by Runtime.settings.collectAsState()
 
-    var nick by remember(saved) { mutableStateOf(saved.nick) }
-    var port by remember(saved) { mutableStateOf(saved.port.toString()) }
-    var advertiseHost by remember(saved) { mutableStateOf(saved.advertiseHost) }
-    var seeds by remember(saved) { mutableStateOf(saved.seeds) }
-    var psk by remember(saved) { mutableStateOf(saved.psk) }
-    var cluster by remember(saved) { mutableStateOf(saved.cluster) }
-    var bootstrapPort by remember(saved) { mutableStateOf(saved.bootstrapPort.toString()) }
-    var tombstoneTtl by remember(saved) { mutableStateOf(saved.tombstoneTtlSec.toString()) }
+    // Saveable, not merely remembered: a rotation threw away every unsaved edit
+    // and reseeded the form from storage, which on a tablet is one wrist
+    // movement away at any moment.
+    var nick by rememberSaveable(saved) { mutableStateOf(saved.nick) }
+    var port by rememberSaveable(saved) { mutableStateOf(saved.port.toString()) }
+    var advertiseHost by rememberSaveable(saved) { mutableStateOf(saved.advertiseHost) }
+    var seeds by rememberSaveable(saved) { mutableStateOf(saved.seeds) }
+    var psk by rememberSaveable(saved) { mutableStateOf(saved.psk) }
+    var cluster by rememberSaveable(saved) { mutableStateOf(saved.cluster) }
+    var bootstrapPort by rememberSaveable(saved) { mutableStateOf(saved.bootstrapPort.toString()) }
+    var tombstoneTtl by rememberSaveable(saved) { mutableStateOf(saved.tombstoneTtlSec.toString()) }
+    // What the last Apply would not keep. Without this a refused value stays in
+    // the field with nothing in effect behind it.
+    var refusals by rememberSaveable { mutableStateOf(listOf<String>()) }
 
     Column(
         modifier = Modifier
@@ -84,7 +91,7 @@ fun SettingsScreen() {
         Button(
             modifier = Modifier.fillMaxWidth(),
             onClick = {
-                val updated = saved.copy(
+                val typed = saved.copy(
                     nick = nick,
                     port = port.toIntOrNull() ?: saved.port,
                     advertiseHost = advertiseHost,
@@ -93,12 +100,35 @@ fun SettingsScreen() {
                     cluster = cluster,
                     bootstrapPort = bootstrapPort.toIntOrNull() ?: saved.bootstrapPort,
                     tombstoneTtlSec = tombstoneTtl.toLongOrNull() ?: 0,
-                ).sanitized(saved)
+                )
+                val updated = typed.sanitized(saved)
+                refusals = typed.refusals(saved)
+                // The form must never show a value that is not in effect, and the
+                // state flow does not re-seed it when the only edit was refused:
+                // the sanitized settings are identical to the stored ones, so
+                // nothing recomposes. Put the kept values back by hand.
+                nick = updated.nick
+                port = updated.port.toString()
+                advertiseHost = updated.advertiseHost
+                seeds = updated.seeds
+                psk = updated.psk
+                cluster = updated.cluster
+                bootstrapPort = updated.bootstrapPort.toString()
+                tombstoneTtl = updated.tombstoneTtlSec.toString()
                 // Applying restarts a role, which closes and rebinds sockets: not
                 // work for the frame the button was pressed on.
                 scope.launch(Dispatchers.IO) { Runtime.applySettings(context, updated) }
             },
         ) { Text("Apply") }
+
+        if (refusals.isNotEmpty()) {
+            Text(
+                text = refusals.joinToString("\n"),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+                modifier = Modifier.padding(top = 8.dp),
+            )
+        }
 
         Text(
             text = "Changing the port, cluster or key restarts whichever role is running: those are " +

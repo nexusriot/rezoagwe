@@ -10,11 +10,18 @@ const { PacketTooLargeError, MAX_DATAGRAM_PAYLOAD } = require('./udp');
 
 /** One end of an in-memory stream: whatever is written here is emitted as 'data' on the other end. */
 class MemStream extends EventEmitter {
-  constructor() {
+  constructor(remote = '') {
     super();
     this.peer = null;
     this.ended = false;
     this.destroyed = false;
+    // The address of the other end, as net.Socket reports it. A stand-in
+    // without it cannot exercise anything that reads where a connection came
+    // from — which is how a rendezvous service that forgot to report the
+    // address it observed passed this whole suite.
+    const parts = remote ? remote.slice(0, remote.lastIndexOf(':')) : '';
+    this.remoteAddress = remote ? parts : undefined;
+    this.remotePort = remote ? Number(remote.slice(remote.lastIndexOf(':') + 1)) : undefined;
   }
 
   write(chunk) {
@@ -63,9 +70,13 @@ class MemStream extends EventEmitter {
 
   setTimeout() {}
 
-  static pair() {
-    const a = new MemStream();
-    const b = new MemStream();
+  /**
+   * Two ends of one connection. Each is told the other's address, so a server
+   * reading `remoteAddress` sees the dialler and vice versa.
+   */
+  static pair(nearRemote = '', farRemote = '') {
+    const a = new MemStream(nearRemote);
+    const b = new MemStream(farRemote);
     a.peer = b;
     b.peer = a;
     return [a, b];
@@ -95,9 +106,17 @@ class MemTransport extends EventEmitter {
     if (!this.streamsAvailable) return Promise.reject(new Error('stream transport unavailable'));
     const target = this.network.lookup(this.addr, addr);
     if (!target) return Promise.reject(new Error(`no route to ${addr}`));
-    const [near, far] = MemStream.pair();
+    // The dialler's end knows the address it dialled; the listener's end knows
+    // the dialler. A real socket's source port is ephemeral, and this models
+    // that: anything comparing ports rather than hosts has to fail here too.
+    const [near, far] = MemStream.pair(addr, `${this.addrHost()}:${this.network.ephemeralPort()}`);
     setImmediate(() => target.emit('stream', far));
     return Promise.resolve(near);
+  }
+
+  /** This transport's host, without its listening port. */
+  addrHost() {
+    return this.addr.slice(0, this.addr.lastIndexOf(':'));
   }
 
   close() {
@@ -116,6 +135,19 @@ class MemNetwork {
     this.blocked = new Set(); // "a|b" pairs that cannot exchange packets
     this.random = opts.random || Math.random;
     this.dropped = 0;
+    this.nextEphemeral = 40000;
+  }
+
+  /**
+   * A source port for an outbound stream. A real one is ephemeral and different
+   * every time, which is exactly why the reflexive-address rule compares hosts
+   * and not ports; handing out a fixed port here would let a port comparison
+   * pass in tests and fail on a socket.
+   */
+  ephemeralPort() {
+    this.nextEphemeral += 1;
+    if (this.nextEphemeral > 60000) this.nextEphemeral = 40000;
+    return this.nextEphemeral;
   }
 
   attach(addr) {

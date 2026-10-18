@@ -410,6 +410,92 @@ class NodeEngineTest {
     }
 
     /**
+     * The reflexive address: where the cluster actually sees this node from.
+     *
+     * A node bound to a wildcard knows every address its machine has and not
+     * which one its packets leave by, so the rendezvous service is the only
+     * component that can tell it. This shipped in the Go service and in neither
+     * port, which left a node joining through this one with no way to learn it
+     * was advertising an address nobody could reach — and made the Go client's
+     * `-advertise auto` fall back to advertising the wildcard.
+     */
+    @Test
+    fun theRendezvousReportsWhereItSeesANodeFrom() {
+        val bootPort = freePort()
+        val boot = BootstrapServer(BootstrapConfig(port = bootPort), dataFile = null, scope = scope)
+        servers += boot
+        boot.start()
+
+        // This node tells the cluster an address that is not the one its packets
+        // come from, which is the case the field exists for.
+        val port = freePort()
+        val wrong = NodeEngine(
+            NodeConfig(
+                advertiseHost = "10.9.9.9",
+                port = port,
+                nick = "misconfigured",
+                seeds = listOf("127.0.0.1:$bootPort"),
+                gossipIntervalMs = 3_600_000,
+                heartbeatIntervalMs = 3_600_000,
+                evictThresholdMs = 3_600_000,
+                sweepIntervalMs = 3_600_000,
+            ),
+            dataFile = null,
+            scope = scope,
+        )
+        engines += wrong
+        wrong.start()
+
+        waitFor("the rendezvous to report an address") { wrong.advertiseMismatch().isNotEmpty() }
+        val observed = wrong.advertiseMismatch()
+        assertTrue("the observed host, not what the node claimed", observed.startsWith("127.0.0.1:"))
+
+        // And it reaches the report, which names the host to use rather than
+        // merely saying the current one looks wrong.
+        val checks = healthChecks(wrong.diagnostics(), System.currentTimeMillis())
+        val check = checks.first { it.title.contains("does not see this node at") }
+        assertEquals(Severity.ERROR, check.severity)
+        assertTrue(check.detail.contains("127.0.0.1"))
+        assertFalse(
+            "the weaker loopback guess must not sit beside the answer",
+            checks.any { it.title.contains("loopback") },
+        )
+    }
+
+    /**
+     * A correctly configured node must see nothing. A stream is dialled from an
+     * ephemeral source port, so a rule comparing addresses rather than hosts
+     * would accuse every node in the cluster on every roster.
+     */
+    @Test
+    fun anAgreeingAddressIsNotReported() {
+        val bootPort = freePort()
+        val boot = BootstrapServer(BootstrapConfig(port = bootPort), dataFile = null, scope = scope)
+        servers += boot
+        boot.start()
+
+        val a = engine(freePort(), "alice", seeds = listOf("127.0.0.1:$bootPort"))
+        a.start()
+        waitFor("alice to register") { boot.roster.value.any { it.addr == a.addr } }
+
+        assertEquals("", a.advertiseMismatch())
+        assertFalse(
+            healthChecks(a.diagnostics(), System.currentTimeMillis()).any { it.title.contains("does not see this node at") },
+        )
+    }
+
+    /** The host comparison itself, including the cases a literal check gets wrong. */
+    @Test
+    fun onlyTheHostIsCompared() {
+        assertFalse("a wildcard advertises nothing in particular", NodeEngine.sameHost("0.0.0.0", "10.0.0.5"))
+        assertFalse(NodeEngine.sameHost("", "10.0.0.5"))
+        assertTrue(NodeEngine.sameHost("10.0.0.5", "10.0.0.5"))
+        assertFalse(NodeEngine.sameHost("10.0.0.9", "10.0.0.5"))
+        assertEquals("10.0.0.5", NodeEngine.hostOf("10.0.0.5:3137"))
+        assertEquals("", NodeEngine.hostOf("10.0.0.5"))
+    }
+
+    /**
      * Every path that learns a peer announces it, and eviction always announces
      * a departure. The roster path announced nothing, so a peer adopted from a
      * bootstrap roster and never heard from again produced a "left" for a node

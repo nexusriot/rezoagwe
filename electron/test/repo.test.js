@@ -113,3 +113,43 @@ test('no build artifact is tracked', { skip: !gitAvailable() && 'not a git check
   const jars = tracked.filter((f) => f.endsWith('.jar'));
   assert.deepEqual(jars, ['android/gradle/wrapper/gradle-wrapper.jar']);
 });
+
+/**
+ * Nothing a person typed into the Android app may be held in state that a
+ * configuration change throws away.
+ *
+ * Measured on a tablet: rotating the device dismissed the open key dialog
+ * outright and took the key, the value and the TTL with it; emptied the chat
+ * composer mid-sentence; and reverted every unsaved field on the settings
+ * screen. The navigation state was already `rememberSaveable` — only the forms
+ * were not — so the app came back on the right screen with every edit gone,
+ * which reads as the app having discarded the work on purpose.
+ *
+ * A tablet is the device that gets rotated, and `remember` is the default
+ * anyone reaches for, so this is checked rather than remembered. It looks only
+ * at state that holds typed text or says which editor is open; ephemeral view
+ * state (a scroll position, a pan, a cached layout) is deliberately exempt and
+ * named here rather than guessed at.
+ */
+test('no Android screen holds typed text in state a rotation discards', () => {
+  const screens = [
+    'android/app/src/main/java/com/nexusriot/rezoagwe/ui/KeysScreen.kt',
+    'android/app/src/main/java/com/nexusriot/rezoagwe/ui/ChatScreen.kt',
+    'android/app/src/main/java/com/nexusriot/rezoagwe/ui/SettingsScreen.kt',
+  ];
+  // State that is recomputed or re-observed on every composition, and so has
+  // nothing to preserve.
+  const EPHEMERAL = /^(scale|pan|now|positions|components|selected)$/;
+
+  const offenders = [];
+  for (const file of screens) {
+    const src = read(file);
+    for (const m of src.matchAll(/\bvar\s+(\w+)\s+by\s+remember\s*(\([^)]*\))?\s*\{\s*mutable\w*StateOf/g)) {
+      if (!EPHEMERAL.test(m[1])) offenders.push(`${file}: ${m[1]}`);
+    }
+  }
+  assert.deepEqual(
+    offenders, [],
+    'these survive a recomposition and not a rotation; use rememberSaveable',
+  );
+});

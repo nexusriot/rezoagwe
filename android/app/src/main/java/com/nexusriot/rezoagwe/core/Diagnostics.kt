@@ -82,6 +82,17 @@ data class NodeDiagnostics(
     val streamListener: Boolean = false,
     val advertiseHost: String = "",
     val localIpv4: String = "",
+    /**
+     * The address a rendezvous service saw this node's packets arrive from, when
+     * it names a different host from the advertised one. The rendezvous is the
+     * only component that can see this, so when it is set it outranks the
+     * loopback heuristic below: that can say an address looks wrong, this says
+     * which one is right.
+     */
+    val advertiseMismatch: String = "",
+    /** The state file, and why it could not be read. */
+    val dataFile: String = "",
+    val loadError: String = "",
     val running: Boolean = false,
     val startedAtMs: Long = 0,
     val uptimeSec: Long = 0,
@@ -378,8 +389,47 @@ fun healthChecks(
         }
     }
 
+    // Reported before anything else that could be a *consequence* of it: a node
+    // that started empty will also look like one that has fallen behind.
+    if (d.loadError.isNotEmpty()) {
+        checks += HealthCheck(
+            Severity.ERROR,
+            "State file could not be read",
+            "${d.dataFile} did not parse (${d.loadError}), so this node started with an empty store " +
+                "and a new identity, and has already rewritten that file with the new state. Its " +
+                "earlier writes are outranked until anti-entropy refills it from a peer, and every " +
+                "chat line it has said before now reads as coming from a different author.",
+        )
+    }
+
     val loopback = d.addr.startsWith("127.") || d.addr.startsWith("localhost:")
-    if (d.running && loopback) {
+
+    // The rendezvous service is the one component that sees where this node's
+    // packets actually come from, so when it has told us, that outranks the
+    // heuristics below: they can say "that address looks wrong" and only this
+    // can say which address is right.
+    //
+    // Except with the radio off. A device with no network advertises loopback
+    // because it has nowhere else to advertise, and the address a rendezvous
+    // saw before the outage describes where this node *used to be*. Reported
+    // then, it tells someone whose Wi-Fi has dropped to hard-code the address
+    // they had — advice that is wrong now and still wrong on the next network.
+    // The loopback rule below says the useful thing: reconnect.
+    if (d.advertiseMismatch.isNotEmpty() && !offline) {
+        val suggestion = NodeEngine.hostOf(d.advertiseMismatch)
+            .takeIf { it.isNotEmpty() }
+            ?.let { "$it:${d.configuredPort}" }
+            ?: d.advertiseMismatch
+        checks += HealthCheck(
+            Severity.ERROR,
+            "Advertising an address the cluster does not see this node at",
+            "Peers are told to reach this node at ${d.addr}, and the rendezvous service received " +
+                "its packets from ${d.advertiseMismatch}. Every peer resolves what it is told, so " +
+                "they are reaching somewhere else — usually their own loopback. Set the advertise " +
+                "host in Settings to ${NodeEngine.hostOf(d.advertiseMismatch)}, which makes this " +
+                "node $suggestion.",
+        )
+    } else if (d.running && loopback) {
         checks += HealthCheck(
             Severity.WARN,
             "Advertising a loopback address",
@@ -388,7 +438,9 @@ fun healthChecks(
         )
     }
 
-    if (d.advertiseHost.isNotEmpty() && d.localIpv4 != d.advertiseHost && !loopback) {
+    if (d.advertiseMismatch.isEmpty() &&
+        d.advertiseHost.isNotEmpty() && d.localIpv4 != d.advertiseHost && !loopback
+    ) {
         checks += HealthCheck(
             Severity.INFO,
             "Advertise host is overridden",

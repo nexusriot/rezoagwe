@@ -35,7 +35,7 @@ PKG_BOOT   := ./cmd/bootstrap
 PKG_DISC   := ./cmd/discovery
 PKG_CTL    := ./cmd/ctl
 GO         ?= go
-VERSION    ?= 0.4.7
+VERSION    ?= 0.4.8
 # The version is injected into every binary: renaming the output file is not
 # the same as building a binary that knows what it is, and the two used to
 # drift apart the moment anyone passed VERSION=.

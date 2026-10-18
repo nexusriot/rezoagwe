@@ -397,3 +397,53 @@ func TestOwnChatFallsBackToAddressForEntriesWithoutAnID(t *testing.T) {
 		t.Fatalf("found=%+v gone=%v, want the line served on the address fallback", found, gone)
 	}
 }
+
+// A state file that cannot be read must not stop the node — losing the store is
+// bad and refusing to start is worse — but it costs the node its identity and
+// its whole replica, and the node then rewrites the file that was the evidence.
+// Recording why is the only way any surface can say so: without -logfile the
+// log line goes nowhere.
+func TestAnUnreadableStateFileIsRecordedRatherThanSwallowed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	if err := os.WriteFile(path, []byte(`{"kv": [ truncated`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	m := NewModel(Config{NodeAddr: "127.0.0.1:3137", DataPath: path})
+
+	if m.LoadError == "" {
+		t.Fatal("a corrupt state file was loaded in silence")
+	}
+	if m.NodeID == "" {
+		t.Error("the node must still get an identity and start")
+	}
+	if n := len(m.Store.Entries()); n != 0 {
+		t.Errorf("store has %d entries after a failed load, want 0", n)
+	}
+}
+
+// Every node has a state file, so recording an error for the ordinary case
+// would put an ERROR on every report and get the real one ignored.
+func TestAStateFileThatReadsFineRecordsNoError(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	first := NewModel(Config{NodeAddr: "127.0.0.1:3137", DataPath: path})
+	first.Store.Set("k", "v")
+	first.Flush()
+
+	second := NewModel(Config{NodeAddr: "127.0.0.1:3137", DataPath: path})
+	if second.LoadError != "" {
+		t.Errorf("LoadError = %q for a file that parsed", second.LoadError)
+	}
+	if second.NodeID != first.NodeID {
+		t.Error("a readable state file must carry the identity across a restart")
+	}
+}
+
+// A missing file is a fresh node, not a failure: reporting it would greet every
+// first start with an error.
+func TestAMissingStateFileIsNotAnError(t *testing.T) {
+	m := NewModel(Config{NodeAddr: "127.0.0.1:3137", DataPath: filepath.Join(t.TempDir(), "absent.json")})
+	if m.LoadError != "" {
+		t.Errorf("LoadError = %q for a node starting fresh", m.LoadError)
+	}
+}

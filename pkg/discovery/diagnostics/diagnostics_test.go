@@ -705,3 +705,36 @@ func TestAnAgreeingObservationRaisesNothing(t *testing.T) {
 	d.SeenAt = "10.0.0.1:51234"
 	mustNotFind(t, Checks(d, now), "does not see this node at")
 }
+
+// A node that cannot read its state file starts anyway — losing the store is
+// bad and refusing to start is worse — but it starts empty and with a new
+// identity, and then rewrites the unreadable file with that new state. The only
+// other trace was a log line that goes nowhere without -logfile, and the file
+// that was the evidence is gone by the time anyone looks.
+func TestAnUnreadableStateFileIsReported(t *testing.T) {
+	snap := healthy()
+	snap.DataPath = "/var/lib/rezoagwe/node.json"
+	snap.LoadError = "unexpected end of JSON input"
+
+	checks := Checks(snap, now)
+	found := findCheck(t, checks, "State file could not be read")
+	if found.Severity != SeverityError {
+		t.Errorf("severity = %v, want error", found.Severity)
+	}
+	for _, want := range []string{
+		"/var/lib/rezoagwe/node.json",  // which file
+		"unexpected end of JSON input", // why
+		"new identity",                 // and the consequence that is not obvious
+		"different author",
+	} {
+		if !strings.Contains(found.Detail, want) {
+			t.Errorf("detail does not mention %q: %s", want, found.Detail)
+		}
+	}
+}
+
+func TestAReadableStateFileIsNotReported(t *testing.T) {
+	// Every node has a state file, so a finding for the ordinary case would be
+	// noise on every report and get ignored along with the real one.
+	mustNotFind(t, Checks(healthy(), now), "State file could not be read")
+}

@@ -36,6 +36,7 @@ import com.nexusriot.rezoagwe.proto.Version
 import com.nexusriot.rezoagwe.proto.WireJson
 import java.io.File
 import java.net.Inet4Address
+import java.net.InetAddress
 import java.net.NetworkInterface
 import java.net.Socket
 import java.util.UUID
@@ -205,6 +206,37 @@ class NodeEngine(
     val topology: StateFlow<Topology> = _topology.asStateFlow()
 
     val addr: String get() = "${config.advertiseHost.ifEmpty { localIpv4() }}:${config.port}"
+
+    /**
+     * The source address a rendezvous service last observed this node arriving
+     * from, or "" while none has answered. Only a rendezvous can supply it, and
+     * only [advertiseMismatch] reads it.
+     *
+     * Recorded, never adopted. The advertised address is this node's identity in
+     * its own peer table and is read from every loop, so rewriting it under a
+     * running node would leave `isSelf` answering about an address the node had
+     * stopped using — which is how a node ends up adopting itself as a peer.
+     */
+    @Volatile
+    private var seenAt: String = ""
+
+    /**
+     * The observed address when it names a different host from the one this node
+     * advertises, and "" when they agree or when nothing has been observed.
+     *
+     * Hosts only. A datagram arrives from the node's own bound socket so its
+     * port is right, but a stream is dialled with an ephemeral source port and
+     * its port means nothing — warning about a port the node never claimed
+     * would be worse than saying nothing at all.
+     */
+    fun advertiseMismatch(): String {
+        val observed = seenAt
+        if (observed.isEmpty()) return ""
+        val observedHost = hostOf(observed)
+        if (observedHost.isEmpty()) return ""
+        if (sameHost(hostOf(addr), observedHost)) return ""
+        return observed
+    }
 
     init {
         val saved = persister?.load()
@@ -1500,6 +1532,7 @@ class NodeEngine(
      * been seen to join — which reads as a node leaving twice.
      */
     private fun applyRoster(roster: BootstrapRoster) {
+        if (roster.seenAt.isNotEmpty()) seenAt = roster.seenAt
         var learned = false
         for (p in roster.peers) {
             val isNew = addPeer(p.addr)
@@ -1738,6 +1771,9 @@ class NodeEngine(
             streamListener = tr?.streamsAvailable ?: false,
             advertiseHost = config.advertiseHost,
             localIpv4 = localIpv4(),
+            advertiseMismatch = advertiseMismatch(),
+            dataFile = dataFile?.path ?: "",
+            loadError = persister?.loadError ?: "",
             running = tr != null,
             startedAtMs = startedAtMs,
             uptimeSec = if (startedAtMs == 0L) 0 else (System.currentTimeMillis() - startedAtMs) / 1000,
@@ -1783,6 +1819,39 @@ class NodeEngine(
                 else -> host
             }
             return "$canonical:$port"
+        }
+
+        /** The host half of an `addr:port`, or "" when there is no port to strip. */
+        fun hostOf(addr: String): String {
+            val i = addr.lastIndexOf(':')
+            if (i < 0) return ""
+            return addr.substring(0, i).removePrefix("[").removeSuffix("]")
+        }
+
+        /**
+         * Whether an advertised host and an observed one name the same place.
+         *
+         * A wildcard advertises nothing in particular, which is exactly the case
+         * this exists for: whatever the rendezvous saw, the node is not telling
+         * peers to use it. A literal that simply differs is a mismatch. A name is
+         * resolved rather than called wrong, because a node deliberately
+         * advertising a hostname peers can resolve is doing the right thing and
+         * flagging it would train people to ignore this.
+         */
+        fun sameHost(advertised: String, observed: String): Boolean {
+            if (advertised.isEmpty() || advertised == "0.0.0.0" || advertised == "::") return false
+            if (advertised.equals(observed, ignoreCase = true)) return true
+            // A literal that is not equal is a genuine mismatch; only a name is
+            // worth a lookup.
+            if (advertised.all { it.isDigit() || it == '.' }) return false
+            if (advertised.contains(':')) return false // an IPv6 literal
+            return try {
+                InetAddress.getAllByName(advertised).any {
+                    it.hostAddress.equals(observed, ignoreCase = true)
+                }
+            } catch (e: Exception) {
+                false
+            }
         }
 
         /** The first non-loopback IPv4 address, which is what peers on the LAN can reach. */

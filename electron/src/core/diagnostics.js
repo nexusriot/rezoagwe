@@ -1,6 +1,7 @@
 'use strict';
 
 const { components, unconfirmed } = require('./topology');
+const { splitHostPort } = require('../net/addr');
 
 /** How much attention a finding deserves. */
 const Severity = Object.freeze({ OK: 'ok', INFO: 'info', WARN: 'warn', ERROR: 'error' });
@@ -43,7 +44,9 @@ function healthChecks(d, nowMs) {
   if (d.loadError) {
     add(Severity.ERROR, 'State file could not be read',
       `${d.dataFile} did not parse (${d.loadError}), so this node started with an empty store and a new `
-      + 'identity. Its earlier writes will be outranked until anti-entropy refills it from a peer.');
+      + 'identity, and has already rewritten that file with the new state. Its earlier writes are '
+      + 'outranked until anti-entropy refills it from a peer, and every chat line it has said before '
+      + 'now reads as coming from a different author.');
   }
 
   if (m.authFailures > 0) {
@@ -199,13 +202,26 @@ function healthChecks(d, nowMs) {
   }
 
   const loopback = d.addr.startsWith('127.') || d.addr.startsWith('localhost:');
-  if (d.running && loopback) {
+
+  // The rendezvous service is the one component that sees where this node's
+  // packets actually come from, so when it has told us, that outranks the
+  // heuristics below: they can say "that address looks wrong" and only this can
+  // say which address is right.
+  if (d.advertiseMismatch) {
+    const observed = splitHostPort(d.advertiseMismatch);
+    const host = observed ? observed.host : d.advertiseMismatch;
+    add(Severity.ERROR, 'Advertising an address the cluster does not see this node at',
+      `Peers are told to reach this node at ${d.addr}, and the rendezvous service received its packets `
+      + `from ${d.advertiseMismatch}. Every peer resolves what it is told, so they are reaching `
+      + `somewhere else — usually their own loopback. Set the advertise host in Settings to ${host}, `
+      + `which makes this node ${host}:${d.configuredPort || d.boundPort}.`);
+  } else if (d.running && loopback) {
     add(Severity.WARN, 'Advertising a loopback address',
       `Peers are told to reach this node at ${d.addr}, which only resolves to this machine. Connect to a `
       + 'network, or set an advertise host in Settings.');
   }
 
-  if (d.advertiseHost && d.localIpv4 !== d.advertiseHost && !loopback) {
+  if (!d.advertiseMismatch && d.advertiseHost && d.localIpv4 !== d.advertiseHost && !loopback) {
     add(Severity.INFO, 'Advertise host is overridden',
       `Peers are told ${d.advertiseHost}, while this machine's own address is ${d.localIpv4}. That is `
       + 'right behind a port forward and wrong on a plain LAN.');

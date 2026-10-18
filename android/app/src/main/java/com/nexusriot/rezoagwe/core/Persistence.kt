@@ -59,11 +59,33 @@ class Persister(private val file: File) {
         }
     }
 
+    /**
+     * Why the last [load] could not read the file, or "" when it had nothing to
+     * read or read it fine.
+     *
+     * A node that cannot read its state file does not fail to start — losing
+     * the store is bad and refusing to start is worse — but it starts with an
+     * empty replica *and a freshly minted identity*, and then rewrites the
+     * unreadable file with that new state. Its earlier writes are outranked
+     * until anti-entropy refills it, and every chat line it has said reads as
+     * coming from a different author. Swallowing the exception left none of
+     * that visible anywhere.
+     */
+    @Volatile
+    var loadError: String = ""
+        private set
+
     fun load(): PersistState? = synchronized(lock) {
-        if (!file.exists()) return null
+        if (!file.exists()) {
+            loadError = ""
+            return null
+        }
         return try {
-            WireJson.decodeFromString<PersistState>(file.readText())
+            val state = WireJson.decodeFromString<PersistState>(file.readText())
+            loadError = ""
+            state
         } catch (e: Exception) {
+            loadError = e.message ?: e.javaClass.simpleName
             null
         }
     }

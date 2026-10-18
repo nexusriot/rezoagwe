@@ -371,7 +371,25 @@ data class BootstrapPeer(
 )
 
 @Serializable
-data class BootstrapRoster(val peers: List<BootstrapPeer> = emptyList())
+data class BootstrapRoster(
+    val peers: List<BootstrapPeer> = emptyList(),
+    /**
+     * The source address this rendezvous service observed the request arriving
+     * from — the asker's own address as the network sees it, rather than as the
+     * asker believes it.
+     *
+     * It is the one thing a node cannot work out for itself: bound to a
+     * wildcard it knows every address its machine has and not which one its
+     * packets leave by. Without it the rule for a wrong advertise host is a
+     * local guess about loopback, which can say an address looks wrong and
+     * never which one is right.
+     *
+     * Only the host is dependable. A datagram arrives from the node's own bound
+     * socket so its port is right too, but a stream is dialled with an ephemeral
+     * source port and that port means nothing. Compare hosts.
+     */
+    @SerialName("seen_at") val seenAt: String = "",
+)
 
 /**
  * JSON tuned to match Go's encoding/json:

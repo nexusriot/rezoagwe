@@ -17,8 +17,10 @@ Three binaries:
 A new node contacts bootstrap **once at startup** to learn the initial
 roster. From then on, peers gossip among themselves.
 
-For internals, wire protocol, and the failure model, see
-[DESIGN.md](DESIGN.md).
+To use it — running a cluster, the TUI, the gateway, the desktop client, the
+Android app, and what to do when something is wrong — see
+[MANUAL.md](MANUAL.md). For internals, wire protocol, and the failure model,
+see [DESIGN.md](DESIGN.md).
 
 ### **Why?**
 

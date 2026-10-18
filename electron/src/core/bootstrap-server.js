@@ -109,13 +109,23 @@ class BootstrapServer extends EventEmitter {
     return removed;
   }
 
-  /** The roster as sent on the wire, minus the requester: a node has no use for its own address. */
-  rosterFor(exclude) {
+  /**
+   * The roster as sent on the wire, minus the requester: a node has no use for
+   * its own address.
+   *
+   * seenAt is the address this service observed the request arriving from. It
+   * is the one fact about a joiner that only a rendezvous service holds, so
+   * reporting it is not optional decoration: a node bound to a wildcard cannot
+   * tell which of its addresses its packets leave by, and without this its only
+   * clue that it advertises something unreachable is a loopback guess.
+   */
+  rosterFor(exclude, seenAt = '') {
     return {
       peers: [...this.nodes.values()]
         .filter((n) => n.addr !== exclude)
         .sort((a, b) => (a.addr < b.addr ? -1 : a.addr > b.addr ? 1 : 0))
         .map((n) => ({ addr: n.addr, nick: n.nick, lastSeen: n.lastSeen })),
+      seenAt,
     };
   }
 
@@ -138,7 +148,7 @@ class BootstrapServer extends EventEmitter {
     } catch {
       return;
     }
-    this.handle(frame.kind, body, (reply) => {
+    this.handle(frame.kind, body, packet.from, (reply) => {
       const transport = this.transport;
       if (transport) transport.send(this.replyAddr(packet.from, frame.kind, body), reply).catch(() => {});
     });
@@ -149,7 +159,11 @@ class BootstrapServer extends EventEmitter {
       const raw = await readFrame(conn);
       const frame = this.codec.decode(raw);
       const body = JSON.parse(frame.body.toString('utf8'));
-      this.handle(frame.kind, body, (reply) => writeFrame(conn, reply));
+      // A stream is dialled from an ephemeral source port, so only the host of
+      // this address means anything — which is why the rule that consumes it
+      // compares hosts.
+      const from = conn.remoteAddress ? `${conn.remoteAddress}:${conn.remotePort}` : '';
+      this.handle(frame.kind, body, from, (reply) => writeFrame(conn, reply));
     } catch {
       // a malformed or unauthenticated stream is dropped in silence
     } finally {
@@ -158,7 +172,7 @@ class BootstrapServer extends EventEmitter {
     }
   }
 
-  handle(kind, body, reply) {
+  handle(kind, body, from, reply) {
     try {
       if (kind === Kind.BOOTSTRAP_REGISTER) {
         const reg = W.decodeBootstrapRegister(body);
@@ -168,7 +182,9 @@ class BootstrapServer extends EventEmitter {
         // Asking for the roster is itself proof of life, so a joiner whose
         // REGISTER was lost still ends up known.
         if (req.from) this.register(req.from, '');
-        reply(this.codec.encode(Kind.BOOTSTRAP_ROSTER, W.encodeBootstrapRoster(this.rosterFor(req.from))));
+        reply(this.codec.encode(
+          Kind.BOOTSTRAP_ROSTER, W.encodeBootstrapRoster(this.rosterFor(req.from, from)),
+        ));
       }
     } catch {
       // malformed body: drop it

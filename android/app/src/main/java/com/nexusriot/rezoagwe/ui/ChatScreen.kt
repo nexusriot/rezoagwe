@@ -24,6 +24,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -46,7 +47,10 @@ private val TIME = SimpleDateFormat("HH:mm:ss", Locale.US)
 fun ChatScreen(node: NodeEngine) {
     val messages by node.chat.collectAsState()
     val status by node.status.collectAsState()
-    var draft by remember { mutableStateOf("") }
+    // Saveable, not merely remembered: a rotation emptied the composer and the
+    // line being typed was simply gone, with nothing to say so. A tablet is the
+    // device that gets rotated mid-sentence.
+    var draft by rememberSaveable { mutableStateOf("") }
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
 

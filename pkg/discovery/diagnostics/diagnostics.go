@@ -105,12 +105,17 @@ type Snapshot struct {
 	// from, and AdvertiseMismatch is that address when it names a different
 	// host from the one the node advertises. Empty means they agree, or that
 	// no bootstrap has answered yet.
-	SeenAt            string     `json:"seen_at,omitempty"`
-	AdvertiseMismatch string     `json:"advertise_mismatch,omitempty"`
-	Seeds             []string   `json:"seeds"`
-	Peers             []Peer     `json:"peers"`
-	ChatGaps          []ChatGap  `json:"chat_gaps,omitempty"`
-	Strangers         []Stranger `json:"strangers"`
+	SeenAt            string `json:"seen_at,omitempty"`
+	AdvertiseMismatch string `json:"advertise_mismatch,omitempty"`
+	// DataPath is the state file, and LoadError why it could not be read.
+	// A node that cannot read its state file starts empty and with a new
+	// identity, then overwrites the file that was the evidence.
+	DataPath  string     `json:"data_path,omitempty"`
+	LoadError string     `json:"load_error,omitempty"`
+	Seeds     []string   `json:"seeds"`
+	Peers     []Peer     `json:"peers"`
+	ChatGaps  []ChatGap  `json:"chat_gaps,omitempty"`
+	Strangers []Stranger `json:"strangers"`
 	// IDConflicts are node ids seen claimed by more than one address, and
 	// Impostors peer addresses seen claiming this node's own id.
 	IDConflicts []IDConflict     `json:"id_conflicts,omitempty"`
@@ -132,6 +137,17 @@ func Checks(d Snapshot, now time.Time) []Check {
 		out = append(out, Check{Severity: s, Title: title, Detail: detail})
 	}
 	m := d.Metrics
+
+	// Reported before anything else that could be a *consequence* of it: a node
+	// that started empty will also look like one that has fallen behind.
+	if d.LoadError != "" {
+		add(SeverityError, "State file could not be read",
+			fmt.Sprintf("%s did not parse (%s), so this node started with an empty store and a new "+
+				"identity, and has already rewritten that file with the new state. Its earlier writes "+
+				"are outranked until anti-entropy refills it from a peer, and every chat line it has "+
+				"said before now reads as coming from a different author. Without -logfile the only "+
+				"other trace of this was a discarded log line.", d.DataPath, d.LoadError))
+	}
 
 	if m.AuthFailures > 0 {
 		add(SeverityError, fmt.Sprintf("%d packet(s) failed authentication", m.AuthFailures),

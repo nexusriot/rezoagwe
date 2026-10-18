@@ -62,4 +62,23 @@ function localIpv4() {
   return '127.0.0.1';
 }
 
-module.exports = { splitHostPort, validPeerAddr, normalizeAddr, targetOf, localIpv4 };
+/**
+ * Whether an advertised host and an observed one name the same place.
+ *
+ * A wildcard advertises nothing in particular, which is exactly the case this
+ * exists for: whatever the rendezvous saw, the node is not telling peers to use
+ * it. A literal that simply differs is a mismatch. A name is left alone rather
+ * than called wrong, because a node deliberately advertising a hostname peers
+ * can resolve is doing the right thing, and flagging it would train people to
+ * ignore this — resolving it here would mean a DNS lookup on a path that runs
+ * every time a screen repaints, so a name is assumed correct.
+ */
+function sameHost(advertised, observed) {
+  if (!advertised || advertised === '0.0.0.0' || advertised === '::') return false;
+  if (advertised.toLowerCase() === String(observed || '').toLowerCase()) return true;
+  // Only a literal can be judged without a lookup.
+  if (/^[0-9.]+$/.test(advertised) || advertised.includes(':')) return false;
+  return true;
+}
+
+module.exports = { splitHostPort, validPeerAddr, normalizeAddr, targetOf, localIpv4, sameHost };

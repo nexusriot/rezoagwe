@@ -139,13 +139,23 @@ class BootstrapServer(
         return removed
     }
 
-    /** The roster as sent on the wire, minus the requester: a node has no use for its own address. */
-    fun rosterFor(exclude: String): BootstrapRoster = synchronized(lock) {
+    /**
+     * The roster as sent on the wire, minus the requester: a node has no use for
+     * its own address.
+     *
+     * [seenAt] is the address this service observed the request arriving from.
+     * It is the one fact about a joiner that only a rendezvous service holds, so
+     * reporting it is not optional decoration: a node bound to a wildcard cannot
+     * tell which of its addresses its packets leave by, and without this its
+     * only clue that it advertises something unreachable is a loopback guess.
+     */
+    fun rosterFor(exclude: String, seenAt: String = ""): BootstrapRoster = synchronized(lock) {
         BootstrapRoster(
             peers = nodes.values
                 .filter { it.addr != exclude }
                 .sortedBy { it.addr }
                 .map { BootstrapPeer(addr = it.addr, nick = it.nick, lastSeen = it.lastSeen) },
+            seenAt = seenAt,
         )
     }
 
@@ -155,7 +165,7 @@ class BootstrapServer(
         } catch (e: Exception) {
             return // unauthenticated traffic on an open port is background noise
         }
-        handle(frame.kind, String(frame.body)) { reply ->
+        handle(frame.kind, String(frame.body), packet.from) { reply ->
             synchronized(lock) { transport }?.send(replyAddr(packet.from, frame.kind, String(frame.body)), reply)
         }
     }
@@ -166,12 +176,17 @@ class BootstrapServer(
         } catch (e: Exception) {
             return
         }
-        handle(frame.kind, String(frame.body)) { reply ->
+        // A stream is dialled from an ephemeral source port, so only the host
+        // of this address means anything — which is why the rule that consumes
+        // it compares hosts. Formatted exactly as the datagram path formats
+        // Packet.from, so a reader cannot tell which transport carried it.
+        val from = conn.inetAddress?.hostAddress?.let { "$it:${conn.port}" } ?: ""
+        handle(frame.kind, String(frame.body), from) { reply ->
             writeFrame(conn.getOutputStream(), reply)
         }
     }
 
-    private fun handle(kind: Byte, body: String, reply: (ByteArray) -> Unit) {
+    private fun handle(kind: Byte, body: String, from: String, reply: (ByteArray) -> Unit) {
         try {
             when (kind) {
                 Kind.BOOTSTRAP_REGISTER -> {
@@ -183,7 +198,7 @@ class BootstrapServer(
                     // Asking for the roster is itself proof of life, so a joiner
                     // whose REGISTER was lost still ends up known.
                     if (req.from.isNotEmpty()) register(req.from, "")
-                    reply(codec.encode(Kind.BOOTSTRAP_ROSTER, rosterFor(req.from)))
+                    reply(codec.encode(Kind.BOOTSTRAP_ROSTER, rosterFor(req.from, from)))
                 }
             }
         } catch (e: Exception) {

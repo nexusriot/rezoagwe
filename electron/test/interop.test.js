@@ -332,3 +332,69 @@ test('a client on another cluster cannot read this one', { skip: !ENABLED }, asy
   assert.equal(stranger.store.get('secret'), undefined, 'a foreign cluster name must not decode the data');
   assert.equal(stranger.peerAddrs().length, 0, 'and the roster reply must not authenticate either');
 });
+
+/**
+ * A real Go node joining *this* client's rendezvous.
+ *
+ * Every other case here points the JavaScript at a Go rendezvous. This is the
+ * direction that was broken: the Go service reported the address it observed
+ * and this one did not, so a Go node run with `-advertise auto` against the
+ * desktop client resolved to the wildcard and published `0.0.0.0:<port>` to the
+ * whole cluster — an address no peer can dial. Nothing failed anywhere: Go
+ * simply found no address to adopt and said so on stderr while carrying on.
+ *
+ * `-doctor` is the whole exchange in one process: it starts a node, waits out
+ * two heartbeats, prints the report and exits.
+ */
+test('a Go node learns from this client’s rendezvous where it is seen from', { skip: !ENABLED }, async (t) => {
+  const bootstrapPort = await freePort();
+  const goNodePort = await freePort();
+
+  const goBin = fs.mkdtempSync(path.join(os.tmpdir(), 'rezoagwe-go-'));
+  const build = spawnSync('go', ['build', '-o', path.join(goBin, 'discovery'), './cmd/discovery'], {
+    cwd: REPO, encoding: 'utf8',
+  });
+  assert.equal(build.status, 0, `go build failed: ${build.stderr}`);
+
+  const { BootstrapServer } = require('../src/core/bootstrap-server');
+  const rendezvous = new BootstrapServer(
+    { port: bootstrapPort, psk: PSK, cluster: CLUSTER, nodeTimeoutMs: 3_600_000 }, null, {},
+  );
+  t.after(async () => {
+    await rendezvous.stop().catch(() => {});
+    fs.rmSync(goBin, { recursive: true, force: true });
+  });
+  await rendezvous.start();
+
+  // Bound to a wildcard and told to ask: a node in this state knows every
+  // address its machine has and not which one its packets leave by.
+  //
+  // spawn, never spawnSync: the rendezvous being tested runs in *this* process,
+  // and spawnSync blocks the event loop for as long as the child lives. The
+  // kernel still completes the TCP handshake into the backlog, so Go sees a
+  // connected socket, writes its request and times out reading — which looks
+  // exactly like a service that accepted the stream and refused to answer.
+  const report = await new Promise((resolve, reject) => {
+    const child = spawn(path.join(goBin, 'discovery'), [
+      '-headless', `-node=0.0.0.0:${goNodePort}`, '-advertise=auto',
+      `-bootstrap=127.0.0.1:${bootstrapPort}`, `-psk=${PSK}`, `-cluster=${CLUSTER}`,
+      '-nick=golang', '-data=-', '-doctor',
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '';
+    child.stdout.on('data', (d) => { out += d; });
+    child.stderr.on('data', (d) => { out += d; });
+    child.once('error', reject);
+    child.once('close', () => resolve(out));
+    const kill = setTimeout(() => child.kill('SIGKILL'), 40_000);
+    child.once('close', () => clearTimeout(kill));
+  });
+  assert.doesNotMatch(
+    report, /no seed reported an address/,
+    'this rendezvous has to answer with the address it saw',
+  );
+  assert.match(
+    report, /advertising 127\.0\.0\.1:\d+ \(-advertise\)/,
+    'and `auto` has to resolve to that host with the port the node binds, not to the wildcard',
+  );
+  assert.doesNotMatch(report, /advertising 0\.0\.0\.0/, 'the wildcard is an address no peer can dial');
+});

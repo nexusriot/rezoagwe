@@ -9,7 +9,7 @@ const { Codec, DecodeError, DecodeException, keyFingerprint } = require('../prot
 const { UdpTransport, PacketTooLargeError } = require('../net/udp');
 const { StoreRefusal } = require('./refusal');
 const { writeFrame, readFrame, frameWithLength } = require('../net/framing');
-const { normalizeAddr, validPeerAddr, localIpv4 } = require('../net/addr');
+const { normalizeAddr, validPeerAddr, localIpv4, splitHostPort, sameHost } = require('../net/addr');
 const { KvStore } = require('./kvstore');
 const { ChatTracker, ChatOutcome } = require('./chatseq');
 const { Metrics } = require('./metrics');
@@ -82,6 +82,10 @@ class NodeEngine extends EventEmitter {
     // a lossy network instead of on real sockets.
     this.listen = opts.listen || ((port, o) => UdpTransport.listen(port, o));
     this.now = opts.now || Date.now;
+
+    // The source address a rendezvous service last observed this node arriving
+    // from, or '' while none has answered. Only a rendezvous can supply it.
+    this.seenAt = '';
 
     this.persister = this.dataFile
       ? new Persister(this.dataFile, { onError: (e) => this.logActivity(`persist failed: ${e.message}`) })
@@ -159,6 +163,29 @@ class NodeEngine extends EventEmitter {
   /** The address peers are told to reach this node at. */
   get addr() {
     return `${this.config.advertiseHost || localIpv4()}:${this.config.port}`;
+  }
+
+  /**
+   * The observed address when it names a different host from the one this node
+   * advertises, and '' when they agree or when no rendezvous has answered.
+   *
+   * Recorded, never adopted: the advertised address is this node's identity in
+   * its own peer table and is read from every loop, so rewriting it under a
+   * running node would leave isSelf answering about an address the node had
+   * stopped using.
+   *
+   * Hosts only. A datagram arrives from the node's own bound socket so its port
+   * is right, but a stream is dialled with an ephemeral source port and its port
+   * means nothing — warning about a port the node never claimed would be worse
+   * than saying nothing at all.
+   */
+  advertiseMismatch() {
+    if (!this.seenAt) return '';
+    const observed = splitHostPort(this.seenAt);
+    if (!observed) return '';
+    const advertised = splitHostPort(this.addr);
+    if (!advertised) return '';
+    return sameHost(advertised.host, observed.host) ? '' : this.seenAt;
   }
 
   get isRunning() {
@@ -1594,6 +1621,7 @@ class NodeEngine extends EventEmitter {
    * join — which reads as a node leaving twice.
    */
   async applyRoster(roster) {
+    if (roster.seenAt) this.seenAt = roster.seenAt;
     let learned = false;
     for (const p of roster.peers) {
       const isNew = this.addPeer(p.addr);
@@ -1845,6 +1873,7 @@ class NodeEngine extends EventEmitter {
       streamListener: this.transport ? this.transport.streamsAvailable : false,
       advertiseHost: this.config.advertiseHost,
       localIpv4: localIpv4(),
+      advertiseMismatch: this.advertiseMismatch(),
       running: this.isRunning,
       startedAtMs: this.startedAtMs,
       uptimeSec: this.startedAtMs === 0 ? 0 : Math.floor((this.now() - this.startedAtMs) / 1000),

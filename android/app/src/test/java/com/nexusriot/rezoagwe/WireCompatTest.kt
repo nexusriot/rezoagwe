@@ -103,4 +103,45 @@ class WireCompatTest {
         )
         assertEquals("", legacy.valueHash)
     }
+
+    /**
+     * The reflexive address, pinned against the bytes Go actually writes.
+     *
+     * Three implementations serve this roster and all three must agree: a port
+     * that omits `seen_at` leaves a joiner unable to learn where the cluster
+     * sees it, and one that writes `"seen_at":""` where Go writes nothing is a
+     * wire difference even though both decode the same.
+     */
+    @Test
+    fun theRosterCarriesTheObservedAddressExactlyAsGoWritesIt() {
+        val go = """{"peers":[{"addr":"10.0.0.1:3137","nick":"alice"}],"seen_at":"192.168.1.9:48812"}"""
+        val decoded = WireJson.decodeFromString<BootstrapRoster>(go)
+        assertEquals("192.168.1.9:48812", decoded.seenAt)
+        assertEquals(1, decoded.peers.size)
+        assertEquals(go, WireJson.encodeToString(decoded))
+    }
+
+    /**
+     * An unobserved address is absent from the frame, not sent as "".
+     *
+     * Go gives `seen_at` omitempty, so it writes nothing; a port that wrote the
+     * empty string would be sending a field Go never sends. The `peers` array
+     * is a separate, older and harmless difference — Go has no omitempty there
+     * and writes `"peers":[]` where this port omits the default — and both
+     * decoders read either form, so only the new field is pinned here.
+     */
+    @Test
+    fun anUnobservedAddressIsOmittedTheWayGoOmitsIt() {
+        val encoded = WireJson.encodeToString(BootstrapRoster(peers = emptyList(), seenAt = ""))
+        assertFalse("an empty seen_at must not be written", encoded.contains("seen_at"))
+        assertEquals("", WireJson.decodeFromString<BootstrapRoster>("""{"peers":[]}""").seenAt)
+    }
+
+    /** An older rendezvous sends no field at all; that is not an error. */
+    @Test
+    fun aRosterWithoutTheFieldStillDecodes() {
+        val decoded = WireJson.decodeFromString<BootstrapRoster>("""{"peers":null}""")
+        assertEquals("", decoded.seenAt)
+        assertTrue(decoded.peers.isEmpty())
+    }
 }

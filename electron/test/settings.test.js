@@ -8,7 +8,7 @@ const path = require('node:path');
 
 const {
   DEFAULTS, SettingsStore, sanitize, seedList, toNodeConfig, toBootstrapConfig,
-  nodeNeedsRestart, bootstrapNeedsRestart,
+  nodeNeedsRestart, bootstrapNeedsRestart, refusals,
 } = require('../src/core/settings');
 const { Persister } = require('../src/core/persistence');
 const { Runtime } = require('../src/core/runtime');
@@ -168,5 +168,49 @@ test('the snapshot carries a start-up failure the renderer was not there to hear
   await runtime.guard(async () => {});
   assert.equal(runtime.snapshot().lastError, '');
 
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// Refusing a value is only half an answer. The form repaints from what comes
+// back, so a refused port simply snaps back while the toast says "Settings
+// applied" — which reads as the field not working rather than the value being
+// wrong, and teaches people to stop trusting the screen.
+test('a value that cannot be kept is named, and a good one is not', () => {
+  const kept = { ...DEFAULTS, port: 3137, bootstrapPort: 9999, nick: 'desk', cluster: 'lab' };
+  assert.deepEqual(refusals(kept, DEFAULTS), [], 'a settings screen full of valid values says nothing');
+
+  // 0 binds an ephemeral port and the node then advertises an address no peer
+  // can dial; 99999 cannot bind at all. Neither fails usefully on its own.
+  assert.match(refusals({ ...kept, port: 0 }, kept)[0], /node port 0 .*kept 3137/);
+  assert.match(refusals({ ...kept, port: 99999 }, kept)[0], /node port 99999 .*kept 3137/);
+  assert.match(refusals({ ...kept, bootstrapPort: 0 }, kept)[0], /bootstrap port 0 .*kept 9999/);
+  assert.match(refusals({ ...kept, nick: '   ' }, kept)[0], /nickname cannot be blank/);
+  assert.match(refusals({ ...kept, cluster: '' }, kept)[0], /cluster name cannot be blank/);
+
+  // Every message has to name a value the user can act on: "kept 3137" is the
+  // half that says what is actually in effect now.
+  assert.equal(refusals({ ...kept, port: 0, nick: '' }, kept).length, 2);
+});
+
+test('trimming is not reported, because it is what the user wanted', () => {
+  // The screen documents it, and naming it on every paste would bury the two
+  // messages that matter.
+  const kept = { ...DEFAULTS, port: 3137, bootstrapPort: 9999, nick: 'desk', cluster: 'lab' };
+  assert.deepEqual(refusals({ ...kept, psk: ' secret ', cluster: ' lab ' }, kept), []);
+  assert.equal(sanitize({ ...kept, psk: ' secret ' }, kept).psk, 'secret', 'still trimmed, just not announced');
+});
+
+test('applying a refused value warns before it stores anything', async () => {
+  // The warning is the only thing standing between a user and a port field that
+  // appears to do nothing.
+  const dir = tmpdir();
+  const runtime = new Runtime(dir, { listen: async () => { throw new Error('no sockets in this test'); } });
+  const warnings = [];
+  runtime.on('warning', (w) => warnings.push(w));
+  const before = runtime.settings.port;
+  const after = await runtime.applySettings({ ...runtime.settings, port: 0 });
+  assert.equal(after.port, before, 'the refused value is not stored');
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /Settings: node port 0 is not a usable port/);
   fs.rmSync(dir, { recursive: true, force: true });
 });

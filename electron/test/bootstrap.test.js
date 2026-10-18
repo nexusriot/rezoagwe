@@ -177,3 +177,46 @@ test('status reports what the service is actually doing', async () => {
   await server.stop();
   assert.equal(server.status().running, false);
 });
+
+// The reflexive address. A node bound to a wildcard knows every address its
+// machine has and not which one its packets leave by, so the rendezvous service
+// is the only component that can tell it where the cluster actually sees it.
+// This shipped in the Go service and in neither port, which made the ERROR that
+// names the right address unreachable for anyone whose rendezvous is the phone
+// or the desktop, and made `-advertise auto` against one fall back to
+// advertising the wildcard — an address no peer can dial.
+test('a roster reports the address the service observed the request arriving from', async () => {
+  const { net, server, client } = harness();
+  await server.start();
+  server.register('127.0.0.1:5001', 'bob');
+
+  // The asker claims an address that is not the one its packets come from —
+  // which is the whole case this field exists for. The answer goes to the
+  // claimed address, so that is where the roster has to be read.
+  const claimed = '10.9.9.9:3137';
+  const believed = net.attach(claimed);
+  const got = [];
+  believed.on('packet', (pkt) => {
+    const frame = client.codec.decode(pkt.data);
+    got.push(JSON.parse(frame.body.toString('utf8')));
+  });
+
+  await client.send(Kind.BOOTSTRAP_DISCOVER, W.encodeBootstrapDiscover({ from: claimed }));
+  await settle();
+  const roster = W.decodeBootstrapRoster(got.at(-1));
+  assert.equal(roster.seenAt, client.addr, 'the source the transport saw, not what the asker claimed');
+  assert.notEqual(roster.seenAt, claimed);
+  await server.stop();
+});
+
+// Encoding it is half the contract: Go omits an empty seen_at, so a port that
+// writes "seen_at":"" where Go writes nothing is a wire difference even though
+// both decode the same.
+test('an unobserved address is omitted from the roster rather than sent empty', () => {
+  const wire = W.encodeBootstrapRoster({ peers: [], seenAt: '' });
+  assert.ok(!('seen_at' in wire), 'an empty seen_at must be omitted, as Go omits it');
+  const withAddr = W.encodeBootstrapRoster({ peers: [], seenAt: '10.0.0.4:3137' });
+  assert.equal(withAddr.seen_at, '10.0.0.4:3137');
+  assert.equal(W.decodeBootstrapRoster(withAddr).seenAt, '10.0.0.4:3137');
+  assert.equal(W.decodeBootstrapRoster({ peers: [] }).seenAt, '', 'an older service sends no field');
+});

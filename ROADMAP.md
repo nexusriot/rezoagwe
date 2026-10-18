@@ -13,9 +13,15 @@ Item 1 is next. The three Tier 0 items that sat ahead of it have shipped — see
 
 ## Shipped
 
-The repository is at **0.4.7** — the version the Makefile stamps into the Go
+The repository is at **0.4.8** — the version the Makefile stamps into the Go
 binaries and their `.deb`, the desktop client's `package.json`, and the Android
 app's `versionName`; a test keeps the four in step.
+
+0.4.8 is a device round: a tablet, the desktop client and two Go peers on one
+LAN. It found that the reflexive address 0.4.7 added had shipped in the Go
+rendezvous and in neither port, and that the Android app threw away every piece
+of typed state on a rotation and kept a refused setting on screen with nothing
+in effect behind it. See *0.4.8* below.
 
 0.4.7 releases three rounds. The **Tier 0–3 round** below is eleven items:
 eight features off the backlog, and three ahead of them that came out of
@@ -24,7 +30,9 @@ consistency check never had, and the address only the rendezvous service can
 see. That round is all Go-side; the Kotlin and JavaScript ports are unchanged
 by it and remain at wire parity, because both fields it added are optional and
 a port that ignores them simply does not forward a chat line and does not
-learn where it is seen from.
+learn where it is seen from. That last half-sentence was wrong about what it
+cost, and 0.4.8 is what it cost: a port that does not *report* where it sees a
+node from leaves every joiner guessing, whatever the joiner is written in.
 
 The **hardware round** after it found that one of those eleven had only landed
 in the Go implementation. The **device round** that closes 0.4.7 ran a tablet
@@ -74,6 +82,89 @@ the Kotlin and JavaScript ports — which had been carrying the same anti-entrop
 defect all along.
 
 Newest first.
+
+### 0.4.8 — the device round that read the ports back
+
+A PRITOM M10 (Android 16), the Electron client and two Go peers plus a Go
+rendezvous on one LAN, cluster `e2elab`. Most of this round is the happy path
+and the corner cases holding: a write from each of the three implementations
+reaching the other three with all four folding to the same fingerprint, a 2 MB
+value over the stream path, emoji, CJK, a 4 KB key, `/ # ? %`, a newline, a
+tab, a key of nothing but spaces, an empty value, invalid UTF-8 refused with
+`422`, TTL, CAS both ways, a real Wi-Fi outage resolved by last-write-wins with
+the tombstone holding and five chat lines detected, pulled and re-inserted in
+order, a force-stop and relaunch that restored the node by itself, and forced
+deep Doze. Three things did not hold.
+
+**The reflexive address shipped in one implementation of three** (§13). 0.4.7
+added it and the note above said the ports were unaffected because the field is
+optional. Optional for a *reader*; for a *writer* it is the whole feature. The
+Kotlin and JavaScript rendezvous services never filled in `SeenAt`, and neither
+node ever read one, so the ERROR that names the address a node should be
+advertising — the one check that can say which address is right rather than
+that this one looks wrong — simply did not exist outside Go. Measured: a Go
+node run with `-advertise auto` against the tablet's rendezvous resolved to
+`0.0.0.0:<port>` and published that to the cluster, an address no peer can
+dial. Both halves are implemented in both ports now and verified on the LAN in
+both directions.
+
+Nothing failed while this was broken, which is the part worth keeping: an
+unknown field is ignored by design, so a port that says *less* than the others
+is invisible to every suite including the interop one. Three checks now hold
+the implementations together — `docs.test.js` on the three services and the
+three rules, a `WireCompatTest` case pinning the encoding against the bytes Go
+writes, and an interop case that runs a real Go node against *this client's*
+rendezvous, which is the direction nothing tested before.
+
+Two harness faults surfaced while writing those. `MemStream` had no
+`remoteAddress`, so the in-memory network could not model a connection's source
+at all and the desktop suite was structurally unable to see this bug; it now
+carries both ends' addresses and hands out a fresh ephemeral source port per
+dial, so a rule comparing ports rather than hosts fails there too. And the
+first draft of the interop test used `spawnSync` while the rendezvous under
+test ran in the same process: the kernel completes the handshake into the
+backlog, so Go saw a connected socket, wrote its request and timed out reading
+— indistinguishable from a service that accepts a stream and refuses to answer.
+
+**Rotation discarded everything typed into the Android app.** An open key
+dialog was dismissed outright, taking the key, the value and the TTL; the chat
+composer emptied mid-sentence; unsaved **Settings** edits reverted. The
+navigation state was already `rememberSaveable` and only the forms were not, so
+the app came back on the right screen with the work gone, which reads as having
+thrown it away on purpose. A tablet is the device that gets rotated. The row
+being edited is now held by key with the version it opened against beside it —
+re-reading the entry on restore would have quietly let through a peer write
+made while the screen was turning. `repo.test.js` fails on a screen that holds
+typed text in state a rotation discards.
+
+**A state file that could not be read was lost in silence, in two ports of
+three.** The desktop client had reported it from the start; Go logged it to a
+logger that is discarded without `-logfile`, and the Kotlin port caught the
+exception and returned null. The consequence is not obvious from "the file was
+bad": the node starts with an empty store *and a freshly minted identity*, and
+then rewrites the unreadable file with that new state, so the evidence is gone
+by the time anyone looks. Its earlier writes are outranked until anti-entropy
+refills it, and every chat line it has ever said now reads as coming from a
+different author. Verified on the tablet: the backup held node id `45ae329a…`
+and the rewritten file `36c5c470…`. The mirror image of the `seen_at` gap, and
+checked the same way.
+
+**And the first fix caused a regression that only the radio could show.**
+Reporting the observed address outranks the loopback guess — except with Wi-Fi
+off, when a device advertises loopback because it has nowhere else to advertise
+and the address a rendezvous saw belongs to the network it has just left.
+Switching Wi-Fi off mid-round replaced *"Connect to a network"* with *"set the
+advertise host to 192.168.18.60"* — wrong then, and still wrong on the next
+network joined. The rule now defers to the `offline` flag the port already
+threads through its other findings, which is what that flag is for.
+
+**A refused setting stayed on screen with nothing in effect behind it.**
+Typing `0` into *Node port* and pressing *Apply* correctly stored 3137 and left
+the field reading `0`, silently: the form re-seeds only when the stored
+settings change, so editing *just* the bad field is exactly the case with no
+feedback. `Settings.refusals` now names what was not kept, the fields snap back
+to what is in effect, and the desktop client — which reverted visibly but
+toasted "Settings applied" over it — raises the same thing as a warning.
 
 ### 0.4.7 — the Tier 0–3 round
 

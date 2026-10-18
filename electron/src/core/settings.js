@@ -54,6 +54,32 @@ function sanitize(s, fallback = DEFAULTS) {
   };
 }
 
+/**
+ * What sanitize would not keep, phrased for the person who typed it.
+ *
+ * Refusing a value is only half an answer: the form repaints from the stored
+ * settings, so a refused port simply snaps back while the toast says "Settings
+ * applied". Saying nothing teaches people that the field does not work.
+ *
+ * Trimming is deliberately not reported. It is documented on the screen, it is
+ * what the user wanted, and naming it on every paste would bury the messages
+ * that matter.
+ */
+function refusals(s, fallback = DEFAULTS) {
+  const out = [];
+  const port = Number(s.port);
+  const bootstrapPort = Number(s.bootstrapPort);
+  if (!(Number.isInteger(port) && port > 0 && port <= 65535)) {
+    out.push(`node port ${s.port} is not a usable port, kept ${fallback.port}`);
+  }
+  if (!(Number.isInteger(bootstrapPort) && bootstrapPort > 0 && bootstrapPort <= 65535)) {
+    out.push(`bootstrap port ${s.bootstrapPort} is not a usable port, kept ${fallback.bootstrapPort}`);
+  }
+  if (!String(s.nick ?? '').trim()) out.push(`nickname cannot be blank, kept ${fallback.nick}`);
+  if (!String(s.cluster ?? '').trim()) out.push(`cluster name cannot be blank, kept ${fallback.cluster}`);
+  return out;
+}
+
 function toNodeConfig(s) {
   return {
     advertiseHost: s.advertiseHost,
@@ -122,6 +148,7 @@ class SettingsStore {
 }
 
 module.exports = {
+  refusals,
   DEFAULTS,
   SettingsStore,
   sanitize,

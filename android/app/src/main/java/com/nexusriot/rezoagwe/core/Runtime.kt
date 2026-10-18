@@ -56,6 +56,33 @@ data class Settings(
         bootstrapPort = bootstrapPort.takeIf { it in VALID_PORTS } ?: fallback.bootstrapPort,
     )
 
+    /**
+     * What [sanitized] would not keep, phrased for the person who typed it.
+     *
+     * Refusing a value is only half an answer. The settings form is seeded from
+     * storage, so a refusal that changes nothing else leaves the refused text
+     * sitting in the field with the node still on its old port: the user is
+     * looking at a number that is not in effect and nothing says so. Worse, the
+     * form only re-seeds when the stored settings actually change, so editing
+     * *just* the bad field is exactly the case with no feedback at all.
+     *
+     * Trimming is deliberately not reported. It is documented on the screen, it
+     * is what the user wanted, and naming it on every paste would bury the two
+     * messages that matter.
+     */
+    fun refusals(fallback: Settings = Settings()): List<String> {
+        val out = mutableListOf<String>()
+        if (port !in VALID_PORTS) {
+            out += "Node port $port is not a usable port; keeping ${fallback.port}."
+        }
+        if (bootstrapPort !in VALID_PORTS) {
+            out += "Bootstrap port $bootstrapPort is not a usable port; keeping ${fallback.bootstrapPort}."
+        }
+        if (nick.isBlank()) out += "Nickname cannot be blank; keeping ${fallback.nick}."
+        if (cluster.isBlank()) out += "Cluster name cannot be blank; keeping ${fallback.cluster}."
+        return out
+    }
+
     fun toNodeConfig() = NodeConfig(
         advertiseHost = advertiseHost,
         port = port,

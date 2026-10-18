@@ -8,6 +8,7 @@ const path = require('node:path');
 const S = require('../renderer/shared');
 const G = require('../renderer/graph');
 const { healthChecks, asReport, Severity } = require('../src/core/diagnostics');
+const { sameHost } = require('../src/net/addr');
 
 /**
  * The rules a screenshot cannot check: which screen pairs with which, when a
@@ -481,4 +482,38 @@ test('stream errors are explained, not just counted', () => {
   assert.match(check.detail, /firewall that passes UDP and blocks TCP/);
 
   assert.ok(!healthChecks(baseDiagnostics(), Date.now()).some((c) => c.title.includes('stream (TCP)')));
+});
+
+// The reflexive address, consumed. The rendezvous service is the one component
+// that sees where a node's packets actually come from, so when it has said so
+// that outranks the loopback heuristic: the heuristic can say an address looks
+// wrong and only this can say which address is right.
+test('the address the rendezvous observed outranks the loopback guess and names the fix', () => {
+  const checks = healthChecks(baseDiagnostics({
+    addr: '0.0.0.0:3137',
+    advertiseMismatch: '192.168.1.42:48812',
+  }), Date.now());
+  const check = find(checks, 'does not see this node at');
+  assert.equal(check.severity, Severity.ERROR);
+  assert.match(check.detail, /192\.168\.1\.42/);
+  assert.match(check.detail, /192\.168\.1\.42:3137/, 'the port the node binds, not the ephemeral one observed');
+  assert.ok(!find(checks, 'loopback'), 'the weaker guess must not sit beside the answer');
+});
+
+test('an observed address that agrees with the advertised one says nothing', () => {
+  // Reported on every roster, so a node that is configured correctly must not
+  // see a finding at all — otherwise the check is noise and gets ignored.
+  const checks = healthChecks(baseDiagnostics({ advertiseMismatch: '' }), Date.now());
+  assert.ok(!find(checks, 'does not see this node at'));
+});
+
+test('a wildcard advertise is a mismatch and a matching literal is not', () => {
+  // The engine decides this, not the renderer: a node bound to a wildcard is
+  // precisely the case the field exists for, and a node whose advertised host
+  // is what the service saw is correct however it got there.
+  assert.equal(sameHost('0.0.0.0', '192.168.1.42'), false);
+  assert.equal(sameHost('', '192.168.1.42'), false);
+  assert.equal(sameHost('192.168.1.42', '192.168.1.42'), true);
+  assert.equal(sameHost('192.168.1.9', '192.168.1.42'), false);
+  assert.equal(sameHost('gateway.local', '192.168.1.42'), true, 'a name peers can resolve is not a mistake');
 });

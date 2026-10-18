@@ -33,6 +33,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -50,13 +51,25 @@ import kotlinx.coroutines.withContext
 @Composable
 fun KeysScreen(node: NodeEngine) {
     val entries by node.entries.collectAsState()
-    var editing by remember { mutableStateOf<Entry?>(null) }
-    var creating by remember { mutableStateOf(false) }
-    var historyOf by remember { mutableStateOf<String?>(null) }
-    var confirmDelete by remember { mutableStateOf<String?>(null) }
+    // Which dialog is open survives a configuration change, because losing it
+    // takes the half-typed key and value with it. A rotation is the common one
+    // and a tablet is the device that gets rotated; a process death while the
+    // dialog is open is the same loss, more rarely.
+    //
+    // The row being edited is held by key rather than by Entry: an Entry is not
+    // saveable, and the key is the identity anyway. The version the dialog
+    // opened against is kept beside it because that, not the current version, is
+    // what the optional guard has to compare — re-reading the entry on restore
+    // would quietly let through a peer write made while the screen was turning.
+    var editingKey by rememberSaveable { mutableStateOf<String?>(null) }
+    var editingVersionCounter by rememberSaveable { mutableStateOf(0L) }
+    var editingVersionNode by rememberSaveable { mutableStateOf("") }
+    var creating by rememberSaveable { mutableStateOf(false) }
+    var historyOf by rememberSaveable { mutableStateOf<String?>(null) }
+    var confirmDelete by rememberSaveable { mutableStateOf<String?>(null) }
     // A refused guarded write used to leave only a line in the chat log, which is
     // not the screen the user is looking at: the edit simply vanished.
-    var notice by remember { mutableStateOf<String?>(null) }
+    var notice by rememberSaveable { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
 
     Box(modifier = Modifier.fillMaxSize()) {
@@ -99,7 +112,11 @@ fun KeysScreen(node: NodeEngine) {
             items(entries, key = { it.key }) { entry ->
                 KeyRow(
                     entry = entry,
-                    onEdit = { editing = entry },
+                    onEdit = {
+                        editingKey = entry.key
+                        editingVersionCounter = entry.version.counter
+                        editingVersionNode = entry.version.node
+                    },
                     onHistory = { historyOf = entry.key },
                     onDelete = { confirmDelete = entry.key },
                 )
@@ -161,7 +178,16 @@ fun KeysScreen(node: NodeEngine) {
         )
     }
 
-    editing?.let { entry ->
+    // The entry may have been deleted by a peer while the dialog was open, and
+    // after a restore it may be gone entirely; the dialog closes rather than
+    // editing something that is no longer there.
+    editingKey?.let { openKey ->
+        val entry = entries.firstOrNull { it.key == openKey }
+        if (entry == null) {
+            editingKey = null
+            return@let
+        }
+        val openedAt = Version(editingVersionCounter, editingVersionNode)
         KeyDialog(
             title = "Edit ${entry.key}",
             initialKey = entry.key,
@@ -173,9 +199,9 @@ fun KeysScreen(node: NodeEngine) {
             },
             keyEditable = false,
             guardHint = "Guard (refuse if a peer changed it meanwhile)",
-            onDismiss = { editing = null },
+            onDismiss = { editingKey = null },
             onSave = { key, value, ttl, guard ->
-                editing = null
+                editingKey = null
                 notice = null
                 scope.launch {
                     val rejected = withContext(Dispatchers.IO) { node.admit(key, value) }
@@ -190,7 +216,7 @@ fun KeysScreen(node: NodeEngine) {
                             // The version on screen when the dialog opened is the guard:
                             // if a peer wrote the key in the meantime, the save is refused
                             // rather than silently overwriting the newer value.
-                            node.compareAndSet(key, value, ttl, entry.version) == null
+                            node.compareAndSet(key, value, ttl, openedAt) == null
                         } else {
                             node.set(key, value, ttl)
                             false
@@ -281,10 +307,16 @@ private fun KeyDialog(
     onDismiss: () -> Unit,
     onSave: (key: String, value: String, ttlSeconds: Long, guard: Boolean) -> Unit,
 ) {
-    var key by remember { mutableStateOf(initialKey) }
-    var value by remember { mutableStateOf(initialValue) }
-    var ttl by remember { mutableStateOf(if (initialTtl > 0) initialTtl.toString() else "") }
-    var guard by remember { mutableStateOf(false) }
+    // Saveable, not merely remembered: everything in this dialog is typed by
+    // hand, and a rotation threw all of it away along with the dialog itself.
+    // The seeds are keyed on the initial key so that opening a different row
+    // re-seeds the form rather than showing the previous row's text.
+    var key by rememberSaveable(initialKey) { mutableStateOf(initialKey) }
+    var value by rememberSaveable(initialKey) { mutableStateOf(initialValue) }
+    var ttl by rememberSaveable(initialKey) {
+        mutableStateOf(if (initialTtl > 0) initialTtl.toString() else "")
+    }
+    var guard by rememberSaveable(initialKey) { mutableStateOf(false) }
 
     AlertDialog(
         onDismissRequest = onDismiss,

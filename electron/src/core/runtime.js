@@ -6,7 +6,8 @@ const { EventEmitter } = require('node:events');
 const { NodeEngine } = require('./node-engine');
 const { BootstrapServer } = require('./bootstrap-server');
 const {
-  SettingsStore, toNodeConfig, toBootstrapConfig, nodeNeedsRestart, bootstrapNeedsRestart,
+  SettingsStore, toNodeConfig, toBootstrapConfig, nodeNeedsRestart,
+  refusals, bootstrapNeedsRestart,
 } = require('./settings');
 
 /**
@@ -90,6 +91,11 @@ class Runtime extends EventEmitter {
   /** Applies new settings, restarting whichever role they affect and preserving what was running. */
   async applySettings(partial) {
     const previous = this.settings;
+    // A refused value is reported before anything else happens. The form
+    // repaints from what comes back, so an unusable port simply snaps back to
+    // the old one while the screen says "Settings applied" — which reads as
+    // the field not working rather than as the value being wrong.
+    for (const why of refusals(partial, previous)) this.emit('warning', `Settings: ${why}`);
     const updated = this.settingsStore.save(partial);
 
     if (nodeNeedsRestart(previous, updated)) {

@@ -486,4 +486,82 @@ class DiagnosticsTest {
 
         assertFalse(healthChecks(healthy(), now).any { it.title.contains("stream (TCP)") })
     }
+
+    /**
+     * A state file that cannot be read must not stop the node — losing the
+     * store is bad and refusing to start is worse — but the node starts empty
+     * and with a new identity, and then rewrites the file that was the
+     * evidence. This port swallowed the exception outright, so none of that
+     * reached any screen.
+     */
+    @Test
+    fun anUnreadableStateFileIsReported() {
+        val checks = healthChecks(
+            healthy().copy(
+                dataFile = "/data/user/0/com.nexusriot.rezoagwe/files/node.json",
+                loadError = "Unexpected JSON token at offset 7",
+            ),
+            now,
+        )
+        val check = checks.first { it.title == "State file could not be read" }
+        assertEquals(Severity.ERROR, check.severity)
+        assertTrue(check.detail.contains("node.json"))
+        assertTrue(check.detail.contains("Unexpected JSON token at offset 7"))
+        // The two consequences nobody guesses from "the file was bad".
+        assertTrue(check.detail.contains("new identity"))
+        assertTrue(check.detail.contains("different author"))
+    }
+
+    /**
+     * Every node has a state file, so a finding for the ordinary case would put
+     * an error on every report and get the real one ignored.
+     */
+    @Test
+    fun aStateFileThatReadsFineIsNotReported() {
+        assertTrue(
+            healthChecks(healthy(), now).none { it.title == "State file could not be read" },
+        )
+    }
+
+    /**
+     * With the radio off, the address a rendezvous saw before the outage says
+     * where this node *used to be*.
+     *
+     * A device with no network advertises loopback because it has nowhere else
+     * to advertise. Reporting the stale observation then tells someone whose
+     * Wi-Fi has dropped to hard-code the address they had — wrong now, and
+     * still wrong on the next network they join. Measured on a tablet with
+     * Wi-Fi switched off mid-round: the useful advice ("reconnect") had been
+     * replaced by the useless one.
+     */
+    @Test
+    fun `a stale observed address is not reported while the device is offline`() {
+        val d = healthy().copy(
+            addr = "127.0.0.1:3137",
+            advertiseMismatch = "192.168.18.60:48812",
+        )
+        val checks = healthChecks(d, now, DeviceReport(transport = "none"))
+
+        assertFalse(
+            "the rendezvous saw that address before the radio went off",
+            checks.any { it.title.contains("does not see this node at") },
+        )
+        // And the rule that gives the right answer is back.
+        val loopback = checks.first { it.title.contains("loopback") }
+        assertTrue(loopback.detail.contains("Connect to a network"))
+    }
+
+    /** Connected, the observation is current and still outranks the guess. */
+    @Test
+    fun `an observed address is reported while the device is connected`() {
+        val d = healthy().copy(
+            addr = "10.9.9.9:3137",
+            advertiseMismatch = "192.168.18.60:48812",
+        )
+        val checks = healthChecks(d, now, DeviceReport(transport = "Wi-Fi", validated = true))
+
+        val check = checks.first { it.title.contains("does not see this node at") }
+        assertEquals(Severity.ERROR, check.severity)
+        assertTrue(check.detail.contains("192.168.18.60"))
+    }
 }

@@ -1022,6 +1022,17 @@ What it needed that the engine did not have:
   outright, before the node is built — `cfg.AdvertiseAddr` is read without a
   lock by every loop and is the node's identity in its own peer table, so it
   has to be settled while nothing is running.
+
+  All three rendezvous services report it, and all three nodes consume it.
+  This shipped in the Go service alone, and nothing failed: both ports ignore
+  an unknown field and keep talking, so every suite stayed green while a node
+  that joined through the phone or the desktop silently fell back to the
+  loopback guess and `-advertise auto` against one resolved to the *wildcard*
+  — an address no peer can dial, published to the whole cluster. A field only
+  one implementation writes is a protocol fork nothing else can see, which is
+  why `docs.test.js` now holds the three services and the three rules together
+  rather than leaving it to the suites, none of which can observe a port that
+  merely says less.
 * **Whether discovery is on.** "No peers and no seeds" is sound advice to a
   node that has none and useless to one running `-mdns`, which has taken
   that advice and found nothing. The two have different causes — no other

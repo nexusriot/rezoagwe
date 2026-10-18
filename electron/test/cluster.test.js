@@ -4,7 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const { NodeEngine } = require('../src/core/node-engine');
-const { ID_CONFLICT_FLIPS } = require('../src/core/diagnostics');
+const { ID_CONFLICT_FLIPS, healthChecks, Severity } = require('../src/core/diagnostics');
 const { BootstrapServer } = require('../src/core/bootstrap-server');
 const { MemNetwork } = require('../src/net/mem');
 const { MAX_DATAGRAM_PAYLOAD } = require('../src/net/udp');
@@ -1119,4 +1119,85 @@ test('an activity entry stays on one line whatever the key holds', async () => {
   assert.ok(line, `no activity entry named the key: ${JSON.stringify(b.activity())}`);
   assert.ok(!/[\n\t]/.test(line), `entry still breaks the line: ${JSON.stringify(line)}`);
   await c.stopAll();
+});
+
+// End to end over the real wire: the service observes, the roster carries, the
+// node records, and the diagnosis names the address to use. Each half of that
+// shipped in Go alone, so a node joining through this port's rendezvous had no
+// way to learn it was advertising something nobody could reach.
+test('a node learns from the rendezvous which address the cluster sees it at', async () => {
+  const net = new MemNetwork();
+  const bootstrapAddr = '127.0.0.1:9991';
+  const bootstrap = new BootstrapServer(
+    { port: 9991, psk: 'k', cluster: 'test', nodeTimeoutMs: 3_600_000 },
+    null,
+    { listen: async () => net.attach(bootstrapAddr) },
+  );
+  await bootstrap.start();
+
+  // The node binds at one address and tells the cluster another — the wildcard
+  // case, where a machine knows every address it has and not which one its
+  // packets leave by.
+  const bound = '127.0.0.1:3601';
+  const engine = new NodeEngine(
+    {
+      advertiseHost: '10.9.9.9', port: 3601, nick: 'misconfigured',
+      psk: 'k', cluster: 'test', seeds: [bootstrapAddr], ...QUIET,
+    },
+    null,
+    { listen: async () => net.attach(bound) },
+  );
+  await engine.start();
+  await engine.joining;
+  await settle(60);
+
+  // The join runs over a stream, whose source port is ephemeral: only the host
+  // carries information, and that is what the rule compares.
+  assert.match(engine.seenAt, /^127\.0\.0\.1:\d+$/, 'the rendezvous reported where the packets came from');
+  assert.notEqual(engine.seenAt, bound, 'the observed port is ephemeral, not the bound one');
+  assert.equal(engine.advertiseMismatch(), engine.seenAt, 'and its host disagrees with what peers are told');
+
+  const checks = healthChecks(engine.diagnostics(), Date.now());
+  const check = checks.find((c) => c.title.includes('does not see this node at'));
+  assert.ok(check, 'the finding only a rendezvous can produce');
+  assert.equal(check.severity, Severity.ERROR);
+  assert.match(
+    check.detail, /127\.0\.0\.1:3601/,
+    'it names the observed host with the port the node binds, never the ephemeral one',
+  );
+
+  await engine.stop();
+  await bootstrap.stop();
+});
+
+test('a node whose advertised address is the one observed is told nothing', async () => {
+  const net = new MemNetwork();
+  const bootstrapAddr = '127.0.0.1:9992';
+  const bootstrap = new BootstrapServer(
+    { port: 9992, psk: 'k', cluster: 'test', nodeTimeoutMs: 3_600_000 },
+    null,
+    { listen: async () => net.attach(bootstrapAddr) },
+  );
+  await bootstrap.start();
+  const engine = new NodeEngine(
+    {
+      advertiseHost: '127.0.0.1', port: 3602, nick: 'fine',
+      psk: 'k', cluster: 'test', seeds: [bootstrapAddr], ...QUIET,
+    },
+    null,
+    { listen: async () => net.attach('127.0.0.1:3602') },
+  );
+  await engine.start();
+  await engine.joining;
+  await settle(60);
+
+  // The source port differs from the bound one on every stream, so a rule that
+  // compared addresses rather than hosts would accuse every correct node here.
+  assert.match(engine.seenAt, /^127\.0\.0\.1:\d+$/);
+  assert.notEqual(engine.seenAt, '127.0.0.1:3602');
+  assert.equal(engine.advertiseMismatch(), '', 'the hosts agree, so there is nothing to report');
+  const checks = healthChecks(engine.diagnostics(), Date.now());
+  assert.ok(!checks.some((c) => c.title.includes('does not see this node at')));
+  await engine.stop();
+  await bootstrap.stop();
 });

@@ -318,6 +318,67 @@ constant: a device on an older build reports `agrees: false` against every
 rebuilt node until its APK is replaced, which looks exactly like real
 divergence. Upgrade every node before trusting a report that spans them.
 
+### 2026-10-18 — a tablet, a desktop client and two Go peers on one LAN
+
+PRITOM M10 (Android 16) at 192.168.18.60 with Go `alice` and `bob`, a Go
+rendezvous and the Electron client on the host at 192.168.18.79, cluster
+`e2elab`. The happy path held in every direction — a write from each of the
+three implementations reached the other three and all four folded to the same
+fingerprint — and so did the corner cases: a 2 MB value over the stream path,
+emoji and CJK keys, a 4 KB key, keys carrying `/ # ? %`, a newline and a tab, a
+key of nothing but spaces, an empty value, and a value of invalid UTF-8 refused
+with `422`. TTL expired on all three within a second of each other; CAS refused
+a stale version and an absent-only write to an existing key. A real Wi-Fi
+outage, with writes and chat on both sides, converged on one value with the
+tombstone holding; the tablet detected its own gap, pulled the five lines it
+had missed and re-inserted them in order. `am force-stop` and a relaunch
+brought the node back by itself. The foreground service survived forced deep
+Doze. A node started with `-max-keys 5` was correctly reported as refusing
+updates rather than as stale, from both sides of the cluster.
+
+What it found:
+
+* **Every piece of typed state was lost on rotation.** An open key dialog was
+  dismissed outright, taking the key, value and TTL with it; the chat composer
+  emptied mid-sentence; unsaved **Settings** edits reverted. The navigation
+  state was already `rememberSaveable` and only the forms were not, so the app
+  came back on the right screen with the work gone, which reads as having
+  discarded it on purpose. A tablet is the device that gets rotated. All the
+  form state is saveable now, and `repo.test.js` fails on a screen that holds
+  typed text in state a rotation discards.
+* **A refused setting was kept on screen with nothing in effect behind it.**
+  Typing `0` into *Node port* and pressing *Apply* correctly stored 3137 — and
+  left the field reading `0`, with no message. The form only re-seeds when the
+  stored settings change, so editing *just* the bad field is exactly the case
+  with no feedback at all. The refused fields now snap back to what is in
+  effect and the screen says which value was not kept; the desktop client
+  raises the same thing as a warning, where it had been toasting "Settings
+  applied" over a silent revert.
+* **A state file that could not be read was lost in silence.** The node starts
+  anyway — losing the store is bad and refusing to start is worse — but it
+  starts with an empty replica *and a freshly minted identity*, and then
+  rewrites the unreadable file with that new state. This port caught the
+  exception and returned null, so nothing said any of it had happened.
+  Confirmed on the tablet by corrupting `files/node.json`: the backup held node
+  id `45ae329a…`, the rewritten file `36c5c470…`. **Diag** now raises an error
+  naming the file, the parse failure and both consequences.
+* **This port's rendezvous never reported the address it observed.** See
+  [DESIGN §13](../DESIGN.md#13-diagnostics): the roster carries `SeenAt`, which
+  is the only way a node bound to a wildcard can learn which of its addresses
+  the cluster reaches it on. Only the Go service sent it and only the Go node
+  read it, so a peer joining through this app fell back to the loopback guess,
+  and a Go node run with `-advertise auto` against it resolved to `0.0.0.0` and
+  published that to the whole cluster. Both halves are implemented here and in
+  the desktop client now, verified on this LAN in both directions.
+
+  Fixing it caused one regression that only the radio could show: with Wi-Fi
+  off a device advertises loopback because it has nowhere else to advertise,
+  and the address the rendezvous saw belongs to the network it has just left.
+  Reporting it then replaced *"Connect to a network"* with *"set the advertise
+  host in Settings to 192.168.18.60"* — wrong then, and still wrong on the next
+  network joined. The rule defers to the `offline` flag now, which is what that
+  flag is for.
+
 ## Known gaps
 
 * The battery cost of the 10 s gossip tick is still unmeasured; **Diag**
@@ -327,4 +388,6 @@ divergence. Upgrade every node before trusting a report that spans them.
   They are `NodeConfig` options and enforced by the engine against a peer as
   well as a local writer, but only the Go node has flags for them.
 * Editing **Settings** and navigating away before *Apply* discards the edit,
-  with nothing on screen to say so.
+  with nothing on screen to say so. A rotation no longer does this — the fields
+  are `rememberSaveable` — but leaving the screen still re-seeds them from
+  storage.

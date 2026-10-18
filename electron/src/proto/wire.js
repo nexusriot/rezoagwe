@@ -506,12 +506,18 @@ function decodeBootstrapPeer(o) {
   return { addr: str(o && o.addr), nick: str(o && o.nick), lastSeen: num(o && o.last_seen) };
 }
 
+// seen_at is the source address the rendezvous service observed the request
+// arriving from — the asker's own address as the network sees it rather than as
+// the asker believes it. It is the one thing a node cannot work out for itself:
+// bound to a wildcard it knows every address its machine has and not which one
+// its packets leave by. Only the host is dependable, because a stream is
+// dialled from an ephemeral source port.
 function encodeBootstrapRoster(r) {
-  return { peers: r.peers.map(encodeBootstrapPeer) };
+  return withOmitEmpty({ peers: r.peers.map(encodeBootstrapPeer), seen_at: r.seenAt || '' }, ['seen_at']);
 }
 
 function decodeBootstrapRoster(o) {
-  return { peers: list(o && o.peers).map(decodeBootstrapPeer) };
+  return { peers: list(o && o.peers).map(decodeBootstrapPeer), seenAt: str(o && o.seen_at) };
 }
 
 module.exports = {
