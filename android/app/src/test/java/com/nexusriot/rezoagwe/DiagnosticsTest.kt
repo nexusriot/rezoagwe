@@ -564,4 +564,43 @@ class DiagnosticsTest {
         assertEquals(Severity.ERROR, check.severity)
         assertTrue(check.detail.contains("192.168.18.60"))
     }
+
+    /**
+     * GC off warns that a node away too long will undo a delete. GC on is that
+     * same hazard, configured — and said nothing at all, which is the
+     * asymmetry: the advice appeared only while it was not being followed.
+     *
+     * It cannot be reported after the fact. A node that reclaimed a tombstone
+     * and then accepted a set for that key cannot tell a resurrection from
+     * someone writing it again, so the only honest moment is while the age is
+     * configured. Reproduced on two nodes with an 8s age: the delete came back
+     * on every replica and the consistency check called it converged.
+     */
+    @Test
+    fun `tombstone GC names the exposure it creates`() {
+        val checks = healthChecks(healthy().copy(tombstoneTtlSec = 30), now)
+        val check = checks.first { it.title.contains("Tombstones are reclaimed") }
+        assertEquals(Severity.INFO, check.severity)
+        assertTrue(check.title.contains("30s"))
+        assertTrue(check.detail.contains("away for longer"))
+        assertTrue(check.detail.contains("undone"))
+    }
+
+    @Test
+    fun `GC off says the opposite and not both`() {
+        val d = healthy().copy(
+            tombstoneTtlSec = 0,
+            store = healthy().store.copy(tombstones = 3),
+        )
+        val checks = healthChecks(d, now)
+        assertTrue(checks.any { it.title.contains("kept forever") })
+        assertFalse(checks.any { it.title.contains("Tombstones are reclaimed") })
+    }
+
+    /** The exposure is the setting, not the tombstones it happens to hold. */
+    @Test
+    fun `the GC exposure is reported before anything is deleted`() {
+        val d = healthy().copy(tombstoneTtlSec = 3600, store = healthy().store.copy(tombstones = 0))
+        assertTrue(healthChecks(d, now).any { it.title.contains("Tombstones are reclaimed") })
+    }
 }

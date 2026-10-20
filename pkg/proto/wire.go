@@ -452,15 +452,39 @@ var asciiEscapeLen = func() (t [utf8.RuneSelf]uint8) {
 	return t
 }()
 
+// invalidByteCost is how many bytes the encoder writes for one byte it cannot
+// decode as UTF-8.
+//
+// Measured, not written down — which is the whole lesson here. This was the
+// constant 6, because Go wrote the six-byte escape `\ufffd`; since Go 1.25 it
+// writes the three-byte replacement character itself, so the constant became
+// wrong under a toolchain upgrade with nothing in the code to say so. The
+// escape table above is already re-derived from the encoder by its own test;
+// this was the one cost that was copied instead, and it is the one that drifted.
+//
+// A size calculation that mirrors another package's output has to come from
+// that package.
+var invalidByteCost = func() int {
+	b, err := json.Marshal("\xff")
+	if err != nil || len(b) < 3 {
+		// Unreachable for a string, but the two failure modes are not
+		// symmetric: over-counting only refuses a value that would have fit,
+		// while under-counting admits one that can never replicate. Fall back
+		// to the larger of the costs Go has ever charged.
+		return 6
+	}
+	return len(b) - 2 // less the surrounding quotes
+}()
+
 // EscapedLen is how many bytes s occupies once encoded as a JSON string,
 // counted without building it — the point is to measure values far too big to
 // want a second copy of.
 //
 // Printable text costs its own length. Control bytes cost up to six times it,
-// and bytes that are not valid UTF-8 cost most of all: the encoder replaces
-// each one with U+FFFD, six bytes written out. A value arriving through the
-// HTTP gateway is whatever bytes the client sent, so a binary blob really can
-// sextuple on the wire — which is why this is measured rather than assumed.
+// and bytes that are not valid UTF-8 cost [invalidByteCost] each, the encoder
+// having replaced them with U+FFFD. A value arriving through the HTTP gateway
+// is whatever bytes the client sent, so a blob really can multiply on the wire
+// — which is why this is measured rather than assumed.
 func EscapedLen(s string) int {
 	n := 2 // the surrounding quotes
 	for i := 0; i < len(s); {
@@ -472,7 +496,7 @@ func EscapedLen(s string) int {
 		r, size := utf8.DecodeRuneInString(s[i:])
 		switch {
 		case r == utf8.RuneError && size == 1:
-			n += 6 // �, one per byte the encoder could not decode
+			n += invalidByteCost // one per byte the encoder could not decode
 			i++
 		case r == ' ', r == ' ':
 			n += 6

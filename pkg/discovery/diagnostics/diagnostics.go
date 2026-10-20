@@ -443,6 +443,25 @@ func Checks(d Snapshot, now time.Time) []Check {
 				"you expect to heal.")
 	}
 
+	// The other half of that advice, which nothing said once it was taken. A
+	// reclaimed tombstone is the only record that a key was deleted, so a node
+	// that was away longer than the age comes back still holding the value and
+	// pushes it to a replica with nothing left to refuse it — the delete is
+	// undone everywhere and the consistency check calls the result converged,
+	// because it is. Reproduced on two nodes with an 8s age.
+	//
+	// It cannot be detected after the fact: a node cannot tell a resurrection
+	// from someone writing the key again. Naming the exposure while it is
+	// configured is the only honest moment to do it.
+	if d.TombstoneTTL > 0 {
+		add(SeverityInfo, fmt.Sprintf("Tombstones are reclaimed after %s", d.TombstoneTTL),
+			fmt.Sprintf("A delete is remembered for %s and then forgotten. A node that is away "+
+				"for longer comes back still holding the value, and the delete is undone on "+
+				"every replica with nothing to report it — the cluster converges on the "+
+				"resurrected value. Keep the age above the longest outage a node can return "+
+				"from, or leave GC off and let tombstones accumulate.", d.TombstoneTTL))
+	}
+
 	if !d.PSKSet {
 		add(SeverityInfo, "No pre-shared key",
 			"The framing key comes from the cluster name alone. That keeps two clusters on one "+

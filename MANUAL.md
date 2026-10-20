@@ -470,6 +470,14 @@ gone, undoing the delete on every replica. If you set a GC age, it has to exceed
 the longest outage you expect a node to return from. With GC off (the default)
 this cannot happen.
 
+Measured, not theorised: with an eight-second age the delete came back on both
+nodes and `/consistency` reported the cluster converged — because it had, on the
+resurrected value. **Nothing reports this after the fact**, and nothing can: a
+node that reclaimed a tombstone and then accepted a write for that key cannot
+tell a resurrection from someone simply writing it again. What you get instead
+is a finding naming the exposure for as long as GC is configured, and the
+`rezoagwe_kv_gc_total` counter, which rises each time a tombstone is reclaimed.
+
 **A node restarted without its state file is a new node.** Identity lives in the
 state file. Delete it, or point `-data` somewhere new, and the node comes back
 with a new id: a new chat author, and writes that sort differently against its

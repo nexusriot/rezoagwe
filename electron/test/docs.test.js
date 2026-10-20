@@ -590,3 +590,29 @@ test('every implementation reports a state file it could not read', () => {
     assert.match(src, /[Ll]oadError/, `${port} does not record why the state file failed to load`);
   }
 });
+
+/**
+ * Both halves of the tombstone-GC advice, in every implementation.
+ *
+ * With GC off all three warn that a node away too long will undo a delete.
+ * With GC on — the same hazard, configured — all three said nothing, and the
+ * undoing leaves no trace anywhere: the delete is reversed on every replica and
+ * the consistency check calls the result converged, because it is.
+ *
+ * Checked across the three because that is where this project's findings go
+ * missing: a rule written in one implementation is a silence in the other two.
+ */
+test('every implementation names the exposure tombstone GC creates', () => {
+  const rules = {
+    Go: read('pkg/discovery/diagnostics/diagnostics.go'),
+    Kotlin: read('android/app/src/main/java/com/nexusriot/rezoagwe/core/Diagnostics.kt'),
+    JavaScript: read('electron/src/core/diagnostics.js'),
+  };
+  for (const [port, src] of Object.entries(rules)) {
+    assert.match(src, /kept forever/, `${port} does not warn when GC is off`);
+    assert.match(
+      src, /Tombstones are reclaimed/,
+      `${port} says nothing once GC is on, which is the configured form of the same hazard`,
+    );
+  }
+});

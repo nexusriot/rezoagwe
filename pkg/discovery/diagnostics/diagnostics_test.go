@@ -738,3 +738,45 @@ func TestAReadableStateFileIsNotReported(t *testing.T) {
 	// noise on every report and get ignored along with the real one.
 	mustNotFind(t, Checks(healthy(), now), "State file could not be read")
 }
+
+// GC off warns that a node away too long will undo a delete. GC on is that
+// same hazard, configured — and said nothing at all, which is the asymmetry:
+// the advice appeared only while it was not being followed.
+//
+// It cannot be reported after the fact. A node that reclaimed a tombstone and
+// then accepted a set for that key cannot tell a resurrection from someone
+// writing it again, so the only honest moment is while the age is configured.
+func TestTombstoneGCNamesTheExposureItCreates(t *testing.T) {
+	snap := healthy()
+	snap.TombstoneTTL = 30 * time.Second
+
+	found := findCheck(t, Checks(snap, now), "Tombstones are reclaimed")
+	if found.Severity != SeverityInfo {
+		t.Errorf("severity = %v, want info", found.Severity)
+	}
+	for _, want := range []string{"30s", "away for longer", "undone"} {
+		if !strings.Contains(found.Title+" "+found.Detail, want) {
+			t.Errorf("finding does not mention %q: %s — %s", want, found.Title, found.Detail)
+		}
+	}
+}
+
+func TestGCOffSaysTheOppositeAndNotBoth(t *testing.T) {
+	snap := healthy()
+	snap.TombstoneTTL = 0
+	snap.Gauges.Tombstones = 3
+
+	checks := Checks(snap, now)
+	findCheck(t, checks, "kept forever")
+	mustNotFind(t, checks, "Tombstones are reclaimed")
+}
+
+// And a node with GC on but nothing deleted yet still says it, because the
+// exposure is the setting and not the tombstones it has happened to collect.
+func TestTheGCExposureIsReportedBeforeAnythingIsDeleted(t *testing.T) {
+	snap := healthy()
+	snap.TombstoneTTL = time.Hour
+	snap.Gauges.Tombstones = 0
+
+	findCheck(t, Checks(snap, now), "Tombstones are reclaimed")
+}

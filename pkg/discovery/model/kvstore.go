@@ -242,13 +242,16 @@ func (kv *KVStore) Limits() Limits {
 // Callers hold the lock.
 func (kv *KVStore) admitLocked(key, value string, now int64) error {
 	// Measured as the value will be written on the wire, not as it sits in
-	// memory: a blob of bytes that are not valid UTF-8 sextuples when the
-	// encoder replaces each one with U+FFFD, and a raw length check would wave
-	// it through to strand itself.
+	// memory: a byte the encoder has to escape costs up to six times its own
+	// length, and a raw length check would wave such a value through to strand
+	// itself.
 	//
 	// The cheap length test first, because the exact one walks the value and
-	// almost every value is nowhere near: nothing shorter than a sixth of the
-	// ceiling can exceed it however badly it escapes.
+	// almost every value is nowhere near: six is the worst any single byte can
+	// cost (an ASCII control, written \u0001), so nothing shorter than a sixth
+	// of the ceiling can exceed it however badly it escapes. That bound is
+	// pinned by a test rather than trusted, because it is the encoder's number
+	// and not ours.
 	//
 	// EscapedLen counts the surrounding quotes; the ceiling is about the value
 	// itself, so that a run of plain text exactly MaxReplicableValueBytes long

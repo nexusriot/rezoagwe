@@ -81,3 +81,44 @@ func TestEveryASCIIByteCostsWhatTheEncoderCharges(t *testing.T) {
 		}
 	}
 }
+
+// The cost of a byte the encoder cannot decode is derived from the encoder,
+// because it is the encoder's number and it has changed: Go wrote the six-byte
+// escape `\ufffd` until 1.25 and writes the three-byte replacement character
+// itself since. The constant that used to be here survived the upgrade looking
+// correct while silently refusing values that fit.
+func TestTheInvalidByteCostComesFromTheEncoder(t *testing.T) {
+	b, err := json.Marshal("\xff")
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if want := len(b) - 2; invalidByteCost != want {
+		t.Errorf("invalidByteCost = %d, this toolchain charges %d", invalidByteCost, want)
+	}
+	// Whatever it is, it has to be at least the replacement character itself.
+	if invalidByteCost < 3 {
+		t.Errorf("invalidByteCost = %d, too small to be a U+FFFD", invalidByteCost)
+	}
+}
+
+// admitLocked skips the exact walk for anything shorter than a sixth of the
+// replication ceiling, on the grounds that no single byte can cost more than
+// six. That is the encoder's bound, not ours, so it is checked rather than
+// assumed: if a toolchain ever charges more for one byte, the cheap filter
+// starts waving through values that cannot replicate.
+func TestNoByteCostsMoreThanSixTimesItself(t *testing.T) {
+	worst, worstByte := 0, byte(0)
+	for c := 0; c < 256; c++ {
+		s := string([]byte{byte(c)})
+		b, err := json.Marshal(s)
+		if err != nil {
+			t.Fatalf("marshal %#x: %v", c, err)
+		}
+		if n := len(b) - 2; n > worst {
+			worst, worstByte = n, byte(c)
+		}
+	}
+	if worst > 6 {
+		t.Errorf("byte %#x costs %d bytes encoded; the admitLocked pre-filter divides by 6", worstByte, worst)
+	}
+}

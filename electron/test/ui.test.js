@@ -517,3 +517,34 @@ test('a wildcard advertise is a mismatch and a matching literal is not', () => {
   assert.equal(sameHost('192.168.1.9', '192.168.1.42'), false);
   assert.equal(sameHost('gateway.local', '192.168.1.42'), true, 'a name peers can resolve is not a mistake');
 });
+
+// GC off warns that a node away too long will undo a delete. GC on is that same
+// hazard, configured — and said nothing at all, which is the asymmetry: the
+// advice appeared only while it was not being followed.
+//
+// It cannot be reported after the fact. A node that reclaimed a tombstone and
+// then accepted a set for that key cannot tell a resurrection from someone
+// writing it again, so the only honest moment is while the age is configured.
+test('tombstone GC names the exposure it creates', () => {
+  const checks = healthChecks(baseDiagnostics({ tombstoneTtlSec: 30 }), Date.now());
+  const check = find(checks, 'Tombstones are reclaimed');
+  assert.equal(check.severity, Severity.INFO);
+  assert.match(check.title, /30s/);
+  assert.match(check.detail, /away for longer/);
+  assert.match(check.detail, /undone/);
+});
+
+test('GC off says the opposite and not both', () => {
+  const d = baseDiagnostics({ tombstoneTtlSec: 0 });
+  d.store = { ...d.store, tombstones: 3 };
+  const checks = healthChecks(d, Date.now());
+  assert.ok(find(checks, 'kept forever'));
+  assert.ok(!find(checks, 'Tombstones are reclaimed'));
+});
+
+// The exposure is the setting, not the tombstones it happens to hold.
+test('the GC exposure is reported before anything is deleted', () => {
+  const d = baseDiagnostics({ tombstoneTtlSec: 3600 });
+  d.store = { ...d.store, tombstones: 0 };
+  assert.ok(find(healthChecks(d, Date.now()), 'Tombstones are reclaimed'));
+});

@@ -83,6 +83,54 @@ defect all along.
 
 Newest first.
 
+### 0.4.8 — a second device round, on a different network
+
+The cluster rebuilt from scratch on another LAN with a fresh install, which is
+itself worth doing: every address in every config was different, and the round
+started by finding that the Go suite had gone red on a clean tree.
+
+**`EscapedLen` over-counted invalid UTF-8, because the toolchain changed under
+it.** It charged six bytes per undecodable byte — correct while Go wrote the
+escape `\ufffd`, wrong since Go 1.25 writes the three-byte replacement
+character itself. `EscapedLen` is what decides whether a value can replicate at
+all, so the drift turned into a size check that refuses values which fit. The
+file already says its escape table is "derived, not copied" and re-derives it
+from the encoder in a test; this was the one cost that was copied instead, and
+it is the one that moved. It is measured now, with the fallback biased to the
+larger historical cost because over-counting only refuses a value that would
+have fit while under-counting strands one that can never replicate. A second
+test pins the `/6` bound that `admitLocked` uses as its cheap pre-filter, since
+that is the encoder's number too.
+
+**Tombstone GC said nothing once it was switched on.** With GC off all three
+ports warn that a node away too long will come back and undo a delete. With GC
+on — the same hazard, configured — all three were silent. Reproduced on two
+nodes with an eight-second age: the delete was undone on every replica, and
+`/consistency` reported the cluster converged, because it was. Nothing is in
+the activity feed and nothing is in the findings; only `kv_gc_total` moves.
+
+It cannot be reported after the fact — a node that reclaimed a tombstone and
+then accepted a set for that key cannot tell a resurrection from someone
+writing it again — so the exposure is named while it is configured, which is
+the only honest moment. Added to all three ports at once, with the cross-port
+check that keeps it there.
+
+Everything else held: mDNS discovery with no seeds at all (first time on real
+hardware), the TLS gateway, periodic snapshots and their retention, multi-seed
+failover past a dead first seed, a wrong pre-shared key staying isolated, peer
+forget and rediscovery, import merge losing to a newer version while
+`?mode=seed` wins, and on the tablet every fix from the previous round —
+rotation keeping an open dialog, a chat draft and unsaved settings; a refused
+port snapping back with a message; the offline advice staying "reconnect"
+rather than naming a stale address. A real Wi-Fi outage again resolved
+last-write-wins on all four nodes with the tombstone holding and all six missed
+chat lines recovered in order.
+
+One observation, not fixed: the cluster graph is a bare Canvas with no
+accessibility semantics, and *forget this peer* is reachable only by tapping a
+node on it. It cannot be driven by uiautomator and cannot be reached by a
+screen reader at all.
+
 ### 0.4.8 — the device round that read the ports back
 
 A PRITOM M10 (Android 16), the Electron client and two Go peers plus a Go

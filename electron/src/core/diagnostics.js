@@ -272,6 +272,22 @@ function healthChecks(d, nowMs) {
       + 'once the tombstone is gone, silently undoing the delete.');
   }
 
+  // The other half of that advice, which nothing said once it was taken. A
+  // reclaimed tombstone is the only record that a key was deleted, so the
+  // undoing it warns about leaves no trace at all: the delete is reversed on
+  // every replica and the consistency check calls the result converged, because
+  // it is. It cannot be detected after the fact — a node cannot tell a
+  // resurrection from someone writing the key again — so the exposure is named
+  // while it is configured, which is the only honest moment.
+  if (d.tombstoneTtlSec > 0) {
+    add(Severity.INFO, `Tombstones are reclaimed after ${d.tombstoneTtlSec}s`,
+      `A delete is remembered for ${d.tombstoneTtlSec}s and then forgotten. A node that is away `
+      + 'for longer comes back still holding the value, and the delete is undone on every replica '
+      + 'with nothing to report it — the cluster converges on the resurrected value. Keep the age '
+      + 'above the longest outage a node can return from, or set it to 0 and let tombstones '
+      + 'accumulate.');
+  }
+
   if (!d.pskSet) {
     add(Severity.INFO, 'No pre-shared key',
       'The framing key comes from the cluster name alone. That keeps two clusters on one network apart '
