@@ -17,6 +17,26 @@ data class HealthCheck(val severity: Severity, val title: String, val detail: St
  */
 const val ID_CONFLICT_FLIPS = 3L
 
+/**
+ * How long a send failure stays a warning.
+ *
+ * Gossip runs every few seconds, so a device that has had nothing fail to send
+ * in this long is one whose network came back. Past that the count is history:
+ * it stays on the screen, as information, instead of holding a node that works
+ * at "warning" for as long as it runs.
+ */
+const val SEND_ERROR_RECENT_WINDOW_MS = 120_000L
+
+/**
+ * How long an address stays on the unknown-source list after its last packet.
+ *
+ * The list answers "who is talking to us wrongly *now*", and a misconfigured
+ * node talks continuously, so it stays. One packet from an address that then
+ * goes quiet is the other case entirely, and keeping those forever turned
+ * every departure into a permanent anomaly.
+ */
+const val STRANGER_QUIET_WINDOW_MS = 300_000L
+
 /** What this node has seen claim one node id. */
 data class IdBinding(
     val addr: String,
@@ -291,9 +311,24 @@ fun healthChecks(
 
     if (m.sendErrors > 0) {
         val last = m.lastSendError
+        // Whether anything is wrong *now* is a separate question from whether
+        // anything ever went wrong. On a phone the two come apart constantly:
+        // Wi-Fi power saving, roaming between access points and Doze all make
+        // a send fail for a moment, and the counter never comes back down. A
+        // tablet replicating happily in a four-node cluster was still warning
+        // about failures minutes old — and a warning that cannot clear is one
+        // the reader learns to scroll past, which costs the real ones their
+        // only chance of being read. Sending from the UI thread is exempt: it
+        // is a bug in this app rather than weather, and it does not heal.
+        val recent = last == null || last.onMainThread ||
+            nowMs - last.atMs <= SEND_ERROR_RECENT_WINDOW_MS
         checks += HealthCheck(
-            if (last?.onMainThread == true) Severity.ERROR else Severity.WARN,
-            "${m.sendErrors} send error(s)",
+            when {
+                last?.onMainThread == true -> Severity.ERROR
+                !recent -> Severity.INFO
+                else -> Severity.WARN
+            },
+            if (recent) "${m.sendErrors} send error(s)" else "${m.sendErrors} send error(s), none recent",
             when {
                 offline ->
                     "This device has no network, so nothing could leave it. Nothing here points at " +
@@ -326,6 +361,11 @@ fun healthChecks(
                             ) +
                         " Until it does, that entry cannot reach that peer by any path, and the " +
                         "replicas stay divergent however long anti-entropy runs. Last: $last."
+                !recent ->
+                    "Nothing has failed to leave this device in the last " +
+                        "${SEND_ERROR_RECENT_WINDOW_MS / 60_000}m, so this is history rather than " +
+                        "a fault to chase. Wi-Fi power saving and roaming between access points " +
+                        "both look like this. Last: $last."
                 else ->
                     "Datagrams could not leave the device — usually a peer address that no longer " +
                         "routes, or Wi-Fi dropping while the node stays up. Last: $last."

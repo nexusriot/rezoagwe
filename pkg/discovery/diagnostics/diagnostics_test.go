@@ -780,3 +780,53 @@ func TestTheGCExposureIsReportedBeforeAnythingIsDeleted(t *testing.T) {
 
 	findCheck(t, Checks(snap, now), "Tombstones are reclaimed")
 }
+
+// The send-error counter only climbs, so one blip — an interface bouncing, a
+// peer that went away before its eviction — used to hold a node at "warning"
+// for the rest of its life while every packet since had gone out fine. Observed
+// on hardware: a tablet replicating happily in a four-node cluster warned about
+// failures minutes old, beside Go and desktop nodes calling the same cluster
+// healthy. A warning that cannot clear is one the reader learns to scroll past.
+func TestASendErrorAgesOutOfTheWarnings(t *testing.T) {
+	d := healthy()
+	d.Metrics.SendErrors = 2
+	d.Metrics.LastSendError = &metrics.SendError{
+		Addr: "10.0.0.4:3137", Kind: "hello", Message: "network is unreachable",
+		At: now.Add(-SendErrorRecentWindow - time.Second).Unix(),
+	}
+
+	checks := Checks(d, now)
+	c := findCheck(t, checks, "send error")
+	if c.Severity != SeverityInfo {
+		t.Fatalf("an old send error is still %q: %s", c.Severity, c.Title)
+	}
+	if !strings.Contains(c.Detail, "history") {
+		t.Fatalf("detail does not say it is history: %s", c.Detail)
+	}
+	// The whole point: the node reads as healthy again.
+	if checks[0].Severity != SeverityOK {
+		t.Fatalf("the healthy line is still suppressed:\n%s", titles(checks))
+	}
+	// And the count is not hidden — it is what says the blip happened at all.
+	if !strings.Contains(c.Title, "2 send error") {
+		t.Fatalf("the count was dropped: %s", c.Title)
+	}
+}
+
+// Still a warning while it is happening: the fix must not silence the case the
+// check exists for.
+func TestARecentSendErrorIsStillAWarning(t *testing.T) {
+	d := healthy()
+	d.Metrics.SendErrors = 1
+	d.Metrics.LastSendError = &metrics.SendError{
+		Addr: "10.0.0.4:3137", Kind: "hello", Message: "network is unreachable",
+		At: now.Add(-time.Second).Unix(),
+	}
+	c := findCheck(t, Checks(d, now), "send error")
+	if c.Severity != SeverityWarn {
+		t.Fatalf("a send error one second old is %q, want warn", c.Severity)
+	}
+	if Worst(Checks(d, now)) != SeverityWarn {
+		t.Fatal("a node failing to send right now reads as healthy")
+	}
+}

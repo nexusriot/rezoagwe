@@ -191,6 +191,15 @@ type Node struct {
 	// packets come from (a NAT, or a wrong -advertise).
 	strangerMu sync.Mutex
 	strangers  map[string]int64
+	// rendezvous are source addresses that have answered with a roster. A
+	// rendezvous service is a configured counterparty that by design never
+	// becomes a peer, so keying strangers on the peer table alone reported a
+	// correctly configured seed as an anomaly — in the words of a NAT
+	// misconfiguration — whenever the roster arrived by datagram rather than
+	// over the stream. Recording where the roster actually came from, rather
+	// than matching the seed string, also covers a seed written as a hostname,
+	// whose packets arrive from a resolved IP that never equals what was typed.
+	rendezvous map[string]struct{}
 
 	actMu    sync.Mutex
 	activity []string
@@ -243,20 +252,21 @@ func New(cfg Config, ev Events) (*Node, error) {
 	})
 	m.Store.SetLimits(cfg.Limits)
 	n := &Node{
-		cfg:       cfg,
-		Model:     m,
-		Metrics:   metrics.New(),
-		codec:     pb.NewCodec(cfg.PSK, cfg.Cluster),
-		tr:        tr,
-		ev:        ev,
-		startedAt: time.Now(),
-		stop:      make(chan struct{}),
-		rnd:       rand.New(rand.NewSource(time.Now().UnixNano())),
-		aeCursors: make(map[string]string),
-		strangers: make(map[string]int64),
-		chatGaps:  newChatTracker(),
-		chatSeq:   m.ChatSeq(),
-		watchers:  make(map[uint64]*Watcher),
+		cfg:        cfg,
+		Model:      m,
+		Metrics:    metrics.New(),
+		codec:      pb.NewCodec(cfg.PSK, cfg.Cluster),
+		tr:         tr,
+		ev:         ev,
+		startedAt:  time.Now(),
+		stop:       make(chan struct{}),
+		rnd:        rand.New(rand.NewSource(time.Now().UnixNano())),
+		aeCursors:  make(map[string]string),
+		strangers:  make(map[string]int64),
+		rendezvous: make(map[string]struct{}),
+		chatGaps:   newChatTracker(),
+		chatSeq:    m.ChatSeq(),
+		watchers:   make(map[uint64]*Watcher),
 	}
 	m.Store.SetOnMutate(n.publishMutations)
 	// The log on disk knows how far each author had got. Without this the
@@ -599,12 +609,41 @@ func (n *Node) noteStranger(from, claimed string) {
 	if from == "" || n.Model.HasPeerNormalized(from) || n.Model.IsSelf(from) {
 		return
 	}
+	if n.isRendezvous(from) {
+		return
+	}
 	n.strangerMu.Lock()
 	if n.strangers == nil {
 		n.strangers = make(map[string]int64)
 	}
 	n.strangers[from] = time.Now().Unix()
 	n.strangerMu.Unlock()
+}
+
+// noteRendezvous records that a roster arrived from this source address, which
+// only a rendezvous service sends. It is not a peer and never will be, so it
+// must not be reported as one that failed to introduce itself.
+func (n *Node) noteRendezvous(from string) {
+	if from == "" {
+		return
+	}
+	n.strangerMu.Lock()
+	if n.rendezvous == nil {
+		n.rendezvous = make(map[string]struct{})
+	}
+	n.rendezvous[from] = struct{}{}
+	// It may already have been filed as a stranger by the packet that carried
+	// the roster, or by a register sent before the first roster came back.
+	delete(n.strangers, from)
+	n.strangerMu.Unlock()
+}
+
+// isRendezvous reports whether a roster has ever arrived from this address.
+func (n *Node) isRendezvous(from string) bool {
+	n.strangerMu.Lock()
+	_, ok := n.rendezvous[from]
+	n.strangerMu.Unlock()
+	return ok
 }
 
 // Stranger is a source address that sent packets without being a peer.
@@ -615,13 +654,29 @@ type Stranger struct {
 	Rejected  uint64 `json:"rejected"`
 }
 
+// StrangerQuietWindow is how long an address stays on the unknown-source list
+// after its last packet.
+//
+// The list answers "who is talking to us wrongly *now*", and a misconfigured
+// node talks continuously, so it stays. One packet from an address that then
+// goes quiet is the other case entirely: a peer evicted a moment before its
+// last gossip landed, or a node that left. Keeping those forever turned every
+// departure into a permanent anomaly, reported in the words of a NAT
+// misconfiguration.
+const StrangerQuietWindow = 5 * time.Minute
+
 // Strangers lists the addresses seen sending packets that never became peers.
 func (n *Node) Strangers() []Stranger {
+	cutoff := time.Now().Add(-StrangerQuietWindow).Unix()
 	n.strangerMu.Lock()
 	out := make([]Stranger, 0, len(n.strangers))
 	for addr, at := range n.strangers {
 		if n.Model.HasPeerNormalized(addr) {
 			continue // it introduced itself since
+		}
+		if at < cutoff {
+			delete(n.strangers, addr) // it stopped; nothing is wrong now
+			continue
 		}
 		s := Stranger{Addr: addr, LastSeen: at}
 		if c, ok := n.Metrics.PeerCounters(addr); ok {

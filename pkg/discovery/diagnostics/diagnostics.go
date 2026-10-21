@@ -28,6 +28,14 @@ const (
 	SeverityError Severity = "error"
 )
 
+// SendErrorRecentWindow is how long a send failure stays a warning.
+//
+// Gossip runs every few seconds, so a machine that has sent nothing failing in
+// this long is one whose network came back. Past that the count is history: it
+// stays on the screen, as information, instead of holding a node that works at
+// "warning" forever.
+const SendErrorRecentWindow = 2 * time.Minute
+
 // Check is one finding.
 type Check struct {
 	Severity Severity `json:"severity"`
@@ -266,6 +274,15 @@ func Checks(d Snapshot, now time.Time) []Check {
 		// reader to check an address that is perfectly fine.
 		detail := "Datagrams could not leave this machine — usually a peer address that no longer " +
 			"routes, or an interface dropping while the node stays up."
+		// Whether anything is wrong *now* is a separate question from whether
+		// anything ever went wrong. The counter only climbs, so one blip —
+		// Wi-Fi roaming, an interface bouncing, a peer that went away before
+		// its eviction — left the node warning for the rest of its life while
+		// every packet since had gone out fine. A warning that cannot clear is
+		// one the reader learns to scroll past, which costs the real ones
+		// their only chance of being read.
+		recent := m.LastSendError == nil || m.LastSendError.At == 0 ||
+			now.Sub(time.Unix(m.LastSendError.At, 0)) <= SendErrorRecentWindow
 		if e := m.LastSendError; e != nil && e.Oversize {
 			detail = "A frame too large for one datagram could not be sent. Nothing is wrong with " +
 				"the route: an entry this big travels over a stream instead, and that did not work."
@@ -281,7 +298,14 @@ func Checks(d Snapshot, now time.Time) []Check {
 		if e := m.LastSendError; e != nil {
 			detail += fmt.Sprintf(" Last: %s to %s (%s).", e.Kind, e.Addr, e.Message)
 		}
-		add(SeverityWarn, fmt.Sprintf("%d send error(s)", m.SendErrors), detail)
+		if !recent {
+			detail = fmt.Sprintf("Nothing has failed to leave this machine in the last %s, so this "+
+				"is history rather than a fault to chase.", SendErrorRecentWindow) +
+				fmt.Sprintf(" Last: %s to %s (%s).", m.LastSendError.Kind, m.LastSendError.Addr, m.LastSendError.Message)
+			add(SeverityInfo, fmt.Sprintf("%d send error(s), none recent", m.SendErrors), detail)
+		} else {
+			add(SeverityWarn, fmt.Sprintf("%d send error(s)", m.SendErrors), detail)
+		}
 	}
 	// Counted since the beginning and explained by nothing. The stream is the
 	// only path for a value too big for a datagram and for a whole-store sync

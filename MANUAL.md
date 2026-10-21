@@ -336,6 +336,18 @@ The screens: **Keys**, **Chat**, **Peers**, **Graph**, **Activity**, **Diag**,
 turn it on under **Bootstrap** or tick *Start the rendezvous service
 automatically* — which is enough for a small LAN with no server.
 
+![The desktop client's Keys screen beside the replication counters](docs/screenshots/desktop-keys.png)
+
+**Split** (top right) shows two screens at once. The pairing below — the graph
+beside Diag — is the one to use when a cluster is not forming: the graph says
+who this node can see, and Diag says why the rest are missing.
+
+![The desktop client showing the cluster graph beside the diagnostics screen](docs/screenshots/desktop-graph.png)
+
+**Verify replicas**, on Diag, asks every peer to summarise its whole store and
+reports who disagrees. Anti-entropy repairs divergence but never reports it, so
+a cluster can sit split for as long as nobody looks.
+
 ---
 
 ## 8. The Android app
@@ -374,6 +386,25 @@ What to know:
   so first and explains that the send errors and missing peers below follow from
   that, rather than sending you to check the bootstrap and the key.
 
+On a tablet the app puts two screens side by side; on a phone the same screens
+are tabs. Keys, with versions and the expiry marker on a key that has a TTL:
+
+![The Android app's Keys screen beside the replication counters](docs/screenshots/android-keys.png)
+
+Chat and the peer list. `/me` renders as an emote, and each sender keeps a
+colour:
+
+![The Android app's Chat screen beside the peer list](docs/screenshots/android-chat.png)
+
+Diag names the device and its interfaces as well as the node, because on a
+phone the answer is usually the network rather than the cluster — and further
+down, a battery-optimisation line, because Doze freezes the gossip timers and
+peers evict a node 15s after its last packet. The node below is healthy while
+still carrying seventeen send failures: on Wi-Fi that is the radio, and once
+they stop the finding says so instead of staying a warning:
+
+![The Android app's diagnostics screen beside the cluster graph](docs/screenshots/android-diagnostics.png)
+
 ---
 
 ## 9. When something is wrong
@@ -409,7 +440,18 @@ knowing in advance:
 | *N remote update(s) refused by this node's limits* | `-max-keys` / `-max-value-bytes` are too small for what the cluster holds; this node can never converge on those keys, and waiting will not fix it |
 | *State file could not be read* | the node started empty **and with a new identity**, and has already rewritten the file; its old writes are outranked and its old chat lines now read as another author's |
 | *N peer(s) never answered* | one-way UDP — a firewall or a wrong advertised port, not packet loss |
+| *N send error(s)* | datagrams are failing to leave this machine **now**. On Wi-Fi this is usually the link rather than the cluster |
+| *N send error(s), none recent* | they stopped. The count is history — nothing to chase |
+| *N address(es) sent packets without being a peer* | something is talking to this node that never introduced itself. A seed is not one of these, and an address that goes quiet drops off the list |
 | *N tombstone(s) kept forever* | informational, unless deletes are frequent |
+
+Two of those findings are deliberately time-limited, because a counter that
+only climbs cannot say whether anything is wrong *now*. A send that failed
+while Wi-Fi roamed, or one packet from a peer evicted a moment before its last
+gossip landed, used to leave a node warning for as long as it ran — and a
+warning that cannot clear is one you learn to scroll past. Send errors drop to
+informational after two quiet minutes; an unknown source drops off the list
+after five. The totals stay on the traffic counters either way.
 
 **3. Do the replicas actually agree?**
 

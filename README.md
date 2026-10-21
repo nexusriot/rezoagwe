@@ -399,6 +399,18 @@ package that carries the two Go binaries rather than colliding with it. On a
 machine with no network and no `fpm`, `make -C electron deb-manual` builds the
 same package with `dpkg-deb` alone.
 
+The store and the replication counters, side by side — the desktop is a full
+peer, so "local writes 0, remote applied 24" is this node holding a store it
+was given rather than one it wrote:
+
+![The desktop client's Keys screen beside the replication counters](docs/screenshots/desktop-keys.png)
+
+**Split** puts two screens up at once. Here the cluster graph next to the
+diagnostics, during the live four-node run these screenshots come from — two Go
+nodes, this desktop, and an Android tablet on the same LAN:
+
+![The desktop client showing the cluster graph beside the diagnostics screen](docs/screenshots/desktop-graph.png)
+
 Point it at a rendezvous service in **Settings** (seeds, cluster name and key),
 and it joins as a peer: the store, the chat, the gossip and the anti-entropy all
 run in the app. See [electron/README.md](electron/README.md).
@@ -495,6 +507,26 @@ side by side when there is room for them.
 ```
 cd android && ./gradlew :app:assembleDebug
 ```
+
+The keys list with its versions and expiry markers, beside the same counters
+the desktop and the TUI show:
+
+![The Android app's Keys screen beside the replication counters](docs/screenshots/android-keys.png)
+
+Chat, with per-sender colours and the peer list alongside. The tablet is a peer
+like any other: these lines reached the Go nodes and the desktop, and theirs
+reached it:
+
+![The Android app's Chat screen beside the peer list](docs/screenshots/android-chat.png)
+
+**Diag** is the screen to open when something is wrong — findings first, then
+what this node is, what it bound and advertised, what the device's network is
+doing, and the traffic broken down by message kind. The node below is healthy:
+the send failures are a lossy Wi-Fi link that has since recovered, so they are
+reported as history rather than held at a warning this reader can do nothing
+about:
+
+![The Android app's diagnostics screen beside the cluster graph](docs/screenshots/android-diagnostics.png)
 
 It shares no code with the Go implementation, only the protocol, so parity
 is pinned by tests: a frame produced by the Go codec is decoded by the

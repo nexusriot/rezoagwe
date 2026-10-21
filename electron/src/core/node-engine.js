@@ -23,6 +23,16 @@ const STATE_SYNC_CHAT_LINES = 200;
 /** Entries in a state response that has to fit one datagram. The stream path has no such limit. */
 const DATAGRAM_SYNC_LIMIT = 200;
 
+/**
+ * How long an address stays on the unknown-source list after its last packet.
+ *
+ * The list answers "who is talking to us wrongly *now*", and a misconfigured
+ * node talks continuously, so it stays. One packet from an address that then
+ * goes quiet is the other case entirely, and keeping those forever turned
+ * every departure into a permanent anomaly.
+ */
+const STRANGER_QUIET_WINDOW_MS = 300_000;
+
 /** Soft byte budget and entry cap for one anti-entropy batch. */
 const BATCH_BYTES = 48 * 1024;
 const BATCH_ENTRIES = 64;
@@ -119,6 +129,18 @@ class NodeEngine extends EventEmitter {
     this.idBindings = new Map();
     /** Peer addresses seen announcing this node's own id. */
     this.impostors = new Set();
+    /**
+     * Source addresses that have answered with a roster: the rendezvous service.
+     *
+     * It is a configured counterparty that by design never becomes a peer, so
+     * keying "sent packets without being a peer" on the peer table alone made a
+     * correctly configured node report its own seed as an anomaly, in the words
+     * of a NAT misconfiguration. Recording where the roster actually came from
+     * rather than matching the seed string also covers a seed written as a
+     * hostname, whose packets arrive from a resolved IP that never equals what
+     * was typed.
+     */
+    this.rendezvous = new Set();
     // What each peer last told us its own peer list was. This is the only source
     // of links between two nodes that are not us, and so the only way the app can
     // draw the cluster rather than just our corner of it.
@@ -245,6 +267,7 @@ class NodeEngine extends EventEmitter {
     this.idToAddr.clear();
     this.idBindings.clear();
     this.impostors.clear();
+    this.rendezvous.clear();
     this.gossipViews.clear();
     if (this.persister) await this.persister.flush();
     this.publishPeers();
@@ -955,6 +978,10 @@ class NodeEngine extends EventEmitter {
     }
     this.metrics.received(frame.kind, packet.data.length);
     this.metrics.receivedFrom(source, packet.data.length);
+    // A roster only ever comes from a rendezvous service, which is not a peer and
+    // never will be. Remember where it came from so the diagnostics stop
+    // reporting the configured seed as an unknown source.
+    if (frame.kind === Kind.BOOTSTRAP_ROSTER) this.rendezvous.add(source);
     this.dispatch(frame.kind, frame.body).catch((e) => this.logActivity(`dispatch: ${e.message}`));
   }
 
@@ -1841,9 +1868,20 @@ class NodeEngine extends EventEmitter {
     });
 
     // An address that sends packets while being no peer of ours is worth showing:
-    // it is what a NAT, a stale peer or a wrong advertise host looks like from here.
+    // it is what a NAT, a stale peer or a wrong advertise host looks like from
+    // here. A rendezvous service is none of those — it answers with a roster and
+    // is never a peer — so it is excluded rather than reported as an anomaly on
+    // every healthy node that uses one.
+    // One packet from an address that then went quiet — a peer evicted a
+    // moment before its last gossip landed, or a node that simply left — is
+    // not a misconfiguration. A misconfigured node talks continuously, so it
+    // stays on the list; a departure ages off it instead of becoming a
+    // permanent anomaly.
+    const strangerCutoff = this.now() - STRANGER_QUIET_WINDOW_MS;
     const strangers = [...traffic.values()]
-      .filter((t) => t.addr !== selfAddr && !known.has(t.addr) && (t.packetsIn > 0 || t.rejected > 0))
+      .filter((t) => t.addr !== selfAddr && !known.has(t.addr) && !this.rendezvous.has(t.addr)
+        && (t.packetsIn > 0 || t.rejected > 0)
+        && (t.lastInMs || 0) >= strangerCutoff)
       .map((t) => ({
         addr: t.addr,
         nick: '',
@@ -1930,6 +1968,7 @@ module.exports = {
   CHAT_RING,
   ACTIVITY_RING,
   DATAGRAM_SYNC_LIMIT,
+  STRANGER_QUIET_WINDOW_MS,
   BATCH_BYTES,
   BATCH_ENTRIES,
 };

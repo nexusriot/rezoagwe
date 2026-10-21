@@ -379,6 +379,57 @@ What it found:
   network joined. The rule defers to the `offline` flag now, which is what that
   flag is for.
 
+### 2026-10-21 — the diagnostics round, four nodes on one LAN
+
+PRITOM M10 (Android 16, 1280x800) at 192.168.88.31 with Go `alice` and `bob`, a
+Go rendezvous and the Electron client on the host at 192.168.88.65, cluster
+`hwlan`. The happy path held in every direction again — a write from each of
+the three implementations reached the other three, chat and `/me` crossed all
+four, and `/consistency` folded to the same answer from every side, including a
+200 KB value over the stream path. So did the corner cases: a guarded write
+refused by name from the Android dialog, `If-Match` claiming a lock on one node
+and being refused `412` on another, a TTL key expiring within a second
+everywhere, a value of invalid UTF-8 refused `422` while newlines, tabs, control
+characters and emoji crossed byte for byte, *Stop node* dropping the tablet from
+the Go roster at once, identity and store surviving `am force-stop`, the
+foreground service holding the node in the cluster through a 60 s screen-off,
+and rotation keeping an open key dialog's typed text. A wrong pre-shared key
+isolated the tablet and Diag named the seed and the fingerprint rather than the
+network.
+
+What it found — all three in the diagnostics, all three fixed in every
+implementation, and all three with the hardware symptom written into the test
+that now guards them:
+
+* **A healthy node reported its own rendezvous service as an unknown source.**
+  The rule behind *"N address(es) sent packets without being a peer"* asks
+  whether a packet came from an address in the peer table; a rendezvous answers
+  with a roster and is by design never a peer, so it matched — permanently, and
+  in the words of a NAT misconfiguration. It only shows when the roster comes
+  back by datagram, the fallback taken whenever the stream exchange cannot be
+  made, which on this tablet was every join: the Go and desktop nodes beside it
+  called the same cluster healthy while it warned. A roster now marks the
+  address it arrived from, which also covers a seed written as a hostname.
+* **One failed send warned for the life of the node.** The counter only climbs,
+  and on a phone it always climbs: this tablet's Wi-Fi drops about 3% of plain
+  ICMP, so `sendto` returns `ENETUNREACH` every few minutes while gossip,
+  replication and chat all work. A warning that cannot clear is one the reader
+  learns to scroll past. The last failure carries a timestamp now and the
+  finding drops to informational after two quiet minutes; the total stays on the
+  traffic counters.
+* **A peer that left never stopped being an anomaly.** One packet from an
+  address evicted a moment earlier put it on the unknown-source list for good —
+  seen here when the tablet was moved to a wrong key and its former cluster went
+  on reporting it. An address that has been quiet for five minutes now drops off
+  the list, while a genuinely misconfigured node, which keeps talking, stays on
+  it.
+
+Two things were checked and are *not* bugs, which is worth recording so the next
+run does not chase them: the send failures are the radio, not the app — plain
+`ping` from the device loses the same 3% — and a peer showing *"never gossiped"*
+shortly after a restart is only a gossip tick that has not come round yet, since
+each node gossips to one random peer per interval.
+
 ## Known gaps
 
 * The battery cost of the 10 s gossip tick is still unmeasured; **Diag**

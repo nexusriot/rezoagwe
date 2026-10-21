@@ -6,6 +6,7 @@ import com.nexusriot.rezoagwe.core.NodeDiagnostics
 import com.nexusriot.rezoagwe.core.Peer
 import com.nexusriot.rezoagwe.core.PeerDiagnostics
 import com.nexusriot.rezoagwe.core.SendFailure
+import com.nexusriot.rezoagwe.core.SEND_ERROR_RECENT_WINDOW_MS
 import com.nexusriot.rezoagwe.core.Severity
 import com.nexusriot.rezoagwe.core.StoreDiagnostics
 import com.nexusriot.rezoagwe.core.TopologyBuilder
@@ -176,6 +177,59 @@ class DiagnosticsTest {
         )
         val check = healthChecks(d, now).first { it.title.contains("without being a peer") }
         assertTrue(check.detail.contains("10.0.0.7:5000"))
+    }
+
+    /**
+     * The send-error counter only climbs, and on a phone the two questions
+     * "did anything ever fail?" and "is anything wrong now?" come apart
+     * constantly: Wi-Fi power saving, roaming between access points and Doze
+     * each make a send fail for a moment. Observed on hardware — a tablet
+     * replicating happily in a four-node cluster still warned about failures
+     * minutes old, beside Go and desktop nodes calling the same cluster
+     * healthy. A warning that cannot clear is one the reader learns to scroll
+     * past, which costs the real ones their only chance of being read.
+     */
+    @Test
+    fun aSendErrorAgesOutOfTheWarnings() {
+        val d = healthy().copy(
+            metrics = MetricsSnapshot(
+                sendErrors = 2,
+                lastSendError = SendFailure(
+                    addr = "10.0.0.2:3137",
+                    cause = "ErrnoException",
+                    message = "sendto failed: ENETUNREACH (Network is unreachable)",
+                    atMs = now - SEND_ERROR_RECENT_WINDOW_MS - 1_000,
+                ),
+            ),
+        )
+        val checks = healthChecks(d, now)
+        val check = checks.first { it.title.contains("send error") }
+
+        assertEquals("an old send error still warns", Severity.INFO, check.severity)
+        assertTrue("the detail does not say it is history", check.detail.contains("history"))
+        assertTrue("the count was dropped", check.title.contains("2 send error"))
+        assertTrue(
+            "the node still does not read as healthy",
+            checks.none { it.severity == Severity.WARN || it.severity == Severity.ERROR },
+        )
+    }
+
+    /** The fix must not silence the case the check exists for. */
+    @Test
+    fun aSendErrorHappeningNowIsStillAWarning() {
+        val d = healthy().copy(
+            metrics = MetricsSnapshot(
+                sendErrors = 1,
+                lastSendError = SendFailure(
+                    addr = "10.0.0.2:3137",
+                    cause = "ErrnoException",
+                    message = "sendto failed: ENETUNREACH (Network is unreachable)",
+                    atMs = now - 1_000,
+                ),
+            ),
+        )
+        val check = healthChecks(d, now).first { it.title.contains("send error") }
+        assertEquals(Severity.WARN, check.severity)
     }
 
     /**

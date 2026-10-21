@@ -102,6 +102,7 @@ class Metrics {
         val c = counters(addr)
         c.packetsIn.incrementAndGet()
         c.bytesIn.addAndGet(bytes.toLong())
+        c.lastInMs.set(System.currentTimeMillis())
     }
 
     fun sendFailedTo(addr: String) {
@@ -126,7 +127,9 @@ class Metrics {
 
     /** A frame from [addr] that did not authenticate, parse, or pass the replay guard. */
     fun rejectedFrom(addr: String) {
-        counters(addr).rejected.incrementAndGet()
+        val c = counters(addr)
+        c.rejected.incrementAndGet()
+        c.lastInMs.set(System.currentTimeMillis())
     }
 
     fun forAddr(addr: String): AddrTraffic = counters(addr).snapshot(addr)
@@ -134,7 +137,10 @@ class Metrics {
     fun addrs(): List<AddrTraffic> =
         perAddr.entries.map { (addr, c) -> c.snapshot(addr) }.sortedBy { it.addr }
 
-    private fun counters(addr: String): AddrCounters = perAddr.getOrPut(addr) { AddrCounters() }
+    // internal rather than private so the tests can age an address's last-seen
+    // stamp, which is the only way to assert that a quiet unknown source drops
+    // off the list without making a test wait out the window.
+    internal fun counters(addr: String): AddrCounters = perAddr.getOrPut(addr) { AddrCounters() }
 
     /**
      * Folds the counters since the previous call into per-second rates.
@@ -231,6 +237,16 @@ class AddrCounters {
     val sendErrors = AtomicLong()
     val rejected = AtomicLong()
 
+    /**
+     * When a packet last arrived from this address.
+     *
+     * The unknown-source list answers "who is talking to us wrongly *now*".
+     * Without this, one packet from an address that then went quiet — a peer
+     * evicted a moment before its last gossip landed, or a node that simply
+     * left — was reported as an anomaly for as long as the node ran.
+     */
+    val lastInMs = AtomicLong()
+
     fun snapshot(addr: String) = AddrTraffic(
         addr = addr,
         packetsOut = packetsOut.get(),
@@ -239,6 +255,7 @@ class AddrCounters {
         bytesIn = bytesIn.get(),
         sendErrors = sendErrors.get(),
         rejected = rejected.get(),
+        lastInMs = lastInMs.get(),
     )
 }
 
@@ -250,6 +267,7 @@ data class AddrTraffic(
     val bytesIn: Long = 0,
     val sendErrors: Long = 0,
     val rejected: Long = 0,
+    val lastInMs: Long = 0,
 )
 
 /** Throughput over the last sampling window. */
@@ -268,6 +286,12 @@ data class SendFailure(
     val addr: String = "",
     val cause: String = "",
     val message: String = "",
+    /**
+     * When it happened, so a failure can age out of the health checks. The
+     * counter only climbs, so without this one blip — Wi-Fi roaming, a peer
+     * that went away before its eviction — warned for as long as the node ran.
+     */
+    val atMs: Long = System.currentTimeMillis(),
 ) {
     /** True when the send failed because it ran on Android's main thread — an app bug, not a network one. */
     val onMainThread: Boolean get() = cause == "NetworkOnMainThreadException"

@@ -14,6 +14,16 @@ const Severity = Object.freeze({ OK: 'ok', INFO: 'info', WARN: 'warn', ERROR: 'e
 const ID_CONFLICT_FLIPS = 3;
 
 /**
+ * How long a send failure stays a warning.
+ *
+ * Gossip runs every few seconds, so a machine that has had nothing fail to
+ * send in this long is one whose network came back. Past that the count is
+ * history: it stays on the screen, as information, instead of holding a node
+ * that works at "warning" forever.
+ */
+const SEND_ERROR_RECENT_WINDOW_MS = 120_000;
+
+/**
  * Turns a diagnostics snapshot into the short list of things actually wrong.
  *
  * Pure on purpose: every rule here is a claim about the protocol ("auth failures
@@ -159,7 +169,22 @@ function healthChecks(d, nowMs) {
         + 'divergent however long anti-entropy runs.';
     }
     if (last) detail += ` Last: ${last.cause} to ${last.addr}${last.message ? ` (${last.message})` : ''}.`;
-    add(Severity.WARN, `${m.sendErrors} send error(s)`, detail);
+    // Whether anything is wrong *now* is a separate question from whether
+    // anything ever went wrong. The counter only climbs, so one blip — a
+    // network interface bouncing, a peer that went away before its eviction —
+    // left the node warning for the rest of its life while every packet since
+    // had gone out fine. A warning that cannot clear is one the reader learns
+    // to scroll past, which costs the real ones their only chance of being read.
+    const recent = !last || !last.at || (nowMs - last.at * 1000) <= SEND_ERROR_RECENT_WINDOW_MS;
+    if (recent) {
+      add(Severity.WARN, `${m.sendErrors} send error(s)`, detail);
+    } else {
+      add(Severity.INFO, `${m.sendErrors} send error(s), none recent`,
+        `Nothing has failed to leave this machine in the last `
+        + `${Math.round(SEND_ERROR_RECENT_WINDOW_MS / 60000)}m, so this is history rather than a `
+        + `fault to chase. Last: ${last.cause} to ${last.addr}`
+        + `${last.message ? ` (${last.message})` : ''}.`);
+    }
   }
 
   // Counted since the beginning and explained by nothing. The stream is the only
@@ -356,4 +381,4 @@ function asReport(d, nowMs) {
   return lines.join('\n');
 }
 
-module.exports = { Severity, healthChecks, asReport, ID_CONFLICT_FLIPS };
+module.exports = { Severity, healthChecks, asReport, ID_CONFLICT_FLIPS, SEND_ERROR_RECENT_WINDOW_MS };

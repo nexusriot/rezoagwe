@@ -6,11 +6,13 @@ import com.nexusriot.rezoagwe.core.ID_CONFLICT_FLIPS
 import com.nexusriot.rezoagwe.core.NodeConfig
 import com.nexusriot.rezoagwe.core.NodeEngine
 import com.nexusriot.rezoagwe.core.NodeRole
+import com.nexusriot.rezoagwe.core.STRANGER_QUIET_WINDOW_MS
 import com.nexusriot.rezoagwe.core.Severity
 import com.nexusriot.rezoagwe.core.healthChecks
 import com.nexusriot.rezoagwe.net.MAX_DATAGRAM_PAYLOAD
 import com.nexusriot.rezoagwe.proto.ChatKind
 import com.nexusriot.rezoagwe.proto.Codec
+import com.nexusriot.rezoagwe.proto.BootstrapRoster
 import com.nexusriot.rezoagwe.proto.ChatMessage
 import com.nexusriot.rezoagwe.proto.KVAction
 import com.nexusriot.rezoagwe.proto.KVUpdate
@@ -921,6 +923,89 @@ class NodeEngineTest {
         a.sendChat("still audible")
         waitFor("the next line to reach b") { b.chat.value.any { it.text == "still audible" } }
         assertEquals(2L, a.chat.value.first { it.text == "still audible" }.seq)
+    }
+
+    /**
+     * The rendezvous service answers with a roster and is never a peer, so
+     * keying "sent packets without being a peer" on the peer table alone made
+     * every correctly configured node report its own seed as an anomaly — in
+     * the words of a NAT misconfiguration, and for as long as the node ran.
+     * Observed on hardware: a healthy tablet in a four-node cluster warned
+     * about the rendezvous it had been told to use, while the Go and desktop
+     * nodes beside it reported the same cluster healthy.
+     */
+    @Test
+    fun `the rendezvous service is not reported as an unknown source`() {
+        val seedPort = freePort()
+        val seed = "127.0.0.1:$seedPort"
+        val a = engine(freePort(), "a", seeds = listOf(seed))
+        val rendezvous = engine(seedPort, "rendezvous")
+        a.start()
+        rendezvous.start()
+
+        val roster = Codec("", Codec.DEFAULT_CLUSTER).encode(
+            Kind.BOOTSTRAP_ROSTER,
+            BootstrapRoster(peers = emptyList(), seenAt = a.addr),
+        )
+        rendezvous.sendPacket(a.addr, Kind.BOOTSTRAP_ROSTER, roster)
+
+        waitFor("the roster to arrive") { a.diagnostics().metrics.packetsReceived > 0 }
+        assertEquals(
+            "the seed that answered with the roster is reported as an unknown source",
+            emptyList<String>(),
+            a.diagnostics().strangers.map { it.addr },
+        )
+        assertTrue(
+            "a healthy node warns about its own rendezvous service",
+            healthChecks(a.diagnostics(), System.currentTimeMillis())
+                .none { it.title.contains("without being a peer") },
+        )
+    }
+
+    /**
+     * The unknown-source list answers "who is talking to us wrongly *now*". A
+     * misconfigured node talks continuously and stays on it; one packet from
+     * an address that then goes quiet — a peer evicted a moment before its
+     * last gossip landed, or a node that simply left — is the other case
+     * entirely. Keeping those forever turned every departure into a permanent
+     * anomaly, in the words of a NAT misconfiguration. Seen on hardware: a
+     * tablet moved to a wrong key left its former cluster reporting it as an
+     * unknown source with no way for that ever to clear.
+     */
+    @Test
+    fun `an unknown source that went quiet stops being reported`() {
+        val e = engine(freePort(), "a")
+        e.start()
+
+        // The body claims one address while the packet comes from another,
+        // which is what the list exists to catch.
+        val stranger = "10.9.9.9:3137"
+        e.metrics.receivedFrom(stranger, 64)
+        assertEquals(
+            "precondition: the unknown source was not recorded",
+            listOf(stranger),
+            e.diagnostics().strangers.map { it.addr },
+        )
+
+        // Still reported while it is talking: the check must keep working.
+        e.metrics.counters(stranger).lastInMs.set(
+            System.currentTimeMillis() - STRANGER_QUIET_WINDOW_MS / 2,
+        )
+        assertEquals(
+            "a source that is still sending was dropped",
+            1,
+            e.diagnostics().strangers.size,
+        )
+
+        // And forgotten once it has been quiet for long enough.
+        e.metrics.counters(stranger).lastInMs.set(
+            System.currentTimeMillis() - STRANGER_QUIET_WINDOW_MS - 1_000,
+        )
+        assertEquals(
+            "an address that went quiet is still reported",
+            emptyList<String>(),
+            e.diagnostics().strangers.map { it.addr },
+        )
     }
 
     /**

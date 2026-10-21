@@ -166,6 +166,18 @@ class NodeEngine(
     private val idBindings = HashMap<String, IdBinding>()
     /** Peer addresses seen announcing this node's own id. */
     private val impostorAddrs = LinkedHashSet<String>()
+    /**
+     * Source addresses that have answered with a roster: the rendezvous service.
+     *
+     * It is a configured counterparty that by design never becomes a peer, so
+     * keying "sent packets without being a peer" on the peer table alone made
+     * every correctly configured node report its own seed as an anomaly —
+     * permanently, and in the words of a NAT misconfiguration. Recording the
+     * address the roster actually came from rather than matching the seed string
+     * also covers a seed written as a hostname, whose packets arrive from a
+     * resolved IP that never equals what was typed.
+     */
+    private val rendezvousAddrs = LinkedHashSet<String>()
     // What each peer last told us its own peer list was. This is the only source
     // of links between two nodes that are not us, and so the only way the app can
     // draw the cluster rather than just our corner of it.
@@ -295,6 +307,7 @@ class NodeEngine(
             idToAddr.clear()
             idBindings.clear()
             impostorAddrs.clear()
+            rendezvousAddrs.clear()
             gossipViews.clear()
         }
         publishPeers()
@@ -921,6 +934,10 @@ class NodeEngine(
         }
         metrics.received(frame.kind, packet.data.size)
         metrics.receivedFrom(source, packet.data.size)
+        // A roster only ever comes from a rendezvous service, which is not a peer
+        // and never will be. Remember where it came from so the diagnostics stop
+        // reporting the configured seed as an unknown source.
+        if (frame.kind == Kind.BOOTSTRAP_ROSTER) synchronized(lock) { rendezvousAddrs.add(source) }
         dispatch(frame.kind, String(frame.body))
     }
 
@@ -1718,6 +1735,7 @@ class NodeEngine(
         val selfAddr = normalizeAddr(addr)
         val peerRows: List<PeerDiagnostics>
         val known: Set<String>
+        val rendezvous: Set<String>
         synchronized(lock) {
             peerRows = peers.values.sortedBy { it.addr }.map { peer ->
                 val key = normalizeAddr(peer.addr)
@@ -1739,12 +1757,24 @@ class NodeEngine(
                 )
             }
             known = peers.keys.map { normalizeAddr(it) }.toSet()
+            rendezvous = rendezvousAddrs.toSet()
         }
         // An address that sends us packets while being no peer of ours is worth
         // showing: it is what a NAT, a stale peer or a wrong advertise host looks
-        // like from this side.
+        // like from this side. A rendezvous service is none of those — it answers
+        // with a roster and is never a peer — so it is excluded rather than
+        // reported as an anomaly on every healthy node that uses one.
+        // One packet from an address that then went quiet — a peer evicted a
+        // moment before its last gossip landed, or a node that simply left —
+        // is not a misconfiguration. A misconfigured node talks continuously,
+        // so it stays on the list; a departure ages off it instead of becoming
+        // a permanent anomaly.
+        val strangerCutoff = System.currentTimeMillis() - STRANGER_QUIET_WINDOW_MS
         val strangers = traffic.values
-            .filter { it.addr != selfAddr && it.addr !in known && (it.packetsIn > 0 || it.rejected > 0) }
+            .filter {
+                it.addr != selfAddr && it.addr !in known && it.addr !in rendezvous &&
+                    (it.packetsIn > 0 || it.rejected > 0) && it.lastInMs >= strangerCutoff
+            }
             .map {
                 PeerDiagnostics(
                     addr = it.addr,

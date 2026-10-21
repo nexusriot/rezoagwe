@@ -3,11 +3,12 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { NodeEngine } = require('../src/core/node-engine');
+const { NodeEngine, STRANGER_QUIET_WINDOW_MS } = require('../src/core/node-engine');
 const { ID_CONFLICT_FLIPS, healthChecks, Severity } = require('../src/core/diagnostics');
 const { BootstrapServer } = require('../src/core/bootstrap-server');
 const { MemNetwork } = require('../src/net/mem');
 const { MAX_DATAGRAM_PAYLOAD } = require('../src/net/udp');
+const W = require('../src/proto/wire');
 
 /**
  * A whole cluster in one process, over an in-memory network with configurable
@@ -1200,4 +1201,80 @@ test('a node whose advertised address is the one observed is told nothing', asyn
   assert.ok(!checks.some((c) => c.title.includes('does not see this node at')));
   await engine.stop();
   await bootstrap.stop();
+});
+
+// The rendezvous service answers with a roster and is never a peer, so keying
+// "sent packets without being a peer" on the peer table alone made a correctly
+// configured node report its own seed as an anomaly — in the words of a NAT
+// misconfiguration, and permanently. It shows whenever the roster comes back by
+// datagram, which is the fallback taken when the stream exchange cannot be made.
+test('the rendezvous service is not reported as an unknown source', async () => {
+  const net = new MemNetwork();
+  const addr = '127.0.0.1:3601';
+  const seed = '127.0.0.1:9992';
+  const engine = new NodeEngine(
+    {
+      advertiseHost: '127.0.0.1', port: 3601, nick: 'alice', psk: 'k', cluster: 'test', seeds: [seed], ...QUIET,
+    },
+    null,
+    { listen: async () => net.attach(addr) },
+  );
+  await engine.start();
+  await engine.joining;
+
+  // The roster as it arrives on the datagram path.
+  const frame = engine.codec.encode(W.Kind.BOOTSTRAP_ROSTER, { peers: [], seen_at: addr });
+  engine.handlePacket({ from: seed, data: frame });
+  await settle();
+
+  const d = engine.diagnostics();
+  assert.deepEqual(d.strangers.map((s) => s.addr), [],
+    'the seed that answered with the roster is reported as an unknown source');
+  const noise = healthChecks(d, Date.now()).filter((c) => c.title.includes('without being a peer'));
+  assert.deepEqual(noise, [], 'a healthy node warns about its own rendezvous service');
+
+  // A genuine unknown source is still reported.
+  const hello = engine.codec.encode(W.Kind.HELLO, { from: '127.0.0.1:3999', nick: 'nobody', node_id: 'x' });
+  engine.handlePacket({ from: '10.9.9.9:3137', data: hello });
+  await settle();
+  assert.ok(engine.diagnostics().strangers.some((s) => s.addr === '10.9.9.9:3137'),
+    'a real stranger was lost with the fix');
+
+  await engine.stop();
+});
+
+// The unknown-source list answers "who is talking to us wrongly *now*". A
+// misconfigured node talks continuously and stays on it; one packet from an
+// address that then goes quiet — a peer evicted a moment before its last
+// gossip landed, or a node that simply left — is the other case entirely, and
+// keeping those forever turned every departure into a permanent anomaly
+// reported in the words of a NAT misconfiguration.
+test('an unknown source that went quiet stops being reported', async () => {
+  const net = new MemNetwork();
+  const addr = '127.0.0.1:3611';
+  const engine = new NodeEngine(
+    { advertiseHost: '127.0.0.1', port: 3611, nick: 'alice', psk: 'k', cluster: 'test', ...QUIET },
+    null,
+    { listen: async () => net.attach(addr) },
+  );
+  await engine.start();
+  await engine.joining;
+
+  // The body claims one address while the packet comes from another, which is
+  // what the list exists to catch.
+  const hello = engine.codec.encode(W.Kind.HELLO, { from: '127.0.0.1:3999', nick: 'nobody', node_id: 'x' });
+  engine.handlePacket({ from: '10.9.9.9:3137', data: hello });
+  await settle();
+  assert.equal(engine.diagnostics().strangers.length, 1, 'precondition: not recorded');
+
+  // Still reported while it is talking: the check must keep working.
+  engine.metrics.counters('10.9.9.9:3137').lastInMs = Date.now() - STRANGER_QUIET_WINDOW_MS / 2;
+  assert.equal(engine.diagnostics().strangers.length, 1, 'a source still sending was dropped');
+
+  // And forgotten once it has been quiet long enough.
+  engine.metrics.counters('10.9.9.9:3137').lastInMs = Date.now() - STRANGER_QUIET_WINDOW_MS - 1000;
+  assert.deepEqual(engine.diagnostics().strangers, [],
+    'an address that went quiet is still reported');
+
+  await engine.stop();
 });

@@ -198,3 +198,101 @@ func TestAnUnclaimedSourceIsStillAStranger(t *testing.T) {
 		t.Fatalf("stranger = %q, want the source address", got)
 	}
 }
+
+// The rendezvous service answers with a roster and is never a peer, so keying
+// "sent packets without being a peer" on the peer table alone reported every
+// correctly configured seed as an anomaly — and in the words of a NAT
+// misconfiguration. It only showed when the roster came back by datagram, which
+// is the fallback the node takes whenever the stream exchange cannot be made.
+func TestARendezvousThatAnswersByDatagramIsNotAStranger(t *testing.T) {
+	net := transport.NewMemNet(1)
+	a := newTestNode(t, net, "10.0.0.1:3137")
+	const seed = "10.0.0.9:9999"
+
+	// The register goes out before any roster comes back, so the seed can be
+	// filed as a stranger by traffic that precedes the reply.
+	a.noteStranger(seed, "")
+	if len(a.Strangers()) != 1 {
+		t.Fatal("precondition: the seed was not recorded as a stranger")
+	}
+
+	a.noteRendezvous(seed)
+	if got := a.Strangers(); len(got) != 0 {
+		t.Fatalf("the rendezvous service is still reported as a stranger: %+v", got)
+	}
+
+	// Later traffic from the same address must not put it back.
+	a.noteStranger(seed, "")
+	if got := a.Strangers(); len(got) != 0 {
+		t.Fatalf("the rendezvous service came back as a stranger: %+v", got)
+	}
+
+	// A genuine unknown source is still reported.
+	a.noteStranger("10.0.0.8:3137", "")
+	if got := a.Strangers(); len(got) != 1 || got[0].Addr != "10.0.0.8:3137" {
+		t.Fatalf("a real stranger was lost with the fix: %+v", got)
+	}
+}
+
+// The whole path, not just the bookkeeping: a roster decoded off the wire marks
+// its source, so a node that joined through the datagram fallback reports no
+// anomaly at all.
+func TestARosterArrivingByDatagramClearsTheSeedFromStrangers(t *testing.T) {
+	net := transport.NewMemNet(1)
+	a := newTestNode(t, net, "10.0.0.1:3137")
+	const seed = "10.0.0.9:9999"
+
+	roster := pb.BootstrapRoster{SeenAt: a.Addr()}
+	frame, err := a.codec.Encode(pb.KindBootstrapRoster, roster)
+	if err != nil {
+		t.Fatalf("encode roster: %s", err)
+	}
+	a.handlePacket(seed, frame)
+
+	if got := a.Strangers(); len(got) != 0 {
+		t.Fatalf("the seed that sent the roster is reported as a stranger: %+v", got)
+	}
+	for _, c := range a.HealthChecks() {
+		if strings.Contains(c.Title, "without being a peer") {
+			t.Fatalf("a healthy node warns about its own rendezvous: %s — %s", c.Title, c.Detail)
+		}
+	}
+}
+
+// The unknown-source list answers "who is talking to us wrongly *now*". A
+// misconfigured node talks continuously and stays on it; one packet from an
+// address that then goes quiet — a peer evicted a moment before its last
+// gossip landed, or a node that simply left — is the other case entirely.
+// Keeping those forever turned every departure into a permanent anomaly,
+// reported in the words of a NAT misconfiguration. Seen on hardware: a tablet
+// moved to a wrong key left its former cluster reporting it as a stranger with
+// no way for that to ever clear.
+func TestAStrangerThatWentQuietStopsBeingReported(t *testing.T) {
+	net := transport.NewMemNet(1)
+	a := newTestNode(t, net, "10.0.0.1:3137")
+	a.noteStranger("10.0.0.8:3137", "")
+	if len(a.Strangers()) != 1 {
+		t.Fatal("precondition: the stranger was not recorded")
+	}
+
+	// Still reported while it is recent: the check must keep working.
+	a.strangerMu.Lock()
+	a.strangers["10.0.0.8:3137"] = time.Now().Add(-StrangerQuietWindow / 2).Unix()
+	a.strangerMu.Unlock()
+	if len(a.Strangers()) != 1 {
+		t.Fatal("a stranger that is still sending was dropped")
+	}
+
+	// And forgotten once it has been quiet for long enough.
+	a.strangerMu.Lock()
+	a.strangers["10.0.0.8:3137"] = time.Now().Add(-StrangerQuietWindow - time.Second).Unix()
+	a.strangerMu.Unlock()
+	if got := a.Strangers(); len(got) != 0 {
+		t.Fatalf("an address that went quiet is still reported: %+v", got)
+	}
+	for _, c := range a.HealthChecks() {
+		if strings.Contains(c.Title, "without being a peer") {
+			t.Fatalf("a node whose stranger left still warns: %s", c.Title)
+		}
+	}
+}

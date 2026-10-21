@@ -7,7 +7,9 @@ const path = require('node:path');
 
 const S = require('../renderer/shared');
 const G = require('../renderer/graph');
-const { healthChecks, asReport, Severity } = require('../src/core/diagnostics');
+const {
+  healthChecks, asReport, Severity, SEND_ERROR_RECENT_WINDOW_MS,
+} = require('../src/core/diagnostics');
 const { sameHost } = require('../src/net/addr');
 
 /**
@@ -308,6 +310,46 @@ test('an ordinary send error still blames the network', () => {
   const detail = find(healthChecks(d, Date.now()), 'send error').detail;
   assert.match(detail, /no longer routes/);
   assert.ok(!/too large/.test(detail), `an ordinary failure was called oversized:\n${detail}`);
+});
+
+// The send-error counter only climbs, so one blip — an interface bouncing, a
+// peer that went away before its eviction — used to hold a node at "warning"
+// for the rest of its life while every packet since had gone out fine. A
+// warning that cannot clear is one the reader learns to scroll past.
+test('a send error ages out of the warnings', () => {
+  const d = baseDiagnostics();
+  const now = Date.now();
+  d.metrics.sendErrors = 2;
+  d.metrics.lastSendError = {
+    addr: '10.0.0.4:3137',
+    cause: 'ENETUNREACH',
+    message: 'network is unreachable',
+    at: Math.floor((now - SEND_ERROR_RECENT_WINDOW_MS - 1000) / 1000),
+  };
+
+  const checks = healthChecks(d, now);
+  const c = find(checks, 'send error');
+  assert.equal(c.severity, Severity.INFO, `an old send error is still ${c.severity}`);
+  assert.match(c.detail, /history/);
+  assert.match(c.title, /2 send error/, 'the count was dropped');
+  assert.equal(checks[0].severity, Severity.OK, 'the healthy line is still suppressed');
+});
+
+// Still a warning while it is happening: the fix must not silence the case the
+// check exists for.
+test('a send error happening now is still a warning', () => {
+  const d = baseDiagnostics();
+  const now = Date.now();
+  d.metrics.sendErrors = 1;
+  d.metrics.lastSendError = {
+    addr: '10.0.0.4:3137',
+    cause: 'ENETUNREACH',
+    message: 'network is unreachable',
+    at: Math.floor((now - 1000) / 1000),
+  };
+  const checks = healthChecks(d, now);
+  assert.equal(find(checks, 'send error').severity, Severity.WARN);
+  assert.notEqual(checks[0].severity, Severity.OK, 'a node failing to send right now reads as healthy');
 });
 
 // The renderer is sandboxed and cannot require the protocol module, so the

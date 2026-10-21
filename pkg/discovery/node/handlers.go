@@ -67,6 +67,13 @@ func (n *Node) handlePacket(from string, frame []byte) {
 		attribution = model.NormalizeAddr(claimed)
 	}
 	n.Metrics.RecvFrom(attribution, kind, len(frame))
+	// A roster only ever comes from a rendezvous service, which is not a peer
+	// and never will be. Noting it first keeps the configured seed out of the
+	// strangers list when the roster arrives by datagram — the fallback path,
+	// taken whenever the stream exchange cannot be made.
+	if kind == pb.KindBootstrapRoster {
+		n.noteRendezvous(src)
+	}
 	n.noteStranger(src, claimed)
 	n.dispatch(kind, body)
 }

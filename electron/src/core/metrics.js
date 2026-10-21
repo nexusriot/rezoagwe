@@ -83,7 +83,13 @@ class Metrics {
   counters(addr) {
     let c = this.perAddr.get(addr);
     if (!c) {
-      c = { packetsOut: 0, packetsIn: 0, bytesOut: 0, bytesIn: 0, sendErrors: 0, rejected: 0 };
+      // lastInMs is when a packet last arrived from this address. The
+      // unknown-source list answers "who is talking to us wrongly *now*", and
+      // without it one packet from an address that then went quiet — a peer
+      // evicted a moment before its last gossip landed — was reported forever.
+      c = {
+        packetsOut: 0, packetsIn: 0, bytesOut: 0, bytesIn: 0, sendErrors: 0, rejected: 0, lastInMs: 0,
+      };
       this.perAddr.set(addr, c);
     }
     return c;
@@ -99,6 +105,7 @@ class Metrics {
     const c = this.counters(addr);
     c.packetsIn++;
     c.bytesIn += bytes;
+    c.lastInMs = Date.now();
   }
 
   /**
@@ -118,12 +125,17 @@ class Metrics {
       // should have carried and did not. Told apart because the advice is
       // opposite — nothing about the route is wrong.
       oversize: !!(err && err.name === 'PacketTooLargeError'),
+      // When, so a failure can age out of the health checks. The counter only
+      // climbs, so without this one blip warned for the life of the process.
+      at: Math.floor(Date.now() / 1000),
     };
   }
 
   /** A frame from addr that did not authenticate, parse, or pass the replay guard. */
   rejectedFrom(addr) {
-    this.counters(addr).rejected++;
+    const c = this.counters(addr);
+    c.rejected++;
+    c.lastInMs = Date.now();
   }
 
   addrs() {

@@ -997,6 +997,32 @@ What it needed that the engine did not have:
   about it: stale rejections are normal and alert on nothing, a refusal
   means this replica can never converge. It is the only finding here that
   no amount of waiting clears.
+* **A clock on the transient findings.** A counter only climbs, so on its own
+  it cannot say whether anything is wrong *now* — and most of what reaches
+  these rules is weather. Wi-Fi power saving and roaming between access points
+  make a datagram fail to leave the device; a peer evicted a moment before its
+  last gossip landed sends one packet from an address that is no longer a peer.
+  Keyed on the totals, both findings latched: a tablet replicating happily in a
+  four-node cluster warned about failures minutes old and reported the
+  rendezvous it had been told to use as an unknown source, while the Go and
+  desktop nodes beside it called the same cluster healthy. A warning that
+  cannot clear is one the reader learns to scroll past, which costs the real
+  ones their only chance of being read. So the last send error carries a
+  timestamp and drops to informational once it is older than
+  `SendErrorRecentWindow`, and an unknown source leaves the list after
+  `StrangerQuietWindow` of silence. Neither hides anything a misconfiguration
+  would do, because a misconfigured node keeps failing and keeps talking — it
+  stays. The totals remain on the traffic counters, which is where a number
+  that only climbs belongs.
+* **A rendezvous is not a stranger.** The source-address rule above asks
+  whether a packet came from an address that is a peer; the rendezvous service
+  answers with a roster and is *by design* never a peer, so it matched. It only
+  showed when the roster came back by datagram — the fallback taken whenever
+  the stream exchange cannot be made, which on a phone is most joins — which is
+  why the Go and desktop nodes looked clean and the tablet beside them did not. A roster is
+  recorded against the address it actually arrived from rather than matched
+  against the configured seed string, so a seed written as a hostname, whose
+  packets arrive from a resolved IP, is covered too.
 * **A timing, not a total.** Every other input here is a counter, and a
   counter cannot express the failure measured on a tablet: a node whose
   gossip loop runs so far behind that its peers evict it while it is doing
