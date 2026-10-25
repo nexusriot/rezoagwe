@@ -93,8 +93,13 @@ jobs:
 
       # Needs no display: the suite runs a whole cluster in one process over an
       # in-memory network, and the docs tests read the repository's Markdown.
-      - name: test
+      - name: test (includes shared boundary corpus)
         run: npm test
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Go–desktop interoperability
+        run: npm run test:interop
 
   android:
     name: Android

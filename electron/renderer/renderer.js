@@ -215,147 +215,103 @@ const screens = {};
 
 /** Keys: the store itself, with TTL, version and a guarded save. */
 screens.keys = () => {
-  const rows = h('div', { class: 'rows' });
-  const noticeBar = h('div', {});
-  const filterInput = h('input', {
-    type: 'text',
-    placeholder: 'Filter keys and values',
-    value: ui.filter,
-    oninput: (e) => {
-      ui.filter = e.target.value;
-      render();
-    },
-  });
-
-  const save = async (req, entry) => {
-    ui.notice = null;
-    const result = await api.kv.set({ ...req, expect: entry ? entry.version : null });
-    if (result && result.rejected) {
-      // The store would not take it at all — a size or key limit, or a value
-      // no peer could ever receive. Nothing to do with the guard, so saying
-      // "a peer changed it" would send the reader after the wrong thing.
-      ui.notice = `${req.key} was not written: ${result.reason}`;
-      render();
-      return;
-    }
-    if (result && result.refused) {
-      // A refused guarded write used to leave only a line in the chat log, which
-      // is not the screen the user is looking at: the edit simply vanished.
-      ui.notice = entry
-        ? `Guarded write to ${req.key} refused: a peer changed it since the form opened.`
-        : `Guarded write to ${req.key} refused: it already exists.`;
-      render();
-    }
+  const rows=h('div',{class:'rows'}), noticeBar=h('div',{});
+  const viewport=h('div',{class:'key-viewport'},rows);
+  const spacer=height=>{const el=h('div');el.style.height=`${height}px`;return el;};
+  let page={entries:[],total:0},offset=0,request=0,lastEntries=null,query=ui.filter||'';
+  const pageLabel=h('span',{});
+  const save=async(req,entry)=>{
+    const result=await api.kv.set({...req,expect:entry?entry.version:null});
+    if(result&&result.rejected)ui.notice=`${req.key} was not written: ${result.reason}`;
+    else if(result&&result.refused)ui.notice=`Guarded write to ${req.key} refused: a peer changed it since the form opened.`;
+    await load();
   };
-
-  const root = h('div', { class: 'pane-body-inner' },
-    h('div', { class: 'toolbar' },
-      h('button', {
-        class: 'btn primary',
-        type: 'button',
-        text: 'New key',
-        onclick: () => keyDialog({
-          title: 'New key',
-          entry: null,
-          keyEditable: true,
-          guardHint: 'Guard: only write if the key does not exist',
-          onSave: (req) => save(req, null),
-        }),
-      }),
-      filterInput,
-      h('span', { class: 'spacer' }),
-      h('button', { class: 'btn ghost', type: 'button', text: 'Export', onclick: () => api.store.export() }),
-      h('button', {
-        class: 'btn ghost', type: 'button', text: 'Import', onclick: () => api.store.import(false),
-      }),
-      h('button', {
-        class: 'btn ghost',
-        type: 'button',
-        text: 'Seed',
-        title: 'Import, re-stamping every entry as a local write so it wins',
-        onclick: () => api.store.import(true),
-      })),
-    noticeBar,
-    rows);
-
-  const update = () => {
-    clear(noticeBar);
-    if (ui.notice) {
-      noticeBar.append(h('div', { class: 'notice' },
-        h('span', { text: ui.notice }),
-        h('span', { class: 'spacer' }),
-        h('button', {
-          class: 'btn tiny',
-          type: 'button',
-          text: 'Dismiss',
-          onclick: () => {
-            ui.notice = null;
-            render();
-          },
-        })));
-    }
-
-    const needle = ui.filter.trim().toLowerCase();
-    const visible = needle
-      ? state.entries.filter((e) => e.key.toLowerCase().includes(needle) || e.value.toLowerCase().includes(needle))
-      : state.entries;
-
-    clear(rows);
-    if (!visible.length) {
-      rows.append(h('div', {
-        class: 'empty',
-        text: state.entries.length ? 'No key matches the filter.' : 'No keys yet.',
-      }));
-      return;
-    }
-    const now = nowSec();
-    for (const entry of visible) {
-      const ttl = S.ttlRemaining(entry.expiresAt, now);
-      rows.append(h('div', { class: 'kv-row' },
-        h('div', { class: 'kv-main' },
-          h('div', { class: 'kv-key' },
-            // A key is arbitrary UTF-8, and a newline or tab in one is legal.
-            // Unescaped, CSS collapsed it to a space, so two different keys
-            // drew identically — next to a delete button. The value on this
-            // row has always been escaped; the key was the one field that was
-            // not.
-            h('span', { text: S.displayKey(entry.key) }),
-            ttl === null ? null : h('span', { class: 'pill ttl', text: `expires in ${S.formatUptime(ttl)}` })),
-          h('div', { class: 'kv-value', text: S.displayValue(entry.value) }),
-          h('div', { class: 'kv-meta', text: `v${entry.version.counter}` })),
-        h('div', { class: 'kv-actions' },
-          h('button', {
-            class: 'btn tiny',
-            type: 'button',
-            text: 'Edit',
-            onclick: () => keyDialog({
-              title: `Edit ${entry.key}`,
-              entry,
-              keyEditable: false,
-              guardHint: 'Guard: refuse if a peer changed it meanwhile',
-              onSave: (req) => save(req, entry),
-            }),
-          }),
-          h('button', {
-            class: 'btn tiny', type: 'button', text: 'History', onclick: () => historyDialog(entry.key),
-          }),
-          h('button', {
-            class: 'btn tiny danger',
-            type: 'button',
-            text: 'Delete',
-            onclick: () => confirmDialog({
-              title: `Delete ${entry.key}?`,
-              body: 'The delete replicates as a versioned tombstone, so a stale write cannot resurrect it.',
-              confirmLabel: 'Delete',
-              danger: true,
-              onConfirm: () => api.kv.remove({ key: entry.key, guard: false }),
-            }),
-          }))));
-    }
+  const remove=async(entry)=>{
+    try {
+      const result=await api.kv.remove({key:entry.key,guard:true,expect:entry.version});
+      ui.notice=result?.refused ? `Delete refused: ${entry.key} changed since this version was displayed.` : '';
+    } catch(e) { ui.notice=e.message||String(e); }
+    await load();
   };
-
-  return { root, update };
+  const draw=()=>{
+    clear(rows);clear(noticeBar);
+    if(ui.notice)noticeBar.append(h('div',{class:'notice',text:ui.notice}));
+    pageLabel.textContent=`${page.total ? offset+1 : 0}–${Math.min(offset+page.entries.length,page.total)} of ${page.total}`;
+    // Fixed row height plus spacer rows keeps the DOM bounded while scrolling.
+    const height=112,start=Math.max(0,Math.floor(viewport.scrollTop/height)-3);
+    const end=Math.min(page.entries.length,start+Math.ceil((viewport.clientHeight||600)/height)+6);
+    if(!page.entries.length){rows.append(h('div',{class:'empty',text:'No matching keys.'}));return;}
+    rows.append(spacer(start*height));
+    for(const entry of page.entries.slice(start,end)){
+      const ttl=S.ttlRemaining(entry.expiresAt,nowSec());
+      rows.append(h('div',{class:'kv-row virtual-key-row'},
+        h('div',{class:'kv-main'},h('div',{class:'kv-key',text:S.displayKey(entry.key)}),
+          h('div',{class:'kv-value',text:S.displayValue(entry.value)+(entry.truncated?' …':'')}),
+          h('div',{class:'kv-meta',text:`v${entry.version.counter} · ${entry.valueLength} characters${ttl===null?'':` · expires in ${S.formatUptime(ttl)}`}`})),
+        h('div',{class:'kv-actions'},
+          h('button',{class:'btn tiny',text:'Edit',onclick:async()=>{
+            const full=await api.kv.get(entry.key);
+            if(!full){ui.notice='This key was deleted; refresh the list.';await load();return;}
+            keyDialog({title:`Edit ${full.key}`,entry:full,keyEditable:false,guardHint:'Guard: refuse if a peer changed it meanwhile',onSave:req=>save(req,full)});
+          }}),
+          h('button',{class:'btn tiny',text:'History',onclick:()=>historyDialog(entry.key)}),
+          h('button',{class:'btn tiny danger',text:'Delete',onclick:()=>confirmDialog({title:`Delete ${entry.key}?`,body:'Delete this version and replicate its tombstone.',confirmLabel:'Delete',danger:true,onConfirm:()=>remove(entry)})}))));
+    }
+    rows.append(spacer((page.entries.length-end)*height));
+  };
+  const load=async()=>{
+    const ticket=++request;
+    try {const result=await api.kv.list({query,offset,limit:200});if(ticket!==request)return;page=result;offset=result.offset;draw();}
+    catch(e){ui.notice=e.message||String(e);draw();}
+  };
+  viewport.addEventListener('scroll',draw);
+  let debounce;
+  const filterInput=h('input',{type:'text',placeholder:'Filter keys',value:query,oninput:e=>{
+    query=e.target.value;ui.filter=query;offset=0;viewport.scrollTop=0;
+    clearTimeout(debounce);debounce=setTimeout(load,150);
+  }});
+  const root=h('div',{class:'pane-body-inner'},h('div',{class:'toolbar'},
+    h('button',{class:'btn primary',text:'New key',onclick:()=>keyDialog({title:'New key',entry:null,keyEditable:true,guardHint:'Guard: only write if the key does not exist',onSave:req=>save(req,null)})}),
+    filterInput,h('span',{class:'spacer'}),
+    h('button',{class:'btn ghost',text:'Restore backup',onclick:restoreDialog}),
+    h('button',{class:'btn ghost',text:'Export',onclick:()=>api.store.export()}),
+    h('button',{class:'btn ghost',text:'Import',onclick:()=>api.store.import(false)}),
+    h('button',{class:'btn ghost',text:'Seed',onclick:()=>api.store.import(true)})),
+    noticeBar,viewport,h('div',{class:'toolbar'},
+      h('button',{class:'btn',text:'Previous',onclick:()=>{offset=Math.max(0,offset-200);viewport.scrollTop=0;load();}}),
+      pageLabel,h('button',{class:'btn',text:'Next',onclick:()=>{if(offset+200<page.total){offset+=200;viewport.scrollTop=0;load();}}})));
+  const update=()=>{if(lastEntries!==state.entries){lastEntries=state.entries;load();}};
+  return {root,update};
 };
+
+function restoreDialog(){
+  openModal((modal,close)=>{
+    let page=null;const chosen=new Set();
+    const missing=h('input',{type:'checkbox'}),cross=h('input',{type:'checkbox'});
+    const body=h('div',{}),message=h('div',{class:'notice'});
+    const draw=()=>{clear(body);if(!page)return;
+      body.append(h('div',{text:`Backup: ${page.sourceCluster} / ${page.source||'unknown'} · ${page.total} changed keys`}));
+      for(const item of page.items){
+        const box=h('input',{type:'checkbox',checked:chosen.has(item.key),onchange:e=>{if(e.target.checked)chosen.add(item.key);else chosen.delete(item.key);}});
+        body.append(h('div',{class:'history-entry'},h('label',{},box,` ${item.change}: ${S.displayKey(item.key)}`),
+          h('div',{text:`Current: ${item.current?S.displayValue(item.current.value):'(absent)'}`}),
+          h('div',{text:`Backup: ${S.displayValue(item.desired.value||'')} · expires ${item.desired.expiresAt||'never'}`}),
+          h('button',{class:'btn tiny',text:'Compare full values',onclick:async()=>{
+            const full=await api.restore.detail(page.id,item.key);
+            const detail=h('textarea',{class:'restore-detail',readOnly:true,value:JSON.stringify(full,null,2)});body.append(detail);detail.focus();
+          }})));
+      }
+      body.append(h('button',{class:'btn',text:'Previous',onclick:async()=>{page=await api.restore.page(page.id,Math.max(0,page.offset-100));draw();}}),
+        h('button',{class:'btn',text:'Next',onclick:async()=>{if(page.next>=0){page=await api.restore.page(page.id,page.next);draw();}}}));
+    };
+    modal.append(h('h2',{text:'Restore selected backup keys'}),h('label',{},missing,' Delete local keys absent from backup'),h('label',{},cross,' Allow a backup from another cluster'),
+      h('button',{class:'btn',text:'Choose backup and preview',onclick:async()=>{try{page=await api.restore.open({deleteMissing:missing.checked,allowCrossCluster:cross.checked});chosen.clear();draw();}catch(e){message.textContent=e.message;}}}),message,body,
+      h('div',{class:'actions'},h('button',{class:'btn',text:'Cancel',onclick:close}),h('button',{class:'btn primary',text:'Restore selected keys',onclick:async()=>{
+        if(!page||!chosen.size)return;
+        try{const result=await api.restore.apply(page.id,[...chosen]);message.textContent=`Restored ${result.restored}; changed since preview ${result.changed}; refused ${result.refused}. Replicas ${result.after.converged?'agree':'still differ'}.`;chosen.clear();draw();}catch(e){message.textContent=e.message;}
+      }})));
+  });
+}
 
 /** Chat: messages, emotes, direct messages and the slash commands the TUI has. */
 screens.chat = () => {
@@ -904,6 +860,7 @@ function consistencyCard(r) {
       rows.push(line(name, `did not answer: ${p.error || 'no reply'}`));
       continue;
     }
+    if (p.error) { rows.push(line(name, `comparison unavailable: ${p.error}`)); continue; }
     rows.push(line(name, p.agrees
       ? `agrees — ${p.keys} keys, clock ${p.clock}`
       : `disagrees — ${p.keys} keys, clock ${p.clock}`));
@@ -1034,6 +991,7 @@ screens.settings = () => {
     field('advertiseHost', 'Advertise host (blank = this machine’s LAN address)'),
     field('seeds', 'Bootstrap seeds, comma separated'),
     field('cluster', 'Cluster name'),
+    field('durability', 'Persistence: snapshot, journal, journal-sync'),
     field('psk', 'Pre-shared key', { type: 'password' }),
     field('tombstoneTtlSec', 'Tombstone GC after (seconds, 0 = never)', { type: 'number' }),
     h('h3', { class: 'h3-gap', text: 'Rendezvous' }),
@@ -1058,15 +1016,22 @@ screens.settings = () => {
             advertiseHost: fields.advertiseHost.value,
             seeds: fields.seeds.value,
             cluster: fields.cluster.value,
+            durability: fields.durability.value,
             psk: fields.psk.value,
             tombstoneTtlSec: Number(fields.tombstoneTtlSec.value),
             bootstrapPort: Number(fields.bootstrapPort.value),
             autoStartNode: fields.autoStartNode.checked,
             autoStartBootstrap: fields.autoStartBootstrap.checked,
           };
+          try {
+          if (partial.cluster.trim() && partial.cluster.trim() !== state.settings.cluster) {
+            const preview = await api.app.previewCluster(partial.cluster);
+            if (!window.confirm(`Switch from ${preview.from} to ${preview.destination}?\nCurrent profile: ${preview.currentEntries} entries retained.\nDestination: ${preview.destinationEntries === null ? "entry count available after journal replay" : `${preview.destinationEntries} entries`}.\n${preview.policy}`)) return;
+          }
           state.settings = await api.app.applySettings(partial);
           toast('ok', 'Settings applied');
           render();
+          } catch (e) { toast('error', e.message || String(e)); }
         },
       })),
     h('div', { class: 'kv-meta mt8', text:

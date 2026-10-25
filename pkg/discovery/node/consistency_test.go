@@ -352,3 +352,18 @@ func TestConsistencyFindsTwoValuesAtOneVersion(t *testing.T) {
 			found.Local, found.Remote)
 	}
 }
+
+func TestDigestV2DetectsExpiryAndNegotiatesLegacy(t *testing.T) {
+	a, b := newPairedNodes(t, transport.NewMemNet(1))
+	for i, n := range []*Node{a, b} {
+		n.Model.Store.Apply(pb.KVUpdate{Action: pb.KVSet, Key: "ttl", Value: "v", Version: pb.Version{Counter: 1, Node: "same"}, ExpiresAt: 4102444800 + int64(i)})
+	}
+	if a.CheckConsistency().Converged {
+		t.Fatal("expiry difference missed")
+	}
+	legacy := a.fingerprintResponse(pb.Fingerprint{})
+	modern := a.fingerprintResponse(pb.Fingerprint{DigestVersion: 2})
+	if legacy.DigestVersion != 0 || modern.DigestVersion != 2 || len(modern.Capabilities) == 0 {
+		t.Fatal("bad negotiation")
+	}
+}

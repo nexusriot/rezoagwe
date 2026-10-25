@@ -206,13 +206,17 @@ A node with no terminal, driven over HTTP:
 | `/metrics` | GET | Prometheus exposition text |
 | `/peers` | GET | who this node can see |
 | `/activity` | GET | the activity feed |
-| `/kv` | GET | list keys (`?prefix=`, `?watch=1`) |
+| `/kv` | GET | list keys; `prefix`, `limit`, `offset`, `preview`; `watch=1` opens SSE |
 | `/kv/{key}` | GET PUT DELETE | read, write, delete one key |
 | `/history/{key}` | GET | the recorded versions of a key |
 | `/chat` | GET POST | read the conversation, say a line |
 | `/export` `/import` | GET POST | the whole store out and back |
 | `/snapshot` | POST | write a snapshot now |
 | `/repair` | POST | make this node's copy of named keys win |
+| `/repair/preview` | POST | inspect a stable repair/restore preview page without changing keys |
+| `/repair/apply` | POST | apply a saved repair page with local change guards |
+| `/restore/preview` | POST | compare a backup with current data without changing keys |
+| `/restore/apply` | POST | apply explicitly selected keys from a restore preview |
 | `/topology` | GET | the cluster as a graph |
 | `/diagnostics` | GET | what is wrong, in JSON or `?format=text` |
 | `/consistency` | GET | ask every replica whether they agree |
@@ -260,9 +264,13 @@ write.
 curl -N 'localhost:8137/kv?watch=1&prefix=app/'
 ```
 
-Server-sent events: a `snapshot` of the store as it stands, then one `kv` event
-per change, filtered to the prefix. A watch is a read, so a read-only gateway
-still serves it.
+Without a cursor, the stream starts with a `snapshot`, then sends `kv` events
+filtered to the prefix. Reconnect with the last processed SSE ID in
+`Last-Event-ID` to replay retained events and receive a `ready` marker. HTTP 409
+with `resnapshot_required` means reconnect without a cursor and replace the
+baseline. A slow consumer receives `dropped`, then `resnapshot`, before closure.
+A watch is a GET, so a read-only gateway still serves it. That gateway rejects
+all POST requests, including non-mutating repair and restore previews.
 
 ### Locking the gateway down
 
@@ -570,6 +578,7 @@ Anyone with the key can impersonate any node. See DESIGN.md §11.
 | `-psk` | — | pre-shared key authenticating every packet |
 | `-nick` | `anon` | chat nickname |
 | `-data` | config dir | state file; `-` disables persistence |
+| `-durability` | `snapshot` | `snapshot`, `journal`, or `journal-sync`; see [durability usage](#journal-durability) |
 | `-http` | — | serve the HTTP gateway here, e.g. `:8080` |
 | `-http-token` | — | require this bearer token on every request |
 | `-http-readonly` | `false` | refuse every mutating request |
@@ -606,3 +615,232 @@ Anyone with the key can impersonate any node. See DESIGN.md §11.
 - [android/README.md](android/README.md) — the Android app in detail, and what hardware testing has found
 - [electron/README.md](electron/README.md) — the desktop client in detail
 - [ROADMAP.md](ROADMAP.md) — what has shipped and what is next
+
+## 13. Repair previews and cluster profiles
+
+### Guarded repair
+
+The Go gateway and client now support a two-step repair workflow:
+
+```sh
+rezoagwectl repair -divergent -preview -limit 100 > plan.json
+# Inspect plan.json: source node, keys, values, versions and expiry.
+rezoagwectl repair -apply-plan plan.json
+```
+
+A preview contains `id`, `from`, `node_id`, `created_at`, `total`, `offset`,
+`next`, and `items`. Each item contains the exact local update that would be
+reasserted; a missing local key has `current: null`. Values and tombstones are
+both included. Protect saved preview files as you would an export of the data.
+
+For additional pages, reuse the **same ID**, even after applying the first page:
+
+```sh
+rezoagwectl repair -preview -plan PREVIEW_ID -offset NEXT_OFFSET -limit 100 > next.json
+rezoagwectl repair -apply-plan next.json
+```
+
+Candidate membership and values remain stable during paging. Fetching a new
+`-divergent -preview` instead would create a new snapshot. Nodes keep up to four
+previews for ten minutes; paging an expired or evicted ID returns an explicit
+error. Pages default to 100 entries and are capped at 500. Restarting a node
+clears the page cache. A saved page remains guarded by its exact expected state.
+
+The corresponding authenticated HTTP routes are:
+
+- `POST /repair/preview` with `{"keys":["a"],"offset":0,"limit":100}` or
+  `{"divergent":true,"limit":100}`.
+- `POST /repair/preview` with `{"id":"PREVIEW_ID","offset":100,"limit":100}`.
+- `POST /repair/apply` with the saved preview page as the body.
+
+Before applying, repair observes peer clocks and stamps the selected source
+after them, so deliberately choosing an older source still outranks the known
+remote version. Counter exhaustion is refused instead of wrapping.
+
+Applying compares the source identity and the exact local value, version,
+delete state, and expiry under the store lock. A change since preview returns
+`changed` and is skipped. A tombstone uses the same guard. The operation is
+per-key, not an atomic multi-key transaction or a distributed transaction;
+concurrent remote writes can still arrive afterward.
+
+Results include `rewritten`, `changed`, `refused`, `absent`, `remaining`,
+`complete`, per-key outcomes, and a fresh `after` consistency report.
+`remaining` counts selected entries not rewritten (including later pages);
+`after` separately reports replication still outstanding. `complete` requires
+no selected work outstanding and agreement from all known peers. A successful
+local rewrite can therefore have `complete: false` while replication catches up.
+The CLI returns exit 4 for an incomplete applied page.
+
+The existing `repair -divergent` now collects the full named candidate set,
+independently of the 50-key display cap. Very large
+fingerprint replies remain subject to the existing stream frame limit; a failed
+comparison cannot produce a successful completion claim.
+
+### Cluster profiles and migration
+
+Desktop and Android store node state and rendezvous rosters under
+`profiles/<SHA-256 of cluster name>/`. Each cluster has its own node identity,
+values, tombstones, chat and roster. Switching back restores its saved profile.
+Changing a PSK within the same cluster retains that cluster's identity.
+
+Desktop shows source/destination entry counts (the destination count is deferred
+when journal replay is pending) and a confirmation before applying
+a cluster change. Android shows the destination and retention policy in a
+rotation-safe confirmation. Neither switch copies source data into the target.
+The existing desktop Export/Import actions provide explicit migration; Android
+Settings now offers file-picker Export and Import (merge by version) actions.
+
+Go's default data path also includes the cluster profile. An explicit `-data`
+path remains exactly the operator-supplied path; use separate explicit files
+for separate clusters.
+
+Legacy migration is one-time: the initial saved app cluster (or first cluster
+used with the upgraded Go default path) owns the old unscoped files. Originals
+are retained, and migration markers prevent old files being recopied on later
+switches. **For a Go upgrade with legacy data, first launch with the original
+cluster name.** A legacy state file did not record its cluster, so that association
+cannot be inferred from its contents. Export/import is the explicit way to move
+its data to another cluster.
+
+### Coordination guarantees
+
+CAS guards the replica receiving the request. Two partitioned replicas may both
+accept an absent-key claim; last-write-wins later resolves their values but cannot
+undo external work. Use an external consensus coordinator for exclusive ownership
+across replicas. No consensus-backed locking mode is implemented.
+
+## 14. Persistence, watches and restore
+
+### Journal durability
+
+Go, Electron and Android accept three persistence modes:
+
+| Mode | Save behavior | Power-loss acknowledgement |
+|---|---|---|
+| `snapshot` (default) | Atomic replacement of the JSON state file | No |
+| `journal` | Append checksummed changed-key records to `<state>.wal` | No |
+| `journal-sync` | Journal plus file and directory fsync | Yes, after a successful flush |
+
+Go: `-durability journal-sync` with persistence enabled. Electron and Android:
+Settings → Persistence/Durability. Changing modes restarts the node while keeping
+its profile. Legacy profile migration retains both the checkpoint and WAL; a
+destination with a journal reports its count after opening. Diagnostics report the mode, pending state, errors and whether the
+last save confirmed durability. The journal reuses the state format's keys,
+versions, tombstones, expiry, identity and chat metadata.
+
+A checkpoint is written after 64 records or when the journal exceeds 16 MiB.
+Recovery replays complete checksummed records and truncates an unterminated final
+record. A missing checkpoint also blocks recovery: a delta journal cannot reconstruct
+unchanged checkpoint-only keys. Corruption in a complete record blocks saving and keeps the original
+files for recovery. Snapshot mode also replays existing journals before retiring
+them. Switching modes first records the newest state, so a crash between checkpoint
+replacement and journal removal cannot restore an older value.
+
+Writes still enter memory first. Go and Electron coalesce saves; Android calls
+its serialized persister synchronously, so fsync can add operation latency. Journal mode
+alone does **not** make every mutation durable before returning. To require that
+acknowledgement from the Go gateway:
+
+```bash
+rezoagwectl put -durable colour blue
+# Equivalent HTTP request:
+curl -i -X PUT -H 'X-Rezoagwe-Durability: durable' --data-binary blue \
+  http://127.0.0.1:8080/kv/colour
+```
+
+Success has `X-Rezoagwe-Accepted: durable`; an ordinary PUT has `memory`.
+The gateway rejects a durable request before mutation if journal-sync persistence
+is unavailable. If the write enters memory but flushing fails, it returns 503 and
+explicitly reports that the memory write happened. This is local durability, not
+replication acknowledgement or a distributed transaction. Desktop and Android
+writes use memory acceptance; their persistence health reports later saves.
+Storage hardware must honor fsync for its usual guarantees. Copying a live state
+JSON file alone is not a backup in journal mode: use Export or Snapshot, or stop
+the node and retain both state and WAL. Checkpoints still construct full in-memory
+state and retain full chat metadata per record; this is not a disk-backed database.
+
+### Resumable Go watches
+
+`GET /kv?watch=1&prefix=app/` emits SSE IDs on the initial `snapshot`, subsequent
+`kv` events and resume `ready` events. Reconnect with `Last-Event-ID` set to the
+last fully processed ID. `client.WatchFrom(prefix, cursor, stop)` exposes this in Go;
+`WatchEvent.ID` carries the cursor. Retry policy remains the caller's choice.
+
+The node retains at most 2,048 events and approximately 8 MiB of payload. Cursors
+are bound to the process and prefix. An expired, foreign, future or restarted-node
+cursor returns HTTP 409 with `code: resnapshot_required`; reconnect without a
+cursor and replace the baseline. A live consumer that overruns its 256-event
+queue receives `dropped`, then `resnapshot`, and the stream closes. Watch history
+is in memory, independent of the state journal. Compare versions when applying
+events: baseline/live overlap can produce duplicates, and concurrent mutation
+callbacks can arrive in publication order rather than version order.
+
+### Bounded key browsing and value previews
+
+The desktop Keys screen searches key names and loads pages of 200 entries with
+512-character previews. Only visible rows plus an overscan margin are mounted.
+Edit fetches the full current value and version on demand; history remains an
+explicit operation. Runtime entry notifications carry bounded previews instead
+of every full value. Export intentionally contains complete values.
+
+The Go gateway supports `GET /kv?limit=100&offset=0&preview=true&prefix=app/`.
+The response is `{entries,total,offset,limit}`; limits range from 1–500. Previews
+are at most 512 UTF-8 bytes and expose `truncated`. `GET /kv/{key}` retrieves the
+full value. Omitting `limit` preserves the existing array response. Pages are live
+views, not stable snapshots: concurrent key changes can shift offsets. The store
+remains memory-resident and key sorting still scans the keyspace.
+
+### Replication limits and bounded repair work
+
+Hello messages advertise optional `limits.max_value_bytes` and `limits.max_keys`
+on all three ports. Older peers can omit the field. Diagnostics explain unequal
+limits and the possibility of permanent divergence. Repair skips SET values known
+to exceed the destination's value limit, while still sending deletions. A peer's
+key limit is diagnostic, not a reason to suppress updates to keys it already has.
+
+Go processes repair sends with two workers and a queue of 16 jobs. Electron and
+Android allow two active repair sends and defer excess work. Subsequent
+anti-entropy rounds retry deferred work. JSON-encoded byte sizes determine batch
+splitting; Electron yields between batches. Go and Android repair streams no
+longer run synchronously in the incoming packet handler, keeping that handler
+available for heartbeats. These limits cover anti-entropy pushes/pulls, not every
+outgoing write or state-sync transfer, and do not guarantee bandwidth fairness.
+
+### Backup restore preview and selected apply
+
+Desktop: Keys → Restore backup → choose a JSON export → inspect additions,
+overwrites and deletions → select keys → Apply selected. Compare full values on
+demand. Deleting keys absent from the backup and restoring a different cluster
+both require explicit options. Backup selection is capped at 64 MiB.
+
+Go CLI:
+
+```bash
+rezoagwectl restore -preview backup.json
+rezoagwectl restore -preview -plan PREVIEW_ID -offset 100 -limit 100
+rezoagwectl restore -plan PREVIEW_ID colour app/config
+# Optional preview behavior:
+rezoagwectl restore -preview -delete-missing -cross-cluster backup.json
+```
+
+The HTTP equivalents are `POST /restore/preview` with
+`{backup: <export object>, delete_missing: false, allow_cross_cluster: false}` and
+`POST /restore/apply` with `{id: "preview ID", keys: ["colour"]}`. Preview pages use
+`POST /repair/preview` with `{id,offset,limit}`. The gateway body limit is 32 MiB.
+The Go client exposes `PreviewRestore` and `ApplyRestore`. A read-only gateway
+rejects all POST requests, including these non-mutating preview requests.
+
+Go retains at most four repair/restore plans combined; Electron retains at most
+four restore plans. Plans expire after ten minutes and selected restore apply
+is limited to 500 keys. A first Go restore preview returns up to 100 items;
+subsequent pages use the requested limit. Electron restore pages contain 100 items.
+Preview does not write data. Desktop restore apply is serialized with settings
+changes so a profile cannot be replaced while its restore is still running.
+Apply checks each key's exact local state, including
+absence and tombstones; changed keys are reported and skipped. Applied entries
+receive fresh local versions above observed peer clocks, then replicate normally.
+Expired backup values become deletions. Reports include refusals, changed keys
+and a post-restore consistency check. This is a sequence of guarded local writes,
+not an all-or-nothing transaction or a guarantee against unseen concurrent writes.
+Android keeps its existing import/export UI; the new wizard is in Electron and
+the Go gateway/CLI.

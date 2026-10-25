@@ -5,6 +5,7 @@ package httpapi
 
 import (
 	"crypto/subtle"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -81,6 +82,14 @@ func Serve(cfg Config, n *node.Node) (*Server, error) {
 	if (cfg.TLSCert == "") != (cfg.TLSKey == "") {
 		return nil, fmt.Errorf("TLS needs both a certificate and a key")
 	}
+	var tlsConfig *tls.Config
+	if cfg.TLSCert != "" {
+		cert, err := tls.LoadX509KeyPair(cfg.TLSCert, cfg.TLSKey)
+		if err != nil {
+			return nil, fmt.Errorf("load gateway TLS certificate: %w", err)
+		}
+		tlsConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
+	}
 	ln, err := net.Listen("tcp", cfg.Addr)
 	if err != nil {
 		return nil, err
@@ -89,9 +98,10 @@ func Serve(cfg Config, n *node.Node) (*Server, error) {
 	s.http = &http.Server{
 		Handler:           s.mux(),
 		ReadHeaderTimeout: 10 * time.Second,
+		TLSConfig:         tlsConfig,
 	}
 	if cfg.TLSCert != "" {
-		go s.http.ServeTLS(ln, cfg.TLSCert, cfg.TLSKey)
+		go s.http.ServeTLS(ln, "", "")
 	} else {
 		go s.http.Serve(ln)
 	}
@@ -131,6 +141,10 @@ func (s *Server) mux() http.Handler {
 	mux.HandleFunc("POST /import", s.handleImport)
 	mux.HandleFunc("POST /snapshot", s.handleSnapshot)
 	mux.HandleFunc("POST /repair", s.handleRepair)
+	mux.HandleFunc("POST /repair/preview", s.handleRepairPreview)
+	mux.HandleFunc("POST /restore/preview", s.handleRestorePreview)
+	mux.HandleFunc("POST /restore/apply", s.handleRestoreApply)
+	mux.HandleFunc("POST /repair/apply", s.handleRepairApply)
 	mux.HandleFunc("GET /topology", s.handleTopology)
 	mux.HandleFunc("GET /diagnostics", s.handleDiagnostics)
 	mux.HandleFunc("GET /consistency", s.handleConsistency)
@@ -358,6 +372,7 @@ func (s *Server) handleConsistency(w http.ResponseWriter, r *http.Request) {
 
 // kvItem is one key in a listing.
 type kvItem struct {
+	Truncated bool   `json:"truncated,omitempty"`
 	Key       string `json:"key"`
 	Value     string `json:"value"`
 	Version   string `json:"version"`
@@ -383,6 +398,44 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 			ExpiresAt: e.ExpiresAt,
 		})
 	}
+	if r.URL.Query().Has("limit") {
+		limit, err := strconv.Atoi(r.URL.Query().Get("limit"))
+		if err != nil || limit < 1 || limit > 500 {
+			writeErr(w, 400, "limit must be 1–500")
+			return
+		}
+		offset := 0
+		if raw := r.URL.Query().Get("offset"); raw != "" {
+			offset, err = strconv.Atoi(raw)
+			if err != nil || offset < 0 {
+				writeErr(w, 400, "offset must be nonnegative")
+				return
+			}
+		}
+		total := len(out)
+		if offset > total {
+			offset = total
+		}
+		end := offset + limit
+		if end > total {
+			end = total
+		}
+		out = out[offset:end]
+		if r.URL.Query().Get("preview") == "true" {
+			for i := range out {
+				if len(out[i].Value) > 512 {
+					v := out[i].Value[:512]
+					for !utf8.ValidString(v) {
+						v = v[:len(v)-1]
+					}
+					out[i].Value = v
+					out[i].Truncated = true
+				}
+			}
+		}
+		writeJSON(w, 200, map[string]interface{}{"entries": out, "total": total, "offset": offset, "limit": limit})
+		return
+	}
 	writeJSON(w, http.StatusOK, out)
 }
 
@@ -406,7 +459,12 @@ func (s *Server) handleWatch(w http.ResponseWriter, r *http.Request, prefix stri
 		return
 	}
 
-	watcher := s.node.Watch(prefix)
+	cursor := r.Header.Get("Last-Event-ID")
+	watcher, replay, err := s.node.WatchFrom(prefix, cursor)
+	if err != nil {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error(), "code": "resnapshot_required"})
+		return
+	}
 	defer watcher.Close()
 
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -416,21 +474,35 @@ func (s *Server) handleWatch(w http.ResponseWriter, r *http.Request, prefix stri
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
 
-	entries := s.node.Entries()
-	baseline := make([]kvItem, 0, len(entries))
-	for _, e := range entries {
-		if prefix != "" && !strings.HasPrefix(e.Key, prefix) {
-			continue
+	if cursor == "" {
+		entries := s.node.Entries()
+		baseline := make([]kvItem, 0, len(entries))
+		for _, e := range entries {
+			if prefix != "" && !strings.HasPrefix(e.Key, prefix) {
+				continue
+			}
+			baseline = append(baseline, kvItem{
+				Key:       e.Key,
+				Value:     e.Value,
+				Version:   formatVersion(e.Version),
+				ExpiresAt: e.ExpiresAt,
+			})
 		}
-		baseline = append(baseline, kvItem{
-			Key:       e.Key,
-			Value:     e.Value,
-			Version:   formatVersion(e.Version),
-			ExpiresAt: e.ExpiresAt,
-		})
-	}
-	if !writeEvent(w, "snapshot", baseline) {
-		return
+		fmt.Fprintf(w, "id: %s\n", watcher.Cursor)
+		if !writeEvent(w, "snapshot", baseline) {
+			return
+		}
+	} else {
+		for _, ev := range replay {
+			fmt.Fprintf(w, "id: %s\n", watcher.Token(ev.ID))
+			if !writeEvent(w, "kv", ev) {
+				return
+			}
+		}
+		fmt.Fprintf(w, "id: %s\n", watcher.Cursor)
+		if !writeEvent(w, "ready", map[string]string{"cursor": watcher.Cursor}) {
+			return
+		}
 	}
 	flusher.Flush()
 
@@ -453,7 +525,11 @@ func (s *Server) handleWatch(w http.ResponseWriter, r *http.Request, prefix stri
 				if !writeEvent(w, "dropped", map[string]uint64{"events": dropped}) {
 					return
 				}
+				writeEvent(w, "resnapshot", map[string]string{"reason": "consumer fell behind"})
+				flusher.Flush()
+				return
 			}
+			fmt.Fprintf(w, "id: %s\n", watcher.Token(ev.ID))
 			if !writeEvent(w, "kv", ev) {
 				return
 			}
@@ -501,6 +577,15 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
+	durable := r.Header.Get("X-Rezoagwe-Durability")
+	if durable != "" && durable != "memory" && durable != "durable" {
+		writeErr(w, 400, "unknown durability request")
+		return
+	}
+	if durable == "durable" && s.node.Model.PersistenceHealth().Mode != "journal-sync" {
+		writeErr(w, 409, "durable acknowledgement requires journal-sync persistence")
+		return
+	}
 	key := r.PathValue("key")
 	body, ok := readBody(w, r)
 	if !ok {
@@ -508,8 +593,8 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 	}
 	var ttl time.Duration
 	if raw := r.Header.Get("X-Rezoagwe-TTL"); raw != "" {
-		secs, err := strconv.Atoi(raw)
-		if err != nil || secs < 0 {
+		secs, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || secs < 0 || secs > int64((1<<63-1)/time.Second) {
 			writeErr(w, http.StatusBadRequest, "malformed X-Rezoagwe-TTL: %q", raw)
 			return
 		}
@@ -530,7 +615,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.Header().Set("ETag", `"`+formatVersion(u.Version)+`"`)
-		w.WriteHeader(http.StatusNoContent)
+		s.finishPut(w, r)
 		return
 	}
 	u, err := s.node.Set(key, string(body), ttl)
@@ -539,7 +624,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("ETag", `"`+formatVersion(u.Version)+`"`)
-	w.WriteHeader(http.StatusNoContent)
+	s.finishPut(w, r)
 }
 
 // writeRefusal turns the reason a write did not land into a status a client
@@ -690,4 +775,108 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]int{"applied": applied})
+}
+
+func (s *Server) handleRepairPreview(w http.ResponseWriter, r *http.Request) {
+	body, ok := readBody(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		ID        string   `json:"id"`
+		Keys      []string `json:"keys"`
+		Divergent bool     `json:"divergent"`
+		Offset    int      `json:"offset"`
+		Limit     int      `json:"limit"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeErr(w, 400, "malformed preview: %s", err)
+		return
+	}
+	if req.ID != "" {
+		p := s.node.RepairPlanPage(req.ID, req.Offset, req.Limit)
+		if p.Error != "" {
+			writeErr(w, 409, "%s", p.Error)
+			return
+		}
+		writeJSON(w, 200, p)
+		return
+	}
+	if req.Divergent {
+		req.Keys = s.node.DivergentKeys(s.node.CheckConsistency())
+	}
+	writeJSON(w, 200, s.node.PreviewRepair(req.Keys, req.Offset, req.Limit))
+}
+func (s *Server) handleRepairApply(w http.ResponseWriter, r *http.Request) {
+	body, ok := readBody(w, r)
+	if !ok {
+		return
+	}
+	var plan node.RepairPlan
+	if err := json.Unmarshal(body, &plan); err != nil {
+		writeErr(w, 400, "malformed plan: %s", err)
+		return
+	}
+	if plan.NodeID == "" || len(plan.Items) == 0 || len(plan.Items) > 500 {
+		writeErr(w, 400, "plan must name its source and 1–500 items")
+		return
+	}
+	writeJSON(w, 200, s.node.ApplyRepairPlan(plan))
+}
+
+func (s *Server) handleRestorePreview(w http.ResponseWriter, r *http.Request) {
+	body, ok := readBody(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		Backup            json.RawMessage `json:"backup"`
+		Keys              []string        `json:"keys"`
+		DeleteMissing     bool            `json:"delete_missing"`
+		AllowCrossCluster bool            `json:"allow_cross_cluster"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeErr(w, 400, "%s", err)
+		return
+	}
+	plan, err := s.node.PreviewRestore(req.Backup, req.Keys, req.DeleteMissing, req.AllowCrossCluster)
+	if err != nil {
+		writeErr(w, 400, "%s", err)
+		return
+	}
+	writeJSON(w, 200, plan)
+}
+func (s *Server) handleRestoreApply(w http.ResponseWriter, r *http.Request) {
+	body, ok := readBody(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		ID   string   `json:"id"`
+		Keys []string `json:"keys"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeErr(w, 400, "%s", err)
+		return
+	}
+	report, err := s.node.ApplyRestore(req.ID, req.Keys)
+	if err != nil {
+		writeErr(w, 409, "%s", err)
+		return
+	}
+	writeJSON(w, 200, report)
+}
+
+func (s *Server) finishPut(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("X-Rezoagwe-Accepted", "memory")
+	if r.Header.Get("X-Rezoagwe-Durability") == "durable" {
+		s.node.Model.Flush()
+		h := s.node.Model.PersistenceHealth()
+		if !h.Durable || h.Pending || h.Error != "" {
+			writeErr(w, 503, "write accepted in memory; durable save not confirmed: %s", h.Error)
+			return
+		}
+		w.Header().Set("X-Rezoagwe-Accepted", "durable")
+	}
+	w.WriteHeader(http.StatusNoContent)
 }

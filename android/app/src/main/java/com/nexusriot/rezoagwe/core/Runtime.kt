@@ -20,6 +20,7 @@ data class Settings(
     val cluster: String = Codec.DEFAULT_CLUSTER,
     val bootstrapPort: Int = 9999,
     val tombstoneTtlSec: Long = 0,
+    val durability: String = "snapshot",
 ) {
     fun seedList(): List<String> =
         seeds.split(',').map { it.trim() }.filter { it.isNotEmpty() }
@@ -47,6 +48,7 @@ data class Settings(
      * is the only answer that cannot be misread.
      */
     fun sanitized(fallback: Settings = Settings()): Settings = copy(
+        durability = durability.takeIf { it in listOf("snapshot","journal","journal-sync") } ?: fallback.durability,
         nick = nick.trim().ifBlank { fallback.nick },
         port = port.takeIf { it in VALID_PORTS } ?: fallback.port,
         advertiseHost = advertiseHost.trim(),
@@ -72,6 +74,7 @@ data class Settings(
      */
     fun refusals(fallback: Settings = Settings()): List<String> {
         val out = mutableListOf<String>()
+        if (durability !in listOf("snapshot","journal","journal-sync")) out += "Durability must be snapshot, journal, or journal-sync."
         if (port !in VALID_PORTS) {
             out += "Node port $port is not a usable port; keeping ${fallback.port}."
         }
@@ -91,6 +94,7 @@ data class Settings(
         psk = psk,
         cluster = cluster,
         tombstoneTtlSec = tombstoneTtlSec,
+        durability = durability,
     )
 
     fun toBootstrapConfig() = BootstrapConfig(
@@ -133,6 +137,7 @@ object SettingsStore {
         val p = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val defaults = Settings()
         return Settings(
+            durability = p.getString("durability", defaults.durability)!!,
             nick = p.getString("nick", defaults.nick)!!,
             port = p.getInt("port", defaults.port),
             advertiseHost = p.getString("advertiseHost", defaults.advertiseHost)!!,
@@ -146,6 +151,7 @@ object SettingsStore {
 
     fun save(context: Context, s: Settings) {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putString("durability", s.durability)
             .putString("nick", s.nick)
             .putInt("port", s.port)
             .putString("advertiseHost", s.advertiseHost)
@@ -195,7 +201,7 @@ object Runtime {
     private val _lastError = MutableStateFlow<String?>(null)
     val lastError: StateFlow<String?> = _lastError.asStateFlow()
 
-    fun init(context: Context) {
+    @Synchronized fun init(context: Context) {
         if (engineRef != null) return
         _settings.value = SettingsStore.load(context)
         engineRef = NodeEngine(_settings.value.toNodeConfig(), stateFile(context), scope)
@@ -219,14 +225,14 @@ object Runtime {
      * change means a restart — done here rather than silently ignored, which is
      * the failure mode that makes settings screens untrustworthy.
      */
-    fun applySettings(context: Context, updated: Settings) {
+    @Synchronized fun applySettings(context: Context, updated: Settings) {
         init(context)
         val previous = _settings.value
         SettingsStore.save(context, updated)
         _settings.value = updated
 
         val engine = engineRef!!
-        val nodeChanged = previous.port != updated.port ||
+        val nodeChanged = previous.durability != updated.durability || previous.port != updated.port ||
             previous.psk != updated.psk ||
             previous.cluster != updated.cluster ||
             previous.advertiseHost != updated.advertiseHost ||
@@ -235,6 +241,13 @@ object Runtime {
         if (nodeChanged) {
             val wasRunning = engine.isRunning
             engine.stop()
+            val health = engine.persistenceHealth()
+            if (health.pending && health.error.isNotEmpty()) {
+                SettingsStore.save(context, previous)
+                _settings.value = previous
+                _lastError.value = "Profile not switched: ${health.error}"
+                return
+            }
             engineRef = NodeEngine(updated.toNodeConfig(), stateFile(context), scope)
             if (wasRunning) startNode(context)
         } else if (previous.nick != updated.nick) {
@@ -248,8 +261,10 @@ object Runtime {
         ) {
             val wasRunning = bootstrap.isRunning
             bootstrap.stop()
-            bootstrap.config = updated.toBootstrapConfig()
-            if (wasRunning) bootstrap.start()
+            if (previous.cluster != updated.cluster) {
+                bootstrapRef = BootstrapServer(updated.toBootstrapConfig(), rosterFile(context), scope)
+            } else bootstrap.config = updated.toBootstrapConfig()
+            if (wasRunning) bootstrapRef!!.start()
         }
     }
 
@@ -309,7 +324,7 @@ object Runtime {
         }
     }
 
-    private fun stateFile(context: Context) = File(context.filesDir, "node.json")
+    private fun stateFile(context: Context) = File(Profiles.initialize(context.filesDir, _settings.value.cluster), "node.json")
 
-    private fun rosterFile(context: Context) = File(context.filesDir, "bootstrap.json")
+    private fun rosterFile(context: Context) = File(Profiles.initialize(context.filesDir, _settings.value.cluster), "bootstrap.json")
 }

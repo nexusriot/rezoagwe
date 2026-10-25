@@ -38,6 +38,7 @@ type Config struct {
 	AdvertiseAddr string
 	Nick          string
 	DataPath      string // "" disables persistence
+	Durability    string
 }
 
 // Model owns a node's local state: its identity, its KV replica, who its peers
@@ -115,6 +116,11 @@ func NewModel(cfg Config) *Model {
 	var found bool
 	if cfg.DataPath != "" {
 		m.persister = NewPersister(cfg.DataPath)
+		if cfg.Durability != "" {
+			if err := m.persister.SetDurability(cfg.Durability); err != nil {
+				panic(err)
+			}
+		}
 		var err error
 		state, found, err = m.persister.Load()
 		if err != nil {
@@ -231,6 +237,7 @@ func (bn *Model) Persist() {
 	if bn.persister == nil {
 		return
 	}
+	bn.persister.MarkDirty()
 	select {
 	case bn.dirty <- struct{}{}:
 	default: // already rung
@@ -246,12 +253,13 @@ func (bn *Model) writeState() {
 	bn.persistMu.Lock()
 	bn.persistGen++
 	gen := bn.persistGen
+	epoch := bn.persister.Epoch()
 	state := bn.Store.State()
 	state.NodeID = bn.NodeID
 	state.Chat = bn.ChatLog()
 	state.ChatSeq = bn.ChatSeq()
 	bn.persistMu.Unlock()
-	bn.persister.Save(gen, state)
+	bn.persister.SaveAt(gen, state, epoch)
 }
 
 func (bn *Model) GetNodes() []string {
@@ -712,4 +720,11 @@ func (bn *Model) PrependChat(history []pb.ChatEntry) {
 	bn.chatLog = merged
 	bn.chatMu.Unlock()
 	bn.Persist()
+}
+
+func (bn *Model) PersistenceHealth() PersistenceHealth {
+	if bn.persister == nil {
+		return PersistenceHealth{}
+	}
+	return bn.persister.Health()
 }

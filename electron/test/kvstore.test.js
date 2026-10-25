@@ -18,6 +18,20 @@ const at = (t) => {
   return { store: (id) => new KvStore(id, { nowSec: () => now }), set: (v) => { now = v; }, now: () => now };
 };
 
+test('persistence preserves prototype-named keys and tombstones', () => {
+  for (const deleted of [false, true]) {
+    const kv = new KvStore('n');
+    for (const key of ['__proto__', 'constructor', 'toString']) {
+      kv.write(key, 'saved');
+      if (deleted) kv.remove(key);
+    }
+    const state = JSON.parse(JSON.stringify(kv.snapshotState()));
+    const restored = new KvStore('n');
+    restored.loadState(state.clock, state.entries);
+    assert.deepEqual(restored.updates(), kv.updates());
+  }
+});
+
 test('a local write stamps a version and reads back', () => {
   const kv = new KvStore('n1');
   const u = kv.write('colour', 'blue');
@@ -471,4 +485,14 @@ test('the value hash is unchanged for every representable value', () => {
       `hash drifted for ${JSON.stringify(value)}`,
     );
   }
+});
+
+test('key pages bound payloads and preserve full values for explicit reads',()=>{
+ const s=new KvStore('id');for(let i=0;i<450;i++)s.write('k'+String(i).padStart(3,'0'),'x'.repeat(2000));
+ const p=s.page({offset:200,limit:100});assert.equal(p.total,450);assert.equal(p.entries.length,100);assert.equal(p.entries[0].key,'k200');assert.equal(p.entries[0].value.length,512);assert.equal(p.entries[0].truncated,true);assert.equal(s.entry('k200').value.length,2000);
+});
+
+test('a page whose last key disappears falls back to the last available page',()=>{
+ const s=new KvStore('id');for(let i=0;i<201;i++)s.write(String(i).padStart(3,'0'),'value');s.remove('200');
+ const p=s.page({offset:200,limit:200});assert.equal(p.offset,0);assert.equal(p.entries.length,200);
 });

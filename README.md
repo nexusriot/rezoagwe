@@ -38,6 +38,10 @@ claiming something the protocol stopped doing.
 
 ### Features
 
+The [operating manual](MANUAL.md#13-repair-previews-and-cluster-profiles) covers
+guarded repair, cluster profiles, journal durability, resumable Go watches,
+paged browsing and backup restore. See [ROADMAP.md](ROADMAP.md) for planned work.
+
 - Eventually-consistent distributed KV with **per-key last-write-wins**:
   every write carries a version (Lamport counter + node id), so concurrent
   writes to the same key converge to the same value on every node, and
@@ -47,8 +51,8 @@ claiming something the protocol stopped doing.
   direction — so a write whose packet was dropped is re-sent instead of
   leaving two stores divergent forever
 - **Compare-and-swap**: a write or delete can be guarded by the version it
-  expects, and a zero version means "only if absent" — enough to build a
-  lock or a leader election on
+  expects, and a zero version means "only if absent" on that replica.
+  This is local optimistic concurrency, not a distributed lock or leader election
 - **Key TTL**: an optional expiry per key, applied deterministically on
   every replica without replicating anything, plus opt-in tombstone GC
 - **Authenticated wire**: every packet — including bootstrap traffic —
@@ -59,7 +63,7 @@ claiming something the protocol stopped doing.
   the datagram path remains as a fallback
 - Local persistence: identity, values, versions, Lamport clock, tombstones
   and chat are written atomically and reloaded on startup (`-data`, default
-  `<config dir>/rezoagwe/<node>.json`; `-data -` disables). Writes are
+  `<config dir>/rezoagwe/profiles/<cluster hash>/<node>.json`; `-data -` disables). Writes are
   coalesced — a burst costs one rewrite, not one per entry — and a clean
   shutdown flushes. Node identity survives a restart, so a node keeps its
   place in the version ordering even if it moves to another port
@@ -122,10 +126,10 @@ claiming something the protocol stopped doing.
   use — instead of being guessed at by a loopback heuristic. `auto` adopts it
 - **Watch**: `GET /kv?watch=1` streams every mutation as server-sent events —
   local writes, updates merged from peers, and TTL expiries, which replicate
-  nothing and so could not be noticed any other way. The stream opens with the
-  store as it stands, taken *after* the subscription, so a write racing the
-  call is delivered rather than lost. A subscriber that falls behind is told how
-  many events it missed rather than quietly skipping them
+  nothing and so could not be noticed any other way. Without a cursor, the stream opens with the
+  store as it stands, taken *after* the subscription. SSE IDs allow reconnecting
+  through bounded, process-local replay. An expired cursor requires a new baseline;
+  a slow live consumer receives `dropped` and `resnapshot` before closure
 - **LAN discovery** (`-mdns`): find peers with no seed configured at all. The
   node advertises itself over multicast DNS and adopts what answers in its own
   cluster. It also stops advertising `:3137` to a LAN, which is the single most
@@ -135,8 +139,8 @@ claiming something the protocol stopped doing.
   author could not reach one of its own peers forwards the line there — but only
   on that evidence, so a healthy mesh forwards nothing
 - **Scheduled snapshots** (`-snapshot-dir`): the state file is a replica, not a
-  backup — it is rewritten in place on every flush, so a key deleted by mistake
-  is gone from it within 250 ms. Periodic timestamped exports with rotation are
+  backup — it follows the current store, including accidental deletions.
+  Periodic timestamped exports with rotation are
   the backup, and `POST /snapshot` takes one before a risky change
 - **Timings, not just totals**: histograms for the gossip round, state sync and
   stream exchanges, plus how late each gossip tick actually fired. A node whose
@@ -309,8 +313,8 @@ it says is believed. Multicast does not cross subnets and is often blocked on
 guest Wi-Fi, so a cluster spanning networks still needs a rendezvous.
 
 **Back the store up on a timer.** The state file is a replica, not a backup —
-it is rewritten in place on every flush, so a key deleted by mistake is gone
-from it within 250 ms:
+successful saves also preserve accidental deletions and bad imports. Use
+separate timestamped exports for recovery:
 
 ```
 ./rezoagwe-discovery -snapshot-dir /var/lib/rezoagwe/snapshots \
@@ -473,8 +477,11 @@ curl -X POST -d '{"keys":["colour"]}' localhost:8080/repair   # this node's copy
 `snapshot` event with the store as it stands, then a `kv` event per mutation
 carrying the update and where it came from (`local`, `remote` or `expiry`).
 Add `&prefix=` to scope it. A subscriber that falls behind gets a `dropped`
-event saying how many it missed, because a watch with a silent hole in it is
-worse than no watch.
+event saying how many it missed, followed by `resnapshot` and stream closure.
+Reconnect with the last processed SSE ID in `Last-Event-ID` to replay retained
+events. A 409 `resnapshot_required` response means reconnect without a cursor
+and replace the baseline. Cursors expire with bounded history or node restart.
+See [watch recovery and restore usage](MANUAL.md#14-persistence-watches-and-restore).
 
 **The gateway is a write surface.** Anything that can reach the port can
 rewrite the whole cluster through `POST /import?mode=seed`, so bind it to

@@ -35,26 +35,34 @@ data class PersistState(
  * temporary file and a rename: a reader sees either the old file or the whole
  * new one, never a half-written state.
  */
-class Persister(private val file: File) {
+class Persister(private val file: File, mode: String = "snapshot") {
+    private val journal = Journal(file,mode)
     private val lock = Any()
     private var lastGen = 0L
+    @Volatile var health = PersistenceHealth(mode=mode)
+        private set
+    private var blocked = false
 
     fun save(gen: Long, state: PersistState) {
         synchronized(lock) {
             if (gen != 0L && gen <= lastGen) return
+            health = health.copy(pending = true, durable = false)
+            if (blocked) return
             try {
-                file.parentFile?.mkdirs()
-                val tmp = File(file.parentFile, file.name + ".tmp")
-                tmp.writeText(WireJson.encodeToString(state))
-                if (!tmp.renameTo(file)) {
-                    // Rename across a same-directory boundary should not fail; if it
-                    // does, fall back to a direct write rather than losing the state.
-                    file.writeText(tmp.readText())
-                    tmp.delete()
+                journal.save(state) { checkpoint ->
+                    file.parentFile?.mkdirs()
+                    val tmp = File(file.parentFile, file.name + ".tmp")
+                    java.io.FileOutputStream(tmp).use { out ->
+                        out.write(WireJson.encodeToString(checkpoint).toByteArray(Charsets.UTF_8))
+                        if (journal.mode == "journal-sync") out.fd.sync()
+                    }
+                    if (!tmp.renameTo(file)) throw java.io.IOException("atomic state rename failed")
+                    if (journal.mode == "journal-sync") journal.syncDirectory()
                 }
                 lastGen = gen
+                health = health.copy(pending = false, durable = journal.mode == "journal-sync", lastSuccessMs = System.currentTimeMillis(), error = "")
             } catch (e: Exception) {
-                // Persistence is best-effort: a full disk must not take the node down.
+                health = health.copy(error = e.message ?: e.javaClass.simpleName)
             }
         }
     }
@@ -76,17 +84,29 @@ class Persister(private val file: File) {
         private set
 
     fun load(): PersistState? = synchronized(lock) {
-        if (!file.exists()) {
-            loadError = ""
-            return null
-        }
-        return try {
-            val state = WireJson.decodeFromString<PersistState>(file.readText())
-            loadError = ""
-            state
-        } catch (e: Exception) {
+        val snapshot = try {
+            if (file.exists()) WireJson.decodeFromString<PersistState>(file.readText()) else null
+        } catch(e:Exception) {
             loadError = e.message ?: e.javaClass.simpleName
-            null
+            val backup=File(file.path+".corrupt-"+java.util.UUID.randomUUID())
+            if(file.isFile && file.renameTo(backup)) {
+                val wal=File(file.path+".wal")
+                if(wal.exists() && !wal.renameTo(File(backup.path+".wal"))) blocked=true
+                health=health.copy(error=loadError,recoveryFile=backup.absolutePath)
+            } else { blocked=true; health=health.copy(error="$loadError; recovery blocked") }
+            return@synchronized null
         }
+        try { journal.load(snapshot).also { loadError="" } }
+        catch(e:Exception) { blocked=true; loadError=e.message ?: "Journal recovery failed"; health=health.copy(error=loadError); null }
     }
 }
+
+data class PersistenceHealth(
+    val mode: String = "snapshot",
+    val durable: Boolean = false,
+    val enabled: Boolean = true,
+    val pending: Boolean = false,
+    val lastSuccessMs: Long = 0,
+    val error: String = "",
+    val recoveryFile: String = "",
+)

@@ -10,6 +10,7 @@ import com.nexusriot.rezoagwe.proto.MAX_REPLICABLE_VALUE_BYTES
 import com.nexusriot.rezoagwe.proto.Version
 import com.nexusriot.rezoagwe.proto.escapedLen
 import java.security.MessageDigest
+import com.nexusriot.rezoagwe.proto.compareWireStrings
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 
@@ -254,9 +255,10 @@ class KvStore(
                         version = it.value.version,
                         deleted = it.value.deleted,
                         valueHash = it.value.valueHash(),
+                        expiresAt = it.value.expiresAt,
                     )
                 }
-        }.sortedBy { it.key }
+        }.sortedWith { a, b -> compareWireStrings(a.key, b.key) }
     }
 
     fun loadState(savedClock: Long, entries: Map<String, KvEntry>) = synchronized(lock) {
@@ -384,7 +386,7 @@ class KvStore(
         val now = nowSec()
         store.filter { it.value.visible(now) }
             .map { (k, e) -> Entry(k, e.value, e.version, e.expiresAt) }
-            .sortedBy { it.key }
+            .sortedWith { a, b -> compareWireStrings(a.key, b.key) }
     }
 
     fun size(): Int = synchronized(lock) { store.count { it.value.visible(nowSec()) } }
@@ -418,7 +420,7 @@ class KvStore(
 
     /** Every entry, tombstones included — the snapshot a joining peer merges. */
     fun updates(): List<KVUpdate> = synchronized(lock) {
-        store.map { (k, e) -> entryUpdate(k, e) }.sortedBy { it.key }
+        store.map { (k, e) -> entryUpdate(k, e) }.sortedWith { a, b -> compareWireStrings(a.key, b.key) }
     }
 
     fun updatesFor(keys: List<String>): List<KVUpdate> = synchronized(lock) {
@@ -448,7 +450,7 @@ class KvStore(
      *
      * Byte-for-byte identical to the Go and JavaScript stores, and pinned there.
      */
-    fun fingerprint(buckets: Int = FINGERPRINT_BUCKETS): FingerprintReply = synchronized(lock) {
+    fun fingerprint(buckets: Int = FINGERPRINT_BUCKETS, digestVersion: Int = 0): FingerprintReply = synchronized(lock) {
         val n = if (buckets > 0) buckets else FINGERPRINT_BUCKETS
         val folds = Array(n) { ByteArray(32) }
         var keys = 0
@@ -466,6 +468,7 @@ class KvStore(
             digest.update("${e.version.counter}/${e.version.node}/${e.deleted}".toByteArray())
             digest.update(byteArrayOf(0))
             digest.update(e.valueHash().toByteArray())
+            if (digestVersion == 2) digest.update("\u0000${e.expiresAt}".toByteArray())
             val sum = digest.digest()
 
             val fold = folds[idx]
@@ -481,7 +484,7 @@ class KvStore(
     }
 
     fun digest(after: String, limit: Int): Digest = synchronized(lock) {
-        val keys = store.keys.filter { after.isEmpty() || it > after }.sorted()
+        val keys = store.keys.filter { after.isEmpty() || compareWireStrings(it, after) > 0 }.sortedWith(::compareWireStrings)
         val batch = if (keys.size > limit) keys.take(limit) else keys
         // hi is exclusive and must be the last key's exact successor, so the next
         // batch starts where this one stopped. The Go side appends the same NUL.
@@ -520,8 +523,8 @@ class KvStore(
             if (inDigestRange(k, d.lo, d.hi)) push.add(entryUpdate(k, e))
         }
         Reconciliation(
-            push = push.sortedBy { it.key }.take(maxPush),
-            pull = pull.sorted().take(maxPull),
+            push = push.sortedWith { a, b -> compareWireStrings(a.key, b.key) }.take(maxPush),
+            pull = pull.sortedWith(::compareWireStrings).take(maxPull),
         )
     }
 
@@ -584,8 +587,8 @@ class KvStore(
     companion object {
         /** Lo is exclusive: it is the sender's cursor, the last key it already advertised. */
         fun inDigestRange(key: String, lo: String, hi: String): Boolean {
-            if (lo.isNotEmpty() && key <= lo) return false
-            return hi.isEmpty() || key < hi
+            if (lo.isNotEmpty() && compareWireStrings(key, lo) <= 0) return false
+            return hi.isEmpty() || compareWireStrings(key, hi) < 0
         }
     }
 }

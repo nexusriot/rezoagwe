@@ -1,7 +1,9 @@
 package node
 
 import (
+	"encoding/json"
 	"fmt"
+	pb "github.com/nexusriot/rezoagwe/pkg/proto"
 	"testing"
 
 	"github.com/nexusriot/rezoagwe/pkg/transport"
@@ -134,5 +136,17 @@ func TestTheCursorWrapsAtTheEndOfTheKeyspace(t *testing.T) {
 	a.aeMu.Unlock()
 	if present {
 		t.Fatal("a digest that reached the end of the keyspace left the cursor set")
+	}
+}
+
+func TestPeerLimitsAdvertisedAndDiagnosed(t *testing.T) {
+	n := newTestNode(t, transport.NewMemNet(1), "10.0.0.1:3137")
+	if n.helloMessage().Limits == nil {
+		t.Fatal("no advertised limits")
+	}
+	b, _ := json.Marshal(pb.Hello{From: "10.0.0.2:3137", Limits: &pb.StoreLimits{MaxValueBytes: 4}})
+	n.handleHello(b)
+	if len(n.Diagnostics().ReplicationWarnings) != 1 {
+		t.Fatal("missing incompatibility warning")
 	}
 }

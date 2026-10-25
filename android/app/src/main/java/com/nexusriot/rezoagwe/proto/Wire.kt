@@ -71,7 +71,7 @@ data class Version(
 ) {
     /** True when this version should win over [other]. Equal is *not* newer. */
     fun newerThan(other: Version): Boolean =
-        if (counter != other.counter) counter > other.counter else node > other.node
+        if (counter != other.counter) counter > other.counter else compareWireStrings(node, other.node) > 0
 
     val isZero: Boolean get() = counter == 0L && node.isEmpty()
 }
@@ -157,6 +157,7 @@ fun escapedLen(s: String): Int {
 /** Asks a peer to summarise its whole store. */
 @Serializable
 data class Fingerprint(
+    @SerialName("digest_version") val digestVersion: Int = 0,
     val from: String = "",
     /**
      * When set, also asks for the (key, version) pairs held in those buckets.
@@ -177,6 +178,8 @@ data class Fingerprint(
  */
 @Serializable
 data class FingerprintReply(
+    @SerialName("digest_version") val digestVersion: Int = 0,
+    val capabilities: List<String> = emptyList(),
     val from: String = "",
     val nick: String = "",
     val keys: Int = 0,
@@ -302,7 +305,14 @@ data class PeerGossip(
 )
 
 @Serializable
+data class StoreLimits(
+ @SerialName("max_value_bytes") val maxValueBytes: Int = 0,
+ @SerialName("max_keys") val maxKeys: Int = 0,
+)
+
+@Serializable
 data class Hello(
+ val limits: StoreLimits? = null,
     val from: String = "",
     val nick: String = "",
     val id: String = "",
@@ -333,6 +343,7 @@ data class KeyVersion(
      * old to send it, which reads as "cannot compare" rather than a difference.
      */
     @SerialName("vhash") val valueHash: String = "",
+    @SerialName("expires_at") val expiresAt: Long = 0,
 )
 
 /**
@@ -408,4 +419,14 @@ val WireJson: Json = Json {
     ignoreUnknownKeys = true
     explicitNulls = false
     coerceInputValues = true
+}
+
+/** Go orders protocol strings by unsigned UTF-8 bytes, not UTF-16 code units. */
+fun compareWireStrings(a: String, b: String): Int {
+    val x = a.toByteArray(Charsets.UTF_8); val y = b.toByteArray(Charsets.UTF_8)
+    for (i in 0 until minOf(x.size, y.size)) {
+        val d = (x[i].toInt() and 255) - (y[i].toInt() and 255)
+        if (d != 0) return d
+    }
+    return x.size - y.size
 }

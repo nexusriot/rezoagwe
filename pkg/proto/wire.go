@@ -314,9 +314,15 @@ type PeerGossip struct {
 	Peers []string `json:"peers"`
 }
 
+type StoreLimits struct {
+	MaxValueBytes int `json:"max_value_bytes"`
+	MaxKeys       int `json:"max_keys"`
+}
+
 type Hello struct {
-	From string `json:"from"`
-	Nick string `json:"nick,omitempty"`
+	Limits *StoreLimits `json:"limits,omitempty"`
+	From   string       `json:"from"`
+	Nick   string       `json:"nick,omitempty"`
 	// ID is the sender's stable node id — the same string it stamps into
 	// Version.Node — so peers can attribute a write to a nickname even after
 	// the node moves to a different address.
@@ -340,9 +346,10 @@ type Goodbye struct {
 // KeyVersion is one entry of an anti-entropy digest: what the sender holds for
 // a key, without the value.
 type KeyVersion struct {
-	Key     string  `json:"key"`
-	Version Version `json:"version"`
-	Deleted bool    `json:"deleted,omitempty"`
+	ExpiresAt int64   `json:"expires_at,omitempty"`
+	Key       string  `json:"key"`
+	Version   Version `json:"version"`
+	Deleted   bool    `json:"deleted,omitempty"`
 	// ValueHash is sha256 of the value, hex, and empty for a tombstone or an
 	// empty value. It is what lets the checker tell apart two replicas that
 	// agree on the version but hold different data — the one divergence
@@ -374,7 +381,8 @@ type PullRequest struct {
 // Fingerprint asks a peer to summarise its whole store, so two replicas can be
 // compared without shipping either of them.
 type Fingerprint struct {
-	From string `json:"from"`
+	DigestVersion int    `json:"digest_version,omitempty"`
+	From          string `json:"from"`
 	// Buckets, when set, also asks for the (key, version) pairs held in those
 	// buckets. A checker fills it on a second request, once the digests have
 	// said which buckets disagree — which turns "you differ somewhere in this
@@ -395,11 +403,13 @@ type Fingerprint struct {
 // that hash into it, so two replicas holding the same versions produce the
 // same bucket whatever order they learned them in.
 type FingerprintReply struct {
-	From       string `json:"from"`
-	Nick       string `json:"nick,omitempty"`
-	Keys       int    `json:"keys"`
-	Tombstones int    `json:"tombstones"`
-	Clock      uint64 `json:"clock"`
+	DigestVersion int      `json:"digest_version,omitempty"`
+	Capabilities  []string `json:"capabilities,omitempty"`
+	From          string   `json:"from"`
+	Nick          string   `json:"nick,omitempty"`
+	Keys          int      `json:"keys"`
+	Tombstones    int      `json:"tombstones"`
+	Clock         uint64   `json:"clock"`
 	// Buckets is FingerprintBuckets hex digests, indexed by bucket.
 	Buckets []string `json:"buckets"`
 	// Entries is every (key, version) the sender holds in the buckets the

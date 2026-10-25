@@ -295,17 +295,24 @@ stall startup.
 
 Each node persists identity, Lamport clock, every entry (tombstones
 included) and the chat ring to a JSON file (`-data`, default
-`<config dir>/rezoagwe/<node>.json`). The file is rewritten atomically
+`<config dir>/rezoagwe/profiles/<cluster hash>/<node>.json`). The file is rewritten atomically
 (temp file + rename), gated on a monotonically increasing generation so a
 slow, out-of-order write can never regress the on-disk copy.
+
+The default `snapshot` mode behaves as described below. Optional `journal` and
+`journal-sync` modes append checksummed deltas and periodically checkpoint; the
+latter fsyncs records and checkpoint files/directories. See
+[operating manual](MANUAL.md#14-persistence-watches-and-restore) for recovery and acknowledgement semantics.
 
 Writes are **coalesced**: a mutation marks the state dirty and a flush loop
 rewrites the file at most once every 250 ms, with a synchronous flush on a
 clean shutdown. It used to be synchronous on every mutation, which meant a
 single `PUT` serialised the entire store — and a 128-entry anti-entropy
 repair serialised it 128 times, once per applied entry. The trade is up to
-250 ms of unflushed work on a `kill -9`; a clean stop loses nothing, and
-anything a hard kill does lose is what anti-entropy re-fetches from a peer.
+normally one 250 ms debounce interval of unflushed work in default mode; slow
+I/O or save failures can leave more work unsaved. A successful clean-stop
+flush saves pending work; disk errors are surfaced in persistence health.
+Anti-entropy can recover lost writes only when another peer received them.
 The file is compact rather than indented for the same reason: it is read by
 the node, not by a person.
 
@@ -357,9 +364,13 @@ exchanging a message.
 
 A write may carry an expected version; it lands only if the current
 version matches. A zero expected version means "the key must be absent",
-where missing, tombstoned and expired all count as absent. This is the
-primitive a lock or a leader election is built on. CAS is evaluated
-against *local* state — this is a PoC, not a consensus system.
+where missing, tombstoned and expired all count as absent. CAS is evaluated
+against **local state only**. Two partitioned replicas can both accept an
+absent-key claim; after healing, last-write-wins selects one value but does
+not undo work performed by either claimant. This cannot provide a distributed
+exclusive lock, fencing token, or leader election. Use an external consensus
+service for those requirements. The partition regression test demonstrates
+this boundary.
 
 ### 5.4 Digest ranges
 
@@ -739,7 +750,7 @@ value it holds.
 
 | Method   | Path             | Notes                                              |
 |----------|------------------|----------------------------------------------------|
-| `GET`    | `/kv`            | listing; `?prefix=` filters; `?watch=1` streams changes as server-sent events (§16) |
+| `GET`    | `/kv`            | listing; `prefix` filters; `limit`/`offset` page; `preview=true` truncates paged values; `watch=1` opens SSE (§16) |
 | `GET`    | `/kv/{key}`      | value as text; `ETag` carries the version          |
 | `PUT`    | `/kv/{key}`      | body is the value; `If-Match` makes it a CAS (`*` or an empty value mean "must be absent"), `X-Rezoagwe-TTL` sets an expiry |
 | `DELETE` | `/kv/{key}`      | `If-Match` supported                               |
@@ -755,6 +766,10 @@ value it holds.
 | `GET`    | `/diagnostics`   | health findings; `?format=text` for a report (§13) |
 | `GET`    | `/consistency`   | asks every peer what it holds; `409` if they differ (§14) |
 | `POST`   | `/snapshot`      | write a snapshot now; `409` without `-snapshot-dir` (§18) |
+| `POST`   | `/restore/preview` | preview a backup diff; explicit cross-cluster and delete-missing options |
+| `POST`   | `/restore/apply` | apply selected keys from a guarded restore preview |
+| `POST`   | `/repair/preview` | read-only repair page: source, values, versions, and continuation offset |
+| `POST`   | `/repair/apply` | apply a preview with atomic local change guards and a post-repair consistency report |
 | `POST`   | `/repair`        | make this node's copy of the named keys win everywhere; `?divergent=true` takes the keys from its own consistency check (§14.2) |
 
 A write the store will not take is refused, not reported as a write. The
@@ -923,13 +938,13 @@ replicates through them in both directions.
 | Bootstrap        | Seeds are static, and `-mdns` only covers one LAN: multicast does not cross subnets and is commonly blocked on guest Wi-Fi | A rendezvous reachable from every subnet, which is what bootstrap already is |
 | State sync       | Pulls from one random peer, so a joiner inherits that peer's gaps  | Pull from several and merge                   |
 | Anti-entropy     | Digest is per-key, so a huge store still costs many rounds even now that each one repairs everything it covers | Merkle tree over key ranges |
-| Persistence      | A `kill -9` can lose up to 250 ms of writes, the whole store is rewritten per flush (measured: 8.4 ms and 11.5 MB allocated at 100k keys), and the rename is atomic for a reader but never fsynced, so a power loss can lose a write the filesystem reported as durable | Append-only log + periodic snapshot, and fsync before the rename |
-| Store limits     | `-max-value-bytes` / `-max-keys` refuse a peer's update, which is a deliberate divergence. The refusing node now counts it apart from staleness, names the limit in its activity feed and raises a diagnostics error (§5.6), and the consistency check names the keys (§14) — but the limit is still not advertised, so the peer keeps sending into a refusal for as long as both run | Advertise limits in `Hello` so a peer stops sending what this node cannot take |
+| Persistence | Default snapshot mode coalesces writes and does not fsync. Optional journal-sync provides local durability after successful flush; full state still resides in memory | Disk-backed storage and measured load/power-loss validation; see [operating manual](MANUAL.md#14-persistence-watches-and-restore) |
+| Store limits | Limits are advertised in Hello; mismatches are diagnosed and repair skips values known to exceed the receiver limit. Key-count limits can still prevent convergence | Default sizing policy and admission feedback for ordinary writes |
 | Very large values | The protocol ceiling (§8.1) is what a frame can carry, not what a node can comfortably hold. Measured on a tablet: a store of ~100 MB delayed the gossip loop past the 15 s eviction window, so the phone flapped in and out of the cluster until the large keys were deleted. The diagnostics now name this — gossip lateness is timed and compared against the eviction threshold (§13) — but it is still a report after the fact, and `-max-value-bytes` is the lever and is off by default | A default value limit, and shedding gossip work when the loop is already behind |
-| Desktop renderer  | `app:snapshot` ships every value in full to the renderer on every tick, so one 64 MB value made the window unresponsive and a 154 MB state file on disk. The keys list only ever shows a truncated preview | Send previews, fetch a full value on demand |
+| Desktop renderer | Keys use bounded previews, pagination and virtual rows; full values load on demand. Sorting still scans the in-memory keyspace | Indexed browsing and measured million-key performance |
 | Tombstones       | GC is age-based and off by default                                 | Track cluster-wide acknowledgement            |
 | Chat             | A dropped line is named and asked for (§5.7), but only the **author** can answer it, and only while the line is still in that node's ring — so a line lost while its author is away for longer than the ring is gone for good, and reported as such. Relaying (§5.8) closes the window where the author never knew a node existed, but only where gossip has already shown the asymmetry. No history beyond that ring, and no attachments | Persist chat beyond the ring; paged history |
-| Watch            | A subscriber that falls behind loses events. It is told how many (§16), but the events themselves are gone — the queue is bounded because publishing runs on a replication path and must not block | A resumable stream: a cursor a client can reconnect from |
+| Watch | Cursors replay bounded process-local history; an expired cursor or node restart requires resnapshot (§16) | Persisted event history and automatic client reconnect policies |
 | Android          | Runs on hardware; the battery cost of the 10 s gossip tick is still unmeasured | Measure it over a night |
 | Store limits UI  | `maxValueBytes` / `maxKeys` are constructor options in the Kotlin and JavaScript engines, but neither Settings screen exposes them; only the Go node has flags | Add the two fields to both settings screens |
 | Desktop          | Closing the window stops the node on Linux and Windows: no tray icon | Tray icon + close-to-tray                     |
@@ -1249,7 +1264,7 @@ in any document, and a test now fails if that happens again (§7).
 | `-node`             | `:3137`              | address the sockets bind                                |
 | `-advertise`        | `-node`              | address peers are told to use — set this on a LAN (§13); `auto` asks a seed where it sees this node from (§13) |
 | `-nick`             | `anon`               | chat nickname                                           |
-| `-data`             | `<config dir>/rezoagwe/<node>.json` | state file; `-` disables persistence     |
+| `-data`             | `<config dir>/rezoagwe/profiles/<cluster hash>/<node>.json` | state file; `-` disables persistence     |
 | `-psk`              | none                 | pre-shared key authenticating every packet (§3.1)       |
 | `-cluster`          | `rezoagwe`           | cluster name; nodes only talk to their own              |
 | `-http`             | off                  | serve the HTTP gateway here, e.g. `:8080` (§8)          |
@@ -1259,6 +1274,7 @@ in any document, and a test now fails if that happens again (§7).
 | `-http-readonly`    | `false`              | refuse every mutating gateway request                   |
 | `-max-value-bytes`  | `0` (unbounded)      | refuse values longer than this, from a peer or a writer |
 | `-max-keys`         | `0` (unbounded)      | refuse writes that would exceed this many live keys     |
+| `-durability` | `snapshot` | persistence mode: snapshot, journal, or journal-sync |
 | `-tombstone-ttl`    | `0` (GC off)         | reclaim tombstones older than this (§5.5)               |
 | `-mdns`             | `false`              | find peers on the LAN with no seeds configured (§17)    |
 | `-snapshot-dir`     | off                  | write periodic store exports here (§18)                 |
@@ -1309,7 +1325,15 @@ at a cluster by becoming a member of it.
 | `-token`     | `$REZOAGWE_TOKEN`                | bearer token, for a gateway started with `-http-token`      |
 | `-ttl`       | `0` (never expires)              | expiry for `put`, e.g. `60s` (§5.2)                         |
 | `-if-match`  | none                             | make `put`/`del` a compare-and-swap; `*` means "only if absent" (§5.3) |
+| `-durable` | `false` | require an fsync acknowledgement for put |
+| `-delete-missing` | `false` | include local-only keys as restore deletions |
+| `-cross-cluster` | `false` | allow a restore preview from a different cluster |
 | `-seed`      | `false`                          | with `import`: make the file win over what the cluster holds |
+| `-preview` | `false` | with repair or restore: preview without mutation |
+| `-apply-plan` | empty | apply saved preview JSON, skipping concurrent changes |
+| `-plan` | empty | fetch a stable preview page, or apply selected restore keys |
+| `-offset` | `0` | existing repair/restore preview page offset |
+| `-limit` | `100` | repair/existing restore preview page size, maximum 500 |
 | `-divergent` | `false`                          | with `repair`: take the keys from this node's check (§14.2) |
 | `-json`      | `false`                          | machine-readable output where there is a choice             |
 | `-timeout`   | `30s`                            | per-request timeout                                         |
@@ -1329,9 +1353,12 @@ check` without reading the report.
 ## 16. Watch
 
 `GET /kv?watch=1` streams every mutation as server-sent events. `?prefix=`
-scopes it. The stream opens with a `snapshot` event carrying the store as it
-stands, then a `kv` event per mutation and a `dropped` event when a subscriber
-has fallen behind.
+scopes it. Without `Last-Event-ID`, the stream opens with a `snapshot`, then
+sends `kv` events. A valid cursor replays retained events followed by `ready`.
+Cursors are process/prefix-bound and history is limited to 2,048 events and
+approximately 8 MiB. An invalid or expired cursor returns HTTP 409
+`resnapshot_required`. An overflowing live subscription receives `dropped`,
+then `resnapshot`, and closes; the client must replace its baseline.
 
 Three decisions carry the whole design.
 
@@ -1359,7 +1386,9 @@ people writing by hand against a poll.
 publishing happens on whichever goroutine performed the mutation, which is a
 replication path: a watch that could block would let one stalled HTTP client
 stop a node converging. Overruns are counted per subscriber, raised on the
-stream as a `dropped` event, and exported as `rezoagwe_watch_dropped_total`.
+stream as a `dropped` event, followed by `resnapshot` and closure, and exported as
+`rezoagwe_watch_dropped_total`. Reconnect using `Last-Event-ID` while its bounded
+history is retained; HTTP 409 `resnapshot_required` means a fresh baseline is needed.
 A watch with a silent hole in it is worse than no watch, because it is trusted.
 
 `rezoagwe_watchers` is the open subscription count, which is what makes one
@@ -1412,9 +1441,9 @@ the seed the operator has already decided against (§13).
 `-snapshot-dir` writes a timestamped export on a timer and keeps the newest
 `-snapshot-keep` of them; `POST /snapshot` takes one immediately.
 
-The state file is a replica, not a backup. It is rewritten in place on every
-flush, so a key deleted by mistake is gone from it within 250 ms and a store
-corrupted by a bad import is faithfully preserved. `GET /export` existed, but
+The state file and optional journal represent the current replica, not a backup.
+Successful saves preserve accidental deletions and bad imports too. Use a
+separate export for recovery; copying a live checkpoint alone omits WAL updates. `GET /export` existed, but
 only as a pull — a node that lost its disk took whatever only it held with it
 unless somebody had remembered to call it.
 
@@ -1439,3 +1468,38 @@ lwa of the sea — a fitting name for a protocol whose packets drift
 through the network with no guarantee of arrival. *Rezo* is Haitian
 Creole for "network". The PoC is the small boat; production hardening
 would be the larger ship.
+
+### Digest negotiation and persistence diagnostics
+
+All three ports understand an optional `digest_version: 2` fingerprint request.
+Replies advertise `digest-v2`, `empty-value-hash`, and `expiry-metadata` capabilities.
+A v2 reply sets `digest_version: 2`; requests without it retain the legacy bucket
+algorithm, so old checkers can continue to read upgraded nodes.
+
+Version 2 folds the existing entry summary plus NUL and the decimal absolute
+expiry into each bucket. Named entries carry `expires_at`. The version itself
+makes an empty value hash meaningful, distinct from an old peer that never
+supplied hashes. Same-version empty/nonempty and expiry-only differences are
+therefore named and repairable. Tombstone value bytes remain irrelevant.
+
+New checkers request v2. An old peer that cannot answer v2 is **unsupported**,
+not evidence of agreement. Reports expose the peer's `digest_version`,
+`capabilities`, `comparable`, and error; the report includes `unsupported` and
+`complete`. Desktop, Android, and the Go TUI show comparison-unavailable errors.
+An unsupported peer prevents a verified-complete report. Ordinary replication
+is unaffected, and no global wire-frame version was changed.
+
+Persistence diagnostics expose enabled/pending state, save errors, last success,
+recovery-file paths and durability status. Corrupt snapshots are retained under
+`.corrupt-*` names before a fresh state is written. Complete corrupt journal
+records or a missing checkpoint block saving. Profile replacement refuses to
+abandon unsaved state after a persistence failure.
+
+`testdata/boundaries.json` pins cross-language UTF-8 ordering, version counters,
+expiry-aware digests and encoder byte lengths. `testdata/journal.json` checks
+recovery of Go/Electron journal records in all three ports. These fixtures do
+not establish physical power-loss guarantees.
+
+See the [operating manual](MANUAL.md#14-persistence-watches-and-restore) for
+journal modes, watch cursors, paging, repair limits and guarded restore, and
+[the roadmap](ROADMAP.md) for unfinished capabilities.

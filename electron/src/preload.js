@@ -19,6 +19,7 @@ contextBridge.exposeInMainWorld('rezoagwe', {
   app: {
     snapshot: () => invoke('app:snapshot'),
     settings: () => invoke('app:settings'),
+    previewCluster: (cluster) => invoke('app:previewCluster', cluster),
     applySettings: (partial) => invoke('app:applySettings', partial),
   },
   node: {
@@ -28,6 +29,8 @@ contextBridge.exposeInMainWorld('rezoagwe', {
     history: (key) => invoke('node:history', key),
   },
   kv: {
+    list: (req) => invoke('kv:list', req),
+    get: (key) => invoke('kv:get', key),
     set: (req) => invoke('kv:set', req),
     remove: (req) => invoke('kv:delete', req),
   },
@@ -46,6 +49,7 @@ contextBridge.exposeInMainWorld('rezoagwe', {
     consistency: () => invoke('diag:consistency'),
     copyReport: () => invoke('diag:copyReport'),
   },
+  restore: {open:options=>invoke('restore:open',options),page:(id,offset)=>invoke('restore:page',id,offset),detail:(id,key)=>invoke('restore:detail',id,key),apply:(id,keys)=>invoke('restore:apply',id,keys)},
   store: {
     export: () => invoke('store:export'),
     import: (asLocalWrites) => invoke('store:import', asLocalWrites),

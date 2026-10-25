@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/nexusriot/rezoagwe/pkg/client"
+	"github.com/nexusriot/rezoagwe/pkg/discovery/node"
 )
 
 // version is injected at build time with -ldflags "-X main.version=...".
@@ -58,6 +59,8 @@ data
   export [file]             write the whole store out (stdout when omitted)
   import <file>             merge an export back in
   snapshot                  ask the node to write a snapshot now
+  restore -preview <file>   inspect a backup diff without writing
+  restore -plan ID <keys…>  restore selected keys from that preview
 
 chat
   chat                      print the conversation
@@ -69,9 +72,17 @@ chat
 flags (before or after the command):
   -server URL    gateway address (default http://127.0.0.1:8080, $REZOAGWE_SERVER)
   -token TOKEN   bearer token                                  ($REZOAGWE_TOKEN)
+  -durable       require journal-sync fsync acknowledgement for put
+  -delete-missing include local-only keys as deletes in restore preview
+  -cross-cluster allow a restore preview from another cluster
   -ttl DURATION  expiry for put, e.g. 60s
   -if-match VER  make put/del a compare-and-swap; "*" means "only if absent"
   -seed          make import win over what the cluster holds
+  -plan ID       fetch a stable preview page, or select a restore plan to apply
+  -preview       with repair or restore: emit a reviewable page, without writes
+  -apply-plan F  with repair: apply saved preview JSON, guarding concurrent changes
+  -offset N      existing repair/restore preview offset (default 0)
+  -limit N       repair/existing restore preview size (default 100, maximum 500)
   -divergent     with repair: use this node's consistency check to pick the keys
   -json          machine-readable output where there is a choice
   -timeout DUR   per-request timeout (default 30s)
@@ -85,14 +96,22 @@ func main() {
 
 func run() int {
 	var (
-		server    = flag.String("server", envOr("REZOAGWE_SERVER", "http://127.0.0.1:8080"), "gateway address")
-		token     = flag.String("token", os.Getenv("REZOAGWE_TOKEN"), "bearer token")
-		ttl       = flag.Duration("ttl", 0, "expiry for put")
-		ifMatch   = flag.String("if-match", "", "compare-and-swap against this version")
-		seed      = flag.Bool("seed", false, "make import win over what the cluster holds")
-		divergent = flag.Bool("divergent", false, "repair every key the consistency check names")
-		asJSON    = flag.Bool("json", false, "machine-readable output")
-		timeout   = flag.Duration("timeout", 30*time.Second, "per-request timeout")
+		server        = flag.String("server", envOr("REZOAGWE_SERVER", "http://127.0.0.1:8080"), "gateway address")
+		token         = flag.String("token", os.Getenv("REZOAGWE_TOKEN"), "bearer token")
+		durable       = flag.Bool("durable", false, "require durable local put acknowledgement")
+		deleteMissing = flag.Bool("delete-missing", false, "include keys absent from backup as restore deletions")
+		crossCluster  = flag.Bool("cross-cluster", false, "allow restore across clusters")
+		ttl           = flag.Duration("ttl", 0, "expiry for put")
+		ifMatch       = flag.String("if-match", "", "compare-and-swap against this version")
+		seed          = flag.Bool("seed", false, "make import win over what the cluster holds")
+		planID        = flag.String("plan", "", "existing preview ID for paging or selected restore apply")
+		preview       = flag.Bool("preview", false, "preview repair or restore without writing")
+		applyPlan     = flag.String("apply-plan", "", "apply saved repair preview JSON")
+		offset        = flag.Int("offset", 0, "repair preview page offset")
+		limit         = flag.Int("limit", 100, "repair preview page size (max 500)")
+		divergent     = flag.Bool("divergent", false, "repair every key the consistency check names")
+		asJSON        = flag.Bool("json", false, "machine-readable output")
+		timeout       = flag.Duration("timeout", 30*time.Second, "per-request timeout")
 	)
 	flag.Usage = func() { fmt.Fprint(os.Stderr, usage) }
 	// ContinueOnError so a bad flag returns here instead of exiting 2 from
@@ -117,7 +136,9 @@ func run() int {
 	c := client.New(client.Config{BaseURL: *server, Token: *token, Timeout: *timeout})
 	cmd := &command{
 		client: c, args: args[1:], asJSON: *asJSON,
+		durable: *durable, deleteMissing: *deleteMissing, crossCluster: *crossCluster,
 		ttl: *ttl, ifMatch: *ifMatch, seed: *seed, divergent: *divergent,
+		preview: *preview, applyPlan: *applyPlan, offset: *offset, limit: *limit, planID: *planID,
 	}
 	code, err := cmd.dispatch(args[0])
 	if err != nil {
@@ -158,13 +179,18 @@ func splitArgs(fs *flag.FlagSet, argv []string) (verb string, positionals []stri
 }
 
 type command struct {
-	client    *client.Client
-	args      []string
-	asJSON    bool
-	ttl       time.Duration
-	ifMatch   string
-	seed      bool
-	divergent bool
+	durable, deleteMissing, crossCluster bool
+	planID                               string
+	preview                              bool
+	applyPlan                            string
+	offset, limit                        int
+	client                               *client.Client
+	args                                 []string
+	asJSON                               bool
+	ttl                                  time.Duration
+	ifMatch                              string
+	seed                                 bool
+	divergent                            bool
 }
 
 func (c *command) dispatch(name string) (int, error) {
@@ -197,6 +223,8 @@ func (c *command) dispatch(name string) (int, error) {
 		return c.repair()
 	case "export":
 		return c.export()
+	case "restore":
+		return c.restore()
 	case "import":
 		return c.importFile()
 	case "snapshot":
@@ -254,7 +282,7 @@ func (c *command) put() (int, error) {
 		}
 		value = string(data)
 	}
-	version, err := c.client.Put(key, value, client.PutOptions{TTL: c.ttl, IfMatch: c.ifMatch})
+	version, err := c.client.Put(key, value, client.PutOptions{TTL: c.ttl, IfMatch: c.ifMatch, Durable: c.durable})
 	if err != nil {
 		return codeFor(err), err
 	}
@@ -400,6 +428,41 @@ func (c *command) check() (int, error) {
 // repair is the one command here that can make a cluster worse, so it says
 // what it is about to do and names the node it will do it from.
 func (c *command) repair() (int, error) {
+	if c.applyPlan != "" {
+		data, err := os.ReadFile(c.applyPlan)
+		if err != nil {
+			return exitError, err
+		}
+		var plan node.RepairPlan
+		if err := json.Unmarshal(data, &plan); err != nil {
+			return exitError, err
+		}
+		out, err := c.client.ApplyRepairPlan(plan)
+		if err != nil {
+			return codeFor(err), err
+		}
+		if err := writeJSON(out); err != nil {
+			return exitError, err
+		}
+		if !out.Complete {
+			return 4, nil
+		}
+		return exitOK, nil
+	}
+	if c.preview && c.planID != "" {
+		out, err := c.client.RepairPlanPage(c.planID, c.offset, c.limit)
+		if err != nil {
+			return codeFor(err), err
+		}
+		return exitOK, writeJSON(out)
+	}
+	if c.preview {
+		out, err := c.client.PreviewRepair(c.args, c.divergent, c.offset, c.limit)
+		if err != nil {
+			return codeFor(err), err
+		}
+		return exitOK, writeJSON(out)
+	}
 	if c.divergent {
 		out, err := c.client.RepairDivergent()
 		if err != nil {
@@ -528,4 +591,42 @@ func plural(n int) string {
 		return "y"
 	}
 	return "ies"
+}
+
+func (c *command) restore() (int, error) {
+	if c.preview {
+		if c.planID != "" {
+			p, err := c.client.RepairPlanPage(c.planID, c.offset, c.limit)
+			if err != nil {
+				return codeFor(err), err
+			}
+			return exitOK, writeJSON(p)
+		}
+		if len(c.args) != 1 {
+			return exitError, fmt.Errorf("restore -preview requires a backup file")
+		}
+		data, err := os.ReadFile(c.args[0])
+		if err != nil {
+			return exitError, err
+		}
+		p, err := c.client.PreviewRestore(data, c.deleteMissing, c.crossCluster)
+		if err != nil {
+			return codeFor(err), err
+		}
+		return exitOK, writeJSON(p)
+	}
+	if c.planID == "" || len(c.args) == 0 {
+		return exitError, fmt.Errorf("restore requires -preview FILE, or -plan ID and explicit keys")
+	}
+	report, err := c.client.ApplyRestore(c.planID, c.args)
+	if err != nil {
+		return codeFor(err), err
+	}
+	if err = writeJSON(report); err != nil {
+		return exitError, err
+	}
+	if !report.Complete {
+		return 4, nil
+	}
+	return exitOK, nil
 }

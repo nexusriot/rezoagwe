@@ -28,6 +28,7 @@ func main() {
 	nick := flag.String("nick", "anon", "chat nickname")
 	data := flag.String("data", "", "state file (default: <config dir>/rezoagwe/<node>.json; \"-\" disables)")
 	psk := flag.String("psk", "", "pre-shared key authenticating every packet")
+	durability := flag.String("durability", "snapshot", "persistence mode: snapshot, journal, journal-sync")
 	cluster := flag.String("cluster", "rezoagwe", "cluster name; nodes only talk to their own cluster")
 	httpAddr := flag.String("http", "", "serve the HTTP gateway on this address, e.g. :8080")
 	httpToken := flag.String("http-token", "", "require this bearer token on every gateway request")
@@ -65,7 +66,12 @@ func main() {
 	dataPath := *data
 	switch dataPath {
 	case "":
-		dataPath = model.DefaultDataPath(*nodeAddr)
+		var err error
+		dataPath, err = model.ProfileDataPath(model.DefaultDataPath(*nodeAddr), *cluster)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "cluster profile:", err)
+			os.Exit(1)
+		}
 	case "-":
 		dataPath = "" // persistence disabled
 	}
@@ -81,6 +87,7 @@ func main() {
 		AdvertiseAddr:  *advertise,
 		Nick:           *nick,
 		DataPath:       dataPath,
+		Durability:     *durability,
 		PSK:            *psk,
 		Cluster:        *cluster,
 		Version:        version,

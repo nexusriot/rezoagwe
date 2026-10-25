@@ -1,7 +1,11 @@
 package client
 
 import (
+	"encoding/json"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -69,6 +73,36 @@ func TestPutGetDelete(t *testing.T) {
 	}
 	if _, _, err := c.Get("colour"); !NotFound(err) {
 		t.Errorf("get after delete: %v, want a not-found", err)
+	}
+}
+
+func TestKeysAreNotNormalizedAsURLPaths(t *testing.T) {
+	n, c := gateway(t, httpapi.Config{})
+	for _, key := range []string{"a//b", "a/../b", "./b", ".", "..", "/b", "a/./b"} {
+		t.Run(key, func(t *testing.T) {
+			if _, err := n.Set(key, "original", 0); err != nil {
+				t.Fatal(err)
+			}
+			got, _, err := c.Get(key)
+			if err != nil || got != "original" {
+				t.Fatalf("get %q = %q, %v", key, got, err)
+			}
+			if _, err := c.Put(key, "updated", PutOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			if got, _ := n.Get(key); got != "updated" {
+				t.Fatalf("wrong key updated: %q", got)
+			}
+			if history, err := c.History(key); err != nil || len(history) < 2 {
+				t.Fatalf("history = %v, %v", history, err)
+			}
+			if err := c.Delete(key, ""); err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := n.Get(key); ok {
+				t.Fatal("key survived delete")
+			}
+		})
 	}
 }
 
@@ -411,5 +445,156 @@ func TestRepairWithNoKeysReportsTheRefusal(t *testing.T) {
 		t.Error("repairing nothing succeeded")
 	} else if Status(err) != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400", Status(err))
+	}
+}
+
+func TestSharedCorpusURLKeys(t *testing.T) {
+	_, c := gateway(t, httpapi.Config{})
+	data, err := os.ReadFile("../../testdata/boundaries.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var corpus struct{ Entries []struct{ Key, Value string } }
+	if err := json.Unmarshal(data, &corpus); err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range corpus.Entries {
+		if _, err := c.Put(e.Key, e.Value, PutOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		got, _, err := c.Get(e.Key)
+		if err != nil || got != e.Value {
+			t.Fatalf("%q: %q %v", e.Key, got, err)
+		}
+	}
+}
+
+func TestRepairPreviewApplyAndStablePages(t *testing.T) {
+	n, c := gateway(t, httpapi.Config{})
+	for _, key := range []string{"a", "b", "c"} {
+		n.Set(key, "original", 0)
+	}
+	p, err := c.PreviewRepair([]string{"a", "b", "c"}, false, 0, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Total != 3 || p.Next != 1 {
+		t.Fatalf("preview %+v", p)
+	}
+	n.Set("a", "concurrent", 0)
+	r, err := c.ApplyRepairPlan(p)
+	if err != nil || r.Changed != 1 {
+		t.Fatalf("apply %+v %v", r, err)
+	}
+	next, err := c.RepairPlanPage(p.ID, p.Next, 1)
+	if err != nil || next.Items[0].Key != "b" {
+		t.Fatalf("page shifted: %+v %v", next, err)
+	}
+}
+
+func TestResumeWatchThroughGateway(t *testing.T) {
+	n, c := gateway(t, httpapi.Config{})
+	stop := make(chan struct{})
+	events, errs := c.Watch("app/", stop)
+	var first WatchEvent
+	select {
+	case first = <-events:
+	case <-time.After(time.Second):
+		t.Fatal("no snapshot")
+	}
+	if first.ID == "" || first.Name != "snapshot" {
+		t.Fatal(first)
+	}
+	close(stop)
+	for range events {
+	}
+	for range errs {
+	}
+	n.Set("app/key", "after disconnect", 0)
+	stop = make(chan struct{})
+	defer close(stop)
+	events, _ = c.WatchFrom("app/", first.ID, stop)
+	select {
+	case ev := <-events:
+		if ev.Name != "kv" || ev.ID == "" || ev.Event.Update.Value != "after disconnect" {
+			t.Fatal(ev)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no replay")
+	}
+	select {
+	case ev := <-events:
+		if ev.Name != "ready" {
+			t.Fatal(ev)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no ready event")
+	}
+}
+
+func TestRestoreAPIAndPagedPreview(t *testing.T) {
+	n, c := gateway(t, httpapi.Config{})
+	n.Set("k", "old", 0)
+	p, err := c.PreviewRestore(json.RawMessage(`{"cluster":"rezoagwe","entries":[{"key":"k","value":"new","action":"set"}]}`), false, false)
+	if err != nil || p.Total != 1 {
+		t.Fatal(p, err)
+	}
+	r, err := c.ApplyRestore(p.ID, []string{"k"})
+	if err != nil || r.Rewritten != 1 {
+		t.Fatal(r, err)
+	}
+	n.Set("large", strings.Repeat("€", 1000), 0)
+	resp, err := c.request(http.MethodGet, "/kv?limit=1&offset=1&preview=true", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var page struct {
+		Entries []struct {
+			Value     string
+			Truncated bool
+		}
+		Total int
+	}
+	if err = json.NewDecoder(resp.Body).Decode(&page); err != nil {
+		t.Fatal(err)
+	}
+	if page.Total != 2 || len(page.Entries) != 1 || !page.Entries[0].Truncated || len(page.Entries[0].Value) > 512 {
+		t.Fatal(page)
+	}
+}
+
+func TestDurablePutAndRecovery(t *testing.T) {
+	mem := transport.NewMemNet(1)
+	file := filepath.Join(t.TempDir(), "state.json")
+	n, err := node.New(node.Config{NodeAddr: "10.0.0.1:3137", Transport: mem.Node("10.0.0.1:3137"), DataPath: file, Durability: "journal-sync"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n.Start()
+	t.Cleanup(n.Stop)
+	srv, err := httpapi.Serve(httpapi.Config{Addr: "127.0.0.1:0"}, n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { srv.Close() })
+	c := New(Config{BaseURL: srv.URL()})
+	if _, err = c.Put("durable", "saved", PutOptions{Durable: true}); err != nil {
+		t.Fatal(err)
+	}
+	if !n.Model.PersistenceHealth().Durable {
+		t.Fatal("durability not confirmed")
+	}
+	p := model.NewPersister(file)
+	state, found, err := p.Load()
+	if err != nil || !found || state.Clock == 0 {
+		t.Fatal(state, found, err)
+	}
+	_, plain := gateway(t, httpapi.Config{})
+	if _, err = plain.Put("no", "write", PutOptions{Durable: true}); err == nil {
+		t.Fatal("accepted durable write without persistence")
+	}
+	if _, _, err = plain.Get("no"); err == nil {
+		t.Fatal("refused write mutated data")
 	}
 }

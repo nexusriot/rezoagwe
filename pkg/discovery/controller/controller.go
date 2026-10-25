@@ -591,6 +591,8 @@ func renderConsistency(r node.ConsistencyReport) string {
 		switch {
 		case !p.Reachable:
 			fmt.Fprintf(&b, "  [yellow]?[-] %s\n      [darkgray]did not answer: %s[-]\n", name, p.Error)
+		case p.Error != "":
+			fmt.Fprintf(&b, "  [yellow]?[-] %s\n      comparison unavailable: %s\n", name, p.Error)
 		case p.Agrees:
 			fmt.Fprintf(&b, "  [green]=[-] %s  [darkgray]%d keys, clock %d[-]\n", name, p.Keys, p.Clock)
 		default:

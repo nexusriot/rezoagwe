@@ -488,3 +488,7 @@ svg.graph.dragging { cursor: grabbing; }
 .legend .sw-self { background: var(--ok); }
 .legend .sw-peer { background: var(--accent); }
 .legend .sw-indirect { background: transparent; border: 1px dashed var(--text-faint); }
+
+.key-viewport { height:65vh; overflow:auto; }
+.virtual-key-row { height:112px; box-sizing:border-box; overflow:hidden; }
+.restore-detail { width:100%; height:60vh; }

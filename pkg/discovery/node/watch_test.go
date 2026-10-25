@@ -1,6 +1,7 @@
 package node
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -176,5 +177,29 @@ func TestWatchDropsRatherThanBlocks(t *testing.T) {
 	}
 	if got := n.Metrics.WatchDropped.Load(); got == 0 {
 		t.Error("drops are invisible in the metrics")
+	}
+}
+
+func TestWatchResumeScopesAndExpiry(t *testing.T) {
+	n := newTestNode(t, transport.NewMemNet(1), "10.0.0.1:3137")
+	w := n.Watch("a")
+	cursor := w.Cursor
+	w.Close()
+	n.Set("a1", "one", 0)
+	n.Set("b1", "skip", 0)
+	w, replay, err := n.WatchFrom("a", cursor)
+	if err != nil || len(replay) != 1 || replay[0].Update.Value != "one" {
+		t.Fatal(replay, err)
+	}
+	cursor = w.Token(replay[0].ID)
+	w.Close()
+	if _, _, err = n.WatchFrom("b", cursor); !errors.Is(err, ErrResnapshot) {
+		t.Fatal("prefix scope accepted")
+	}
+	for i := 0; i < watchHistoryLimit+1; i++ {
+		n.Set("a1", "v", 0)
+	}
+	if _, _, err = n.WatchFrom("a", cursor); !errors.Is(err, ErrResnapshot) {
+		t.Fatal("expired cursor accepted")
 	}
 }

@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nexusriot/rezoagwe/pkg/discovery/model"
 	"github.com/nexusriot/rezoagwe/pkg/discovery/topology"
 	"github.com/nexusriot/rezoagwe/pkg/metrics"
 )
@@ -94,18 +95,20 @@ type IDConflict struct {
 // Snapshot is everything the rules read. It is a plain struct so a test can
 // fabricate any cluster condition without running one.
 type Snapshot struct {
-	Addr           string `json:"addr"`
-	BindAddr       string `json:"bind_addr"`
-	AdvertiseAddr  string `json:"advertise_addr,omitempty"`
-	LocalIPv4      string `json:"local_ipv4,omitempty"`
-	Nick           string `json:"nick"`
-	NodeID         string `json:"node_id"`
-	Cluster        string `json:"cluster"`
-	KeyFingerprint string `json:"key_fingerprint"`
-	PSKSet         bool   `json:"psk_set"`
-	Version        string `json:"version,omitempty"`
-	UptimeSec      int64  `json:"uptime_sec"`
-	StreamListener bool   `json:"stream_listener"`
+	ReplicationWarnings []string                `json:"replication_warnings,omitempty"`
+	Persistence         model.PersistenceHealth `json:"persistence"`
+	Addr                string                  `json:"addr"`
+	BindAddr            string                  `json:"bind_addr"`
+	AdvertiseAddr       string                  `json:"advertise_addr,omitempty"`
+	LocalIPv4           string                  `json:"local_ipv4,omitempty"`
+	Nick                string                  `json:"nick"`
+	NodeID              string                  `json:"node_id"`
+	Cluster             string                  `json:"cluster"`
+	KeyFingerprint      string                  `json:"key_fingerprint"`
+	PSKSet              bool                    `json:"psk_set"`
+	Version             string                  `json:"version,omitempty"`
+	UptimeSec           int64                   `json:"uptime_sec"`
+	StreamListener      bool                    `json:"stream_listener"`
 	// MDNS reports whether LAN discovery is running, which changes what "no
 	// peers" means and therefore what to do about it.
 	MDNS bool `json:"mdns,omitempty"`
@@ -144,6 +147,20 @@ func Checks(d Snapshot, now time.Time) []Check {
 	add := func(s Severity, title, detail string) {
 		out = append(out, Check{Severity: s, Title: title, Detail: detail})
 	}
+	for _, warning := range d.ReplicationWarnings {
+		add(SeverityWarn, "Replication limits differ", warning)
+	}
+	if d.Persistence.Enabled {
+		p := d.Persistence
+		detail := fmt.Sprintf("Mode: %s; durable: %t; last successful save: %d ms UTC; pending: %t; retained recovery file: %s", p.Mode, p.Durable, p.LastSuccess, p.Pending, p.RecoveryFile)
+		if p.Error != "" {
+			add(SeverityError, "State is not safely saved", p.Error+". "+detail)
+		} else if p.Pending {
+			add(SeverityInfo, "State save pending", detail)
+		} else {
+			add(SeverityOK, "State saved", detail)
+		}
+	}
 	m := d.Metrics
 
 	// Reported before anything else that could be a *consequence* of it: a node
@@ -151,7 +168,7 @@ func Checks(d Snapshot, now time.Time) []Check {
 	if d.LoadError != "" {
 		add(SeverityError, "State file could not be read",
 			fmt.Sprintf("%s did not parse (%s), so this node started with an empty store and a new "+
-				"identity, and has already rewritten that file with the new state. Its earlier writes "+
+				"identity. The original is retained for recovery, or further saves are blocked if retention failed. Its earlier writes "+
 				"are outranked until anti-entropy refills it from a peer, and every chat line it has "+
 				"said before now reads as coming from a different author. Without -logfile the only "+
 				"other trace of this was a discarded log line.", d.DataPath, d.LoadError))

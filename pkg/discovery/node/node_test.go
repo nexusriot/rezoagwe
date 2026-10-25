@@ -771,3 +771,22 @@ func TestActivityPreviewKeepsAnEventOnOneLine(t *testing.T) {
 		return false
 	})
 }
+
+func TestPartitionedCASClaimsBothSucceedLocally(t *testing.T) {
+	net := transport.NewMemNet(1)
+	a, b := newPairedNodes(t, net)
+	net.Partition(a.Addr(), b.Addr(), true)
+	ua, ea := a.CompareAndSet("claim", "alice", 0, pb.Version{})
+	ub, eb := b.CompareAndSet("claim", "bob", 0, pb.Version{})
+	if ea != nil || eb != nil {
+		t.Fatalf("local claims: %v %v", ea, eb)
+	}
+	net.Partition(a.Addr(), b.Addr(), false)
+	a.antiEntropyRound(b.Addr())
+	b.antiEntropyRound(a.Addr())
+	winner := "bob"
+	if ua.Version.Newer(ub.Version) {
+		winner = "alice"
+	}
+	waitFor(t, "LWW settles the claims", func() bool { av, _ := a.Get("claim"); bv, _ := b.Get("claim"); return av == winner && bv == winner })
+}

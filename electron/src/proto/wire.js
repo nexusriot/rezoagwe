@@ -78,8 +78,10 @@ function version(counter, node) {
 /** True when a should win over b. Equal is *not* newer, so re-delivery is idempotent. */
 function versionNewer(a, b) {
   if (a.counter !== b.counter) return a.counter > b.counter;
-  return a.node > b.node;
+  return compareWireStrings(a.node, b.node) > 0;
 }
+
+function compareWireStrings(a, b) { return Buffer.compare(Buffer.from(a, 'utf8'), Buffer.from(b, 'utf8')); }
 
 function versionEqual(a, b) {
   return a.counter === b.counter && a.node === b.node;
@@ -289,12 +291,12 @@ function decodePeerGossip(o) {
 }
 
 function encodeHello(h) {
-  return withOmitEmpty({ from: h.from, nick: h.nick || '', id: h.id || '', chat_seq: h.chatSeq || 0 },
+  return withOmitEmpty({ from: h.from, nick: h.nick || '', id: h.id || '', chat_seq: h.chatSeq || 0, ...(h.limits ? {limits:h.limits} : {}) },
     ['nick', 'id', 'chat_seq']);
 }
 
 function decodeHello(o) {
-  return { from: str(o && o.from), nick: str(o && o.nick), id: str(o && o.id), chatSeq: num(o && o.chat_seq) };
+  return { from: str(o && o.from), nick: str(o && o.nick), id: str(o && o.id), chatSeq: num(o && o.chat_seq), ...(o?.limits ? {limits:o.limits} : {}) };
 }
 
 function encodeGoodbye(g) {
@@ -316,7 +318,8 @@ function encodeKeyVersion(kv) {
     version: { counter: kv.version.counter, node: kv.version.node },
     deleted: !!kv.deleted,
     vhash: kv.vhash || '',
-  }, ['deleted', 'vhash']);
+    expires_at: kv.expiresAt || 0,
+  }, ['deleted', 'vhash', 'expires_at']);
 }
 
 function decodeKeyVersion(o) {
@@ -326,6 +329,7 @@ function decodeKeyVersion(o) {
     version: decodeVersion(o.version),
     deleted: o.deleted === true,
     vhash: typeof o.vhash === 'string' ? o.vhash : '',
+    ...(o.expires_at ? { expiresAt: num(o.expires_at) } : {}),
   };
 }
 
@@ -446,12 +450,13 @@ function encodeFingerprint(f) {
   // said which buckets disagree — which turns "you differ somewhere in this
   // sixteenth of the keyspace" into the names of the keys. Omitted when empty,
   // so this is byte for byte the old request.
-  return withOmitEmpty({ from: f.from, buckets: f.buckets || [] }, ['buckets']);
+  return withOmitEmpty({ from: f.from, buckets: f.buckets || [], digest_version: f.digestVersion || 0 }, ['buckets', 'digest_version']);
 }
 
 function decodeFingerprint(o) {
   return {
     from: str(o && o.from),
+    ...(o && o.digest_version ? { digestVersion: num(o.digest_version) } : {}),
     buckets: list(o && o.buckets).filter((b) => Number.isInteger(b)),
   };
 }
@@ -465,7 +470,9 @@ function encodeFingerprintReply(r) {
     clock: r.clock || 0,
     buckets: r.buckets || [],
     entries: (r.entries || []).map(encodeKeyVersion),
-  }, ['nick', 'entries']);
+    digest_version: r.digestVersion || 0,
+    capabilities: r.capabilities || null,
+  }, ['nick', 'entries', 'digest_version', 'capabilities']);
 }
 
 function decodeFingerprintReply(o) {
@@ -479,6 +486,8 @@ function decodeFingerprintReply(o) {
     // in this project's history.
     buckets: list(o && o.buckets).filter((b) => typeof b === 'string'),
     entries: list(o && o.entries).map(decodeKeyVersion),
+    ...(o && o.digest_version ? { digestVersion: num(o.digest_version) } : {}),
+    ...(o && o.capabilities ? { capabilities: list(o.capabilities) } : {}),
   };
 }
 
@@ -521,6 +530,7 @@ function decodeBootstrapRoster(o) {
 }
 
 module.exports = {
+  compareWireStrings,
   Kind,
   kindName,
   FINGERPRINT_BUCKETS,

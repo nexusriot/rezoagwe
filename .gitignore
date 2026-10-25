@@ -10,9 +10,11 @@ dist/
 # `make clean` names these, so a build can leave them in the repository root
 /rezoagwe-bootstrap
 /rezoagwe-discovery
+/rezoagwectl
 # what `go build ./cmd/...` drops here when it is run without -o
 /bootstrap
 /discovery
+/ctl
 
 # Go test artifacts
 *.test
@@ -21,8 +23,13 @@ dist/
 *.log
 
 # runtime data / persistence
-data-dir*
+/data-dir*/
 *.tmp
+# Runtime journals and retained corruption evidence; keep exports/JSON fixtures visible.
+*.wal
+*.corrupt-*
+*.profile-owner
+*.migrated
 
 # Android
 android/.gradle/

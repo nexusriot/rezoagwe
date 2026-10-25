@@ -20,8 +20,11 @@ const consistencyTimeout = 5 * time.Second
 
 // PeerConsistency is one peer's answer to "what do you hold?".
 type PeerConsistency struct {
-	Addr string `json:"addr"`
-	Nick string `json:"nick,omitempty"`
+	DigestVersion int      `json:"digest_version"`
+	Capabilities  []string `json:"capabilities,omitempty"`
+	Comparable    bool     `json:"comparable"`
+	Addr          string   `json:"addr"`
+	Nick          string   `json:"nick,omitempty"`
 	// Reachable is false when the peer never answered; Error says why.
 	Reachable  bool   `json:"reachable"`
 	Error      string `json:"error,omitempty"`
@@ -76,12 +79,14 @@ type KeyDifference struct {
 // split — or a peer can quietly refuse everything it is sent — for as long as
 // nobody looks. This is the looking.
 type ConsistencyReport struct {
-	Addr       string            `json:"addr"`
-	Keys       int               `json:"keys"`
-	Tombstones int               `json:"tombstones"`
-	Clock      uint64            `json:"clock"`
-	CheckedAt  int64             `json:"checked_at"`
-	Peers      []PeerConsistency `json:"peers"`
+	Unsupported int               `json:"unsupported"`
+	Complete    bool              `json:"complete"`
+	Addr        string            `json:"addr"`
+	Keys        int               `json:"keys"`
+	Tombstones  int               `json:"tombstones"`
+	Clock       uint64            `json:"clock"`
+	CheckedAt   int64             `json:"checked_at"`
+	Peers       []PeerConsistency `json:"peers"`
 	// Converged is true when every peer that answered agreed on every bucket.
 	Converged bool `json:"converged"`
 	// Unreachable counts the peers that never answered; a report over a peer
@@ -96,7 +101,7 @@ type ConsistencyReport struct {
 // that disagrees, which is exactly the wrong conclusion to draw from packet
 // loss.
 func (n *Node) CheckConsistency() ConsistencyReport {
-	local := n.Model.Store.Fingerprint(pb.FingerprintBuckets)
+	local := n.Model.Store.FingerprintVersion(pb.FingerprintBuckets, 2)
 	report := ConsistencyReport{
 		Addr:       n.cfg.AdvertiseAddr,
 		Keys:       local.Keys,
@@ -120,6 +125,9 @@ func (n *Node) CheckConsistency() ConsistencyReport {
 	wg.Wait()
 
 	for _, r := range results {
+		if r.Reachable && !r.Comparable {
+			report.Unsupported++
+		}
 		if !r.Reachable {
 			report.Unreachable++
 		} else if !r.Agrees {
@@ -127,6 +135,7 @@ func (n *Node) CheckConsistency() ConsistencyReport {
 		}
 		report.Peers = append(report.Peers, r)
 	}
+	report.Complete = report.Unreachable == 0 && report.Unsupported == 0
 	sort.Slice(report.Peers, func(i, j int) bool { return report.Peers[i].Addr < report.Peers[j].Addr })
 	return report
 }
@@ -135,7 +144,7 @@ func (n *Node) CheckConsistency() ConsistencyReport {
 func (n *Node) fingerprintPeer(addr string, local pb.FingerprintReply) PeerConsistency {
 	out := PeerConsistency{Addr: addr, Nick: n.Model.NickOf(addr)}
 
-	body, err := n.requestOverStream(addr, pb.KindFingerprint, pb.Fingerprint{From: n.cfg.AdvertiseAddr})
+	body, err := n.requestOverStream(addr, pb.KindFingerprint, pb.Fingerprint{From: n.cfg.AdvertiseAddr, DigestVersion: 2})
 	if err != nil {
 		out.Error = err.Error()
 		return out
@@ -146,7 +155,13 @@ func (n *Node) fingerprintPeer(addr string, local pb.FingerprintReply) PeerConsi
 		return out
 	}
 
+	out.DigestVersion = reply.DigestVersion
+	out.Capabilities = reply.Capabilities
 	out.Reachable = true
+	if reply.DigestVersion != 2 {
+		out.Error = "unsupported consistency digest: peer needs digest v2"
+		return out
+	}
 	out.Keys = reply.Keys
 	out.Tombstones = reply.Tombstones
 	out.Clock = reply.Clock
@@ -160,6 +175,7 @@ func (n *Node) fingerprintPeer(addr string, local pb.FingerprintReply) PeerConsi
 			len(reply.Buckets), len(local.Buckets))
 		return out
 	}
+	out.Comparable = true
 	for i := range local.Buckets {
 		if local.Buckets[i] != reply.Buckets[i] {
 			out.DifferingBuckets = append(out.DifferingBuckets, i)
@@ -183,8 +199,12 @@ func (n *Node) fingerprintPeer(addr string, local pb.FingerprintReply) PeerConsi
 // report falls back to the bucket indices rather than failing: "they differ in
 // bucket 7" is worse than a key name but much better than an error.
 func (n *Node) namedDifferences(addr string, buckets []int) ([]KeyDifference, int) {
+	return n.namedDifferencesLimit(addr, buckets, MaxReportedDifferences)
+}
+
+func (n *Node) namedDifferencesLimit(addr string, buckets []int, limit int) ([]KeyDifference, int) {
 	body, err := n.requestOverStream(addr, pb.KindFingerprint,
-		pb.Fingerprint{From: n.cfg.AdvertiseAddr, Buckets: buckets})
+		pb.Fingerprint{From: n.cfg.AdvertiseAddr, Buckets: buckets, DigestVersion: 2})
 	if err != nil {
 		return nil, 0
 	}
@@ -208,8 +228,7 @@ func (n *Node) namedDifferences(addr string, buckets []int) ([]KeyDifference, in
 		// Equal versions holding different values is divergence, not agreement.
 		// A peer too old to send a hash sends an empty one, which cannot be
 		// compared and so is not treated as a difference.
-		sameVersion := agreed && r.ValueHash != l.ValueHash &&
-			r.ValueHash != "" && l.ValueHash != ""
+		sameVersion := agreed && reply.DigestVersion == 2 && (r.ValueHash != l.ValueHash || r.ExpiresAt != l.ExpiresAt)
 		if agreed && !sameVersion {
 			continue
 		}
@@ -237,8 +256,8 @@ func (n *Node) namedDifferences(addr string, buckets []int) ([]KeyDifference, in
 	}
 	sort.Slice(diffs, func(i, j int) bool { return diffs[i].Key < diffs[j].Key })
 
-	if len(diffs) > MaxReportedDifferences {
-		return diffs[:MaxReportedDifferences], len(diffs) - MaxReportedDifferences
+	if limit > 0 && len(diffs) > limit {
+		return diffs[:limit], len(diffs) - limit
 	}
 	return diffs, 0
 }
@@ -327,4 +346,16 @@ func (n *Node) handleFingerprintReply(body []byte) {
 	}
 	n.Model.TouchPeer(reply.From)
 	log.Debugf("fingerprint from %s: %d keys, clock %d", reply.From, reply.Keys, reply.Clock)
+}
+
+// fingerprintResponse negotiates the optional v2 digest without changing v1.
+func (n *Node) fingerprintResponse(req pb.Fingerprint) pb.FingerprintReply {
+	r := n.fingerprintReply(req.Buckets...)
+	r.Capabilities = []string{"digest-v2", "empty-value-hash", "expiry-metadata"}
+	if req.DigestVersion == 2 {
+		v2 := n.Model.Store.FingerprintVersion(pb.FingerprintBuckets, 2)
+		r.Buckets = v2.Buckets
+		r.DigestVersion = 2
+	}
+	return r
 }

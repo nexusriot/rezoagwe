@@ -1,0 +1,33 @@
+{
+  "description": "Checkpoint and first delta written by Go; second delta written by Electron. UTF-8 checksums, removal, prototype key and tombstone.",
+  "checkpoint": {
+    "node_id": "journal-fixture",
+    "clock": 2,
+    "entries": {
+      "keep": {
+        "value": "checkpoint value",
+        "version": {
+          "counter": 1,
+          "node": "journal-fixture"
+        }
+      },
+      "removed": {
+        "value": "old",
+        "version": {
+          "counter": 2,
+          "node": "journal-fixture"
+        }
+      }
+    }
+  },
+  "records": [
+    {
+      "data": "{\"node_id\":\"journal-fixture\",\"clock\":3,\"chat\":null,\"chat_seq\":0,\"set\":{\"go\":{\"value\":\"Go \\u003c\\u003e\\u0026 😀\\nrecord\",\"version\":{\"counter\":3,\"node\":\"journal-fixture\"}}},\"remove\":[\"removed\"]}",
+      "sha256": "da98d554f6ef637114b39b64a614bcd08918a23d082a9080b74e929640672cd9"
+    },
+    {
+      "data": "{\"node_id\":\"journal-fixture\",\"clock\":5,\"chat\":[],\"chat_seq\":0,\"set\":{\"__proto__\":{\"value\":\"JS 😀 <>&\",\"version\":{\"counter\":4,\"node\":\"journal-fixture\"},\"deleted\":false,\"expires_at\":0,\"deleted_at\":0},\"deleted\":{\"value\":\"\",\"version\":{\"counter\":5,\"node\":\"journal-fixture\"},\"deleted\":true,\"expires_at\":0,\"deleted_at\":1}},\"remove\":[]}",
+      "sha256": "9d865ca306b8edbd86afc822a312f4083f01cad37695cfe86922c3766ec876b9"
+    }
+  ]
+}

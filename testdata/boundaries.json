@@ -1,0 +1,194 @@
+{
+  "digest_version": 2,
+  "entries": [
+    {
+      "key": "__proto__",
+      "value": "saved",
+      "counter": 1,
+      "node": "corpus",
+      "expires_at": 0,
+      "escaped_bytes": {
+        "go": 7,
+        "javascript": 7,
+        "kotlin": 7
+      }
+    },
+    {
+      "key": "constructor",
+      "value": "",
+      "counter": 2,
+      "node": "corpus",
+      "expires_at": 0,
+      "escaped_bytes": {
+        "go": 2,
+        "javascript": 2,
+        "kotlin": 2
+      }
+    },
+    {
+      "key": "toString",
+      "value": "prototype",
+      "counter": 3,
+      "node": "corpus",
+      "expires_at": 0,
+      "escaped_bytes": {
+        "go": 11,
+        "javascript": 11,
+        "kotlin": 11
+      }
+    },
+    {
+      "key": "a//b",
+      "value": "slashes",
+      "counter": 4,
+      "node": "corpus",
+      "expires_at": 0,
+      "escaped_bytes": {
+        "go": 9,
+        "javascript": 9,
+        "kotlin": 9
+      }
+    },
+    {
+      "key": "a/../b",
+      "value": "dots",
+      "counter": 5,
+      "node": "corpus",
+      "expires_at": 0,
+      "escaped_bytes": {
+        "go": 6,
+        "javascript": 6,
+        "kotlin": 6
+      }
+    },
+    {
+      "key": ".",
+      "value": "dot",
+      "counter": 6,
+      "node": "corpus",
+      "expires_at": 0,
+      "escaped_bytes": {
+        "go": 5,
+        "javascript": 5,
+        "kotlin": 5
+      }
+    },
+    {
+      "key": "..",
+      "value": "parent",
+      "counter": 7,
+      "node": "corpus",
+      "expires_at": 0,
+      "escaped_bytes": {
+        "go": 8,
+        "javascript": 8,
+        "kotlin": 8
+      }
+    },
+    {
+      "key": "a?b#c%",
+      "value": "URL",
+      "counter": 8,
+      "node": "corpus",
+      "expires_at": 0,
+      "escaped_bytes": {
+        "go": 5,
+        "javascript": 5,
+        "kotlin": 5
+      }
+    },
+    {
+      "key": "",
+      "value": "BMP",
+      "counter": 9,
+      "node": "corpus",
+      "expires_at": 0,
+      "escaped_bytes": {
+        "go": 5,
+        "javascript": 5,
+        "kotlin": 5
+      }
+    },
+    {
+      "key": "😀",
+      "value": "supplementary",
+      "counter": 10,
+      "node": "corpus",
+      "expires_at": 0,
+      "escaped_bytes": {
+        "go": 15,
+        "javascript": 15,
+        "kotlin": 15
+      }
+    },
+    {
+      "key": "ttl",
+      "value": "expires",
+      "counter": 11,
+      "node": "corpus",
+      "expires_at": 4102444800,
+      "escaped_bytes": {
+        "go": 9,
+        "javascript": 9,
+        "kotlin": 9
+      }
+    },
+    {
+      "key": "escapes",
+      "value": "\u0000\u0001\"\\\n\t<&> ",
+      "counter": 12,
+      "node": "corpus",
+      "expires_at": 0,
+      "escaped_bytes": {
+        "go": 46,
+        "javascript": 28,
+        "kotlin": 28
+      }
+    },
+    {
+      "key": "numeric-boundary",
+      "value": "safe integer",
+      "counter": 9007199254740990,
+      "node": "corpus",
+      "expires_at": 0,
+      "escaped_bytes": {
+        "go": 14,
+        "javascript": 14,
+        "kotlin": 14
+      }
+    }
+  ],
+  "sorted_keys": [
+    ".",
+    "..",
+    "__proto__",
+    "a/../b",
+    "a//b",
+    "a?b#c%",
+    "constructor",
+    "escapes",
+    "numeric-boundary",
+    "toString",
+    "ttl",
+    "",
+    "😀"
+  ],
+  "buckets": [
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "b1df6896f10f68051eb1f1c0698c003a878e559f32b9d6b99f244fecffbc4b68",
+    "e600f12df8d5373f44efbd21e10a76c194eb8533a0b5588a83b46e2c8ef944a1",
+    "2c92f61adfd70a45bc06f06f787e1078cd04350a09cdb34819efa26b2d72df44",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "1f52f5537021c5000ea2f044ae7f24310852bfdd0f796ce34d3e461843fc86e4",
+    "87604b8bf664583725d9a2ab3777fc8d826264358bbc96b7391a8b1c37c8eff9",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "e4b40304efcfefb8e1be42f3e6bfb4f18dfe8da944790967a5e5d3a9c21a639b",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "81a92a75c6c8eb0c4a32e66595e3461b283d4b127cfd23eec1d9149971e324e5",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "0000000000000000000000000000000000000000000000000000000000000000"
+  ]
+}

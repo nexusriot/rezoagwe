@@ -1,6 +1,7 @@
 package node
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -212,5 +213,68 @@ func TestRepairDivergentOnAHealthyClusterRewritesNothing(t *testing.T) {
 	}
 	if repair.Rewritten != 0 {
 		t.Errorf("rewrote %d keys with nothing to repair", repair.Rewritten)
+	}
+}
+
+func TestRepairPreviewRejectsConcurrentChanges(t *testing.T) {
+	n := newTestNode(t, transport.NewMemNet(1), "10.0.0.1:3137")
+	n.Set("k", "old", 0)
+	plan := n.PreviewRepair([]string{"k"}, 0, 100)
+	if plan.Items[0].Current.Value != "old" {
+		t.Fatal("preview omitted value")
+	}
+	n.Set("k", "new", 0)
+	r := n.ApplyRepairPlan(plan)
+	if r.Changed != 1 || r.Rewritten != 0 || r.Complete {
+		t.Fatalf("unsafe repair: %+v", r)
+	}
+	if v, _ := n.Get("k"); v != "new" {
+		t.Fatal("concurrent value overwritten")
+	}
+	n.Delete("k")
+	plan = n.PreviewRepair([]string{"k"}, 0, 100)
+	if r := n.ApplyRepairPlan(plan); r.Rewritten != 1 {
+		t.Fatalf("tombstone guard failed: %+v", r)
+	}
+}
+
+func TestRepairBeyondDisplayLimitAndEmptyConflict(t *testing.T) {
+	a, b := newPairedNodes(t, transport.NewMemNet(1))
+	for i := 0; i < 120; i++ {
+		divergeAtTheSameVersion(t, a, b, fmt.Sprintf("k%03d", i), "", "other")
+	}
+	before := a.CheckConsistency()
+	if before.Converged || before.Peers[0].MoreDifferences != 70 {
+		t.Fatalf("empty conflict not named: %+v", before)
+	}
+	keys := a.DivergentKeys(before)
+	p := a.PreviewRepair(keys, 0, 50)
+	if p.Total != 120 || p.Next != 50 || len(p.Items) != 50 {
+		t.Fatalf("page: %+v", p)
+	}
+	p = a.PreviewRepair(keys, p.Next, 50)
+	if p.Offset != 50 || p.Next != 100 {
+		t.Fatal("bad next page")
+	}
+	_, r := a.RepairDivergent()
+	if r.Rewritten != 120 {
+		t.Fatalf("display cap leaked into repair: %+v", r)
+	}
+	waitFor(t, "all repairs", func() bool { return a.CheckConsistency().Converged })
+}
+
+func TestRepairChosenSourceOutranksNewerPeer(t *testing.T) {
+	a, b := newPairedNodes(t, transport.NewMemNet(1))
+	a.Model.Store.Apply(pb.KVUpdate{Action: pb.KVSet, Key: "k", Value: "chosen", Version: pb.Version{Counter: 1, Node: "old"}})
+	b.Model.Store.Apply(pb.KVUpdate{Action: pb.KVSet, Key: "k", Value: "unwanted", Version: pb.Version{Counter: 100, Node: "new"}})
+	plan := a.PreviewRepair([]string{"k"}, 0, 100)
+	r := a.ApplyRepairPlan(plan)
+	if r.Rewritten != 1 {
+		t.Fatalf("repair %+v", r)
+	}
+	waitFor(t, "chosen source wins", func() bool { v, _ := b.Get("k"); return v == "chosen" })
+	e, _ := a.Entry("k")
+	if e.Version.Counter <= 100 {
+		t.Fatal("repair did not outrank observed peer")
 	}
 }

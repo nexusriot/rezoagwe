@@ -3,7 +3,7 @@
 const { createHash } = require('crypto');
 
 const {
-  KVAction, version, versionNewer, versionEqual, versionZero, FINGERPRINT_BUCKETS,
+  compareWireStrings, KVAction, version, versionNewer, versionEqual, versionZero, FINGERPRINT_BUCKETS,
   MAX_REPLICABLE_VALUE_BYTES, escapedLen,
 } = require('../proto/wire');
 
@@ -138,7 +138,8 @@ class KvStore {
 
   /** The persistable snapshot: the clock and every entry, in the Go file layout. */
   snapshotState() {
-    const entries = {};
+    // Keys are user data: __proto__ must be an own property, not a setter.
+    const entries = Object.create(null);
     for (const [k, e] of this.store) {
       const out = { value: e.value, version: { counter: e.version.counter, node: e.version.node } };
       if (e.deleted) out.deleted = true;
@@ -208,9 +209,9 @@ class KvStore {
     const out = [];
     for (const [k, e] of this.store) {
       if (!wanted.has(bucketOf(k, buckets))) continue;
-      out.push({ key: k, version: e.version, deleted: e.deleted, vhash: KvStore.valueHash(e) });
+      out.push({ key: k, version: e.version, deleted: e.deleted, vhash: KvStore.valueHash(e), ...(e.expiresAt ? { expiresAt: e.expiresAt } : {}) });
     }
-    out.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+    out.sort((a, b) => compareWireStrings(a.key, b.key));
     return out;
   }
 
@@ -357,8 +358,22 @@ class KvStore {
     for (const [k, e] of this.store) {
       if (KvStore.visible(e, now)) out.push({ key: k, value: e.value, version: e.version, expiresAt: e.expiresAt });
     }
-    out.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+    out.sort((a, b) => compareWireStrings(a.key, b.key));
     return out;
+  }
+
+  page({ query = '', offset = 0, limit = 200 } = {}) {
+    limit = Math.max(1, Math.min(200, Math.floor(Number(limit) || 200)));
+    offset = Math.max(0, Math.floor(Number(offset) || 0));
+    const needle = String(query).toLowerCase(), now = this.nowSec();
+    const keys = [];
+    for (const [k,e] of this.store) if (KvStore.visible(e,now) && k.toLowerCase().includes(needle)) keys.push(k);
+    keys.sort(compareWireStrings);
+    if(offset>=keys.length)offset=keys.length ? Math.floor((keys.length-1)/limit)*limit : 0;
+    return { total: keys.length, offset, limit, entries: keys.slice(offset,offset+limit).map(k => {
+      const e=this.store.get(k);
+      return {key:k,value:e.value.slice(0,512),truncated:e.value.length>512,valueLength:e.value.length,version:e.version,expiresAt:e.expiresAt};
+    }) };
   }
 
   size() {
@@ -407,7 +422,7 @@ class KvStore {
   updates() {
     const out = [];
     for (const [k, e] of this.store) out.push(KvStore.entryUpdate(k, e));
-    out.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+    out.sort((a, b) => compareWireStrings(a.key, b.key));
     return out;
   }
 
@@ -436,8 +451,8 @@ class KvStore {
    */
   digest(after, limit) {
     const keys = [];
-    for (const k of this.store.keys()) if (after === '' || k > after) keys.push(k);
-    keys.sort();
+    for (const k of this.store.keys()) if (after === '' || compareWireStrings(k, after) > 0) keys.push(k);
+    keys.sort(compareWireStrings);
     const batch = keys.length > limit ? keys.slice(0, limit) : keys;
     // hi is exclusive and has to be the last key's exact successor, so the next
     // batch starts where this one stopped. Go and Kotlin append the same NUL.
@@ -467,7 +482,7 @@ class KvStore {
    *
    * Byte-for-byte identical to Go's KVStore.Fingerprint, and pinned there.
    */
-  fingerprint(buckets = FINGERPRINT_BUCKETS) {
+  fingerprint(buckets = FINGERPRINT_BUCKETS, digestVersion = 0) {
     const n = buckets > 0 ? buckets : FINGERPRINT_BUCKETS;
     const folds = Array.from({ length: n }, () => Buffer.alloc(32));
     let keys = 0;
@@ -486,6 +501,7 @@ class KvStore {
         .update(`${e.version.counter}/${e.version.node}/${e.deleted ? 'true' : 'false'}`, 'utf8')
         .update(Buffer.from([0]))
         .update(KvStore.valueHash(e), 'utf8')
+        .update(digestVersion === 2 ? `\u0000${e.expiresAt || 0}` : '', 'utf8')
         .digest();
       const fold = folds[idx];
       for (let i = 0; i < 32; i++) fold[i] ^= sum[i];
@@ -503,8 +519,8 @@ class KvStore {
 
   /** Lo is exclusive: it is the sender's cursor, the last key it already advertised. */
   static inDigestRange(key, lo, hi) {
-    if (lo !== '' && key <= lo) return false;
-    return hi === '' || key < hi;
+    if (lo !== '' && compareWireStrings(key, lo) <= 0) return false;
+    return hi === '' || compareWireStrings(key, hi) < 0;
   }
 
   /**
@@ -527,8 +543,8 @@ class KvStore {
       if (advertised.has(k)) continue;
       if (KvStore.inDigestRange(k, d.lo, d.hi)) push.push(KvStore.entryUpdate(k, e));
     }
-    push.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
-    pull.sort();
+    push.sort((a, b) => compareWireStrings(a.key, b.key));
+    pull.sort(compareWireStrings);
     return { push: push.slice(0, maxPush), pull: pull.slice(0, maxPull) };
   }
 

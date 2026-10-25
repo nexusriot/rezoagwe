@@ -91,6 +91,7 @@ data class StoreDiagnostics(
  * walking six screens, and so [healthChecks] can reason over all of it at once.
  */
 data class NodeDiagnostics(
+    val replicationWarnings: List<String> = emptyList(),
     val addr: String = "",
     val nick: String = "",
     val nodeId: String = "",
@@ -113,6 +114,7 @@ data class NodeDiagnostics(
     /** The state file, and why it could not be read. */
     val dataFile: String = "",
     val loadError: String = "",
+    val persistence: PersistenceHealth = PersistenceHealth(enabled = false),
     val running: Boolean = false,
     val startedAtMs: Long = 0,
     val uptimeSec: Long = 0,
@@ -151,6 +153,13 @@ fun healthChecks(
     device: DeviceReport? = null,
 ): List<HealthCheck> {
     val checks = mutableListOf<HealthCheck>()
+    for (warning in d.replicationWarnings) checks += HealthCheck(Severity.WARN,"Replication limits differ",warning)
+    val p = d.persistence
+    if (p.enabled) checks += HealthCheck(
+        if (p.error.isNotEmpty()) Severity.ERROR else if (p.pending) Severity.INFO else Severity.OK,
+        if (p.error.isNotEmpty()) "State is not safely saved" else if (p.pending) "State save pending" else "State saved",
+        "${p.error} Mode: ${p.mode}; durable: ${p.durable}; Last save: ${p.lastSuccessMs} ms UTC; pending: ${p.pending}; recovery: ${p.recoveryFile.ifEmpty { "none" }}",
+    )
     val m = d.metrics
 
     // The phone's own state comes first, because when it is the cause every
@@ -436,7 +445,7 @@ fun healthChecks(
             Severity.ERROR,
             "State file could not be read",
             "${d.dataFile} did not parse (${d.loadError}), so this node started with an empty store " +
-                "and a new identity, and has already rewritten that file with the new state. Its " +
+                "and a new identity. The original is retained for recovery, or saves are blocked if retention failed. Its " +
                 "earlier writes are outranked until anti-entropy refills it from a peer, and every " +
                 "chat line it has said before now reads as coming from a different author.",
         )

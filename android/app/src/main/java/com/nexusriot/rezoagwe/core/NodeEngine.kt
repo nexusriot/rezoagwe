@@ -101,6 +101,7 @@ data class NodeConfig(
     val maxPush: Int = 128,
     val maxPull: Int = 128,
     val limits: Limits = Limits(),
+    val durability: String = "snapshot",
 ) {
     /** The digest width the engine actually uses: never wider than one round can repair. */
     val effectiveDigestBatch: Int get() = minOf(digestBatch, maxPush, maxPull)
@@ -150,7 +151,9 @@ class NodeEngine(
     var config: NodeConfig = config
         private set
 
-    private val persister = dataFile?.let { Persister(it) }
+    private val persister = dataFile?.let { Persister(it, config.durability) }
+    private val repairSlots = java.util.concurrent.Semaphore(2)
+    private val peerLimits = java.util.concurrent.ConcurrentHashMap<String, com.nexusriot.rezoagwe.proto.StoreLimits>()
     val nodeId: String
     val store: KvStore
     val metrics = Metrics()
@@ -400,7 +403,7 @@ class NodeEngine(
 
     private fun peerAddrs(): List<String> = synchronized(lock) { peers.keys.toList() }
 
-    private fun helloMessage() = Hello(from = addr, nick = nick, id = nodeId, chatSeq = chatSeq)
+    private fun helloMessage() = Hello(from = addr, nick = nick, id = nodeId, chatSeq = chatSeq, limits = com.nexusriot.rezoagwe.proto.StoreLimits(config.limits.maxValueBytes, config.limits.maxKeys))
 
     private fun helloAllPeers() = broadcast(Kind.HELLO, helloMessage())
 
@@ -534,7 +537,7 @@ class NodeEngine(
 
     /**
      * Writes only if the key still holds [expect]; a zero version requires the key
-     * to be absent. This is the primitive a lock or a leader election is built on.
+     * to be absent. This protects local optimistic updates; it is not a distributed lock or leader election.
      */
     fun compareAndSet(key: String, value: String, ttlSeconds: Long, expect: Version): KVUpdate? =
         write(key, value, ttlSeconds, expect)
@@ -1112,6 +1115,7 @@ class NodeEngine(
     }
 
     private fun handleHello(h: Hello) {
+        if(h.limits != null) peerLimits[h.from] = h.limits else peerLimits.remove(h.from)
         touchPeer(h.from)
         if (h.nick.isNotEmpty()) setNick(h.from, h.nick)
         if (h.id.isNotEmpty()) setNodeId(h.id, h.from)
@@ -1193,6 +1197,11 @@ class NodeEngine(
 
     /** Ships updates as batches, split on a byte budget so a repair of large values still fits a datagram. */
     private fun sendUpdates(target: String, updates: List<KVUpdate>) {
+        if (!repairSlots.tryAcquire()) { logActivity("Repair capacity busy; retry on next anti-entropy round"); return }
+        scope.launch(kotlinx.coroutines.Dispatchers.IO) { try { sendRepair(target, updates) } finally { repairSlots.release() } }
+    }
+    private fun sendRepair(target: String, updates: List<KVUpdate>) {
+        val remote = peerLimits[target]
         var batch = mutableListOf<KVUpdate>()
         var size = 0
         fun flush() {
@@ -1202,7 +1211,8 @@ class NodeEngine(
             size = 0
         }
         for (u in updates) {
-            val entrySize = u.key.length + u.value.length + 160
+            if (u.action == KVAction.SET && (remote?.maxValueBytes ?: 0) > 0 && u.value.toByteArray(Charsets.UTF_8).size > remote!!.maxValueBytes) continue
+            val entrySize = WireJson.encodeToString(u).toByteArray(Charsets.UTF_8).size + 1
             if (batch.isNotEmpty() && (size + entrySize > BATCH_BYTES || batch.size >= BATCH_ENTRIES)) flush()
             batch.add(u)
             size += entrySize
@@ -1243,7 +1253,7 @@ class NodeEngine(
             touchPeer(req.from)
             // A stream has no datagram ceiling, so this is where a request
             // that named buckets gets the keys in them answered.
-            val pkt = codec.encode(Kind.FINGERPRINT_REPLY, fingerprintReply(req.buckets))
+            val pkt = codec.encode(Kind.FINGERPRINT_REPLY, fingerprintReply(req.buckets, req.digestVersion))
             writeFrame(conn.getOutputStream(), pkt)
             metrics.sent(Kind.FINGERPRINT_REPLY, pkt.size)
         } else {
@@ -1258,6 +1268,9 @@ class NodeEngine(
      * nothing about whether it agrees, so it must not be counted as if it did.
      */
     data class PeerConsistency(
+        val digestVersion: Int = 0,
+        val capabilities: List<String> = emptyList(),
+        val comparable: Boolean = false,
         val addr: String,
         val nick: String = "",
         val reachable: Boolean = false,
@@ -1305,6 +1318,8 @@ class NodeEngine(
      * replicas actually the same right now?
      */
     data class ConsistencyReport(
+        val unsupported: Int = 0,
+        val complete: Boolean = false,
         val addr: String,
         val keys: Int,
         val tombstones: Int,
@@ -1324,7 +1339,7 @@ class NodeEngine(
      * Blocking, and it dials every peer — callers must be off the main thread.
      */
     fun checkConsistency(): ConsistencyReport {
-        val local = store.fingerprint()
+        val local = store.fingerprint(digestVersion = 2)
         val results = peerAddrs().map { peerAddr -> fingerprintPeer(peerAddr, local) }.sortedBy { it.addr }
         return ConsistencyReport(
             addr = addr,
@@ -1335,12 +1350,15 @@ class NodeEngine(
             peers = results,
             converged = results.none { it.reachable && !it.agrees },
             unreachable = results.count { !it.reachable },
+            unsupported = results.count { it.reachable && !it.comparable },
+            complete = results.all { it.reachable && it.comparable },
         )
     }
 
     private fun fingerprintPeer(peerAddr: String, local: FingerprintReply): PeerConsistency {
         val reply = requestFingerprint(peerAddr)
             ?: return PeerConsistency(addr = peerAddr, nick = nickOf(peerAddr), error = "no answer")
+        if (reply.digestVersion != 2) return PeerConsistency(addr = peerAddr, reachable = true, error = "unsupported consistency digest: peer needs digest v2")
         if (reply.buckets.size != local.buckets.size) {
             // A peer summarising at a different granularity cannot be compared
             // bucket by bucket; say so rather than reporting a false divergence.
@@ -1358,6 +1376,7 @@ class NodeEngine(
         return PeerConsistency(
             addr = peerAddr,
             nick = reply.nick.ifEmpty { nickOf(peerAddr) },
+            digestVersion = reply.digestVersion, capabilities = reply.capabilities, comparable = true,
             reachable = true,
             keys = reply.keys,
             tombstones = reply.tombstones,
@@ -1395,8 +1414,8 @@ class NodeEngine(
             // resolve it. A peer too old to send a hash sends an empty one,
             // which cannot be compared and so is not treated as a difference.
             val sameVersion = agreed && r != null &&
-                r.valueHash.isNotEmpty() && l.valueHash.isNotEmpty() &&
-                r.valueHash != l.valueHash
+                reply.digestVersion == 2 &&
+                (r.valueHash != l.valueHash || r.expiresAt != l.expiresAt)
             if (agreed && !sameVersion) continue
             diffs.add(
                 KeyDifference(
@@ -1434,7 +1453,7 @@ class NodeEngine(
         val tr = synchronized(lock) { transport } ?: return null
         val conn = tr.dial(peer) ?: return null
         return try {
-            val pkt = codec.encode(Kind.FINGERPRINT, Fingerprint(from = addr, buckets = buckets))
+            val pkt = codec.encode(Kind.FINGERPRINT, Fingerprint(from = addr, buckets = buckets, digestVersion = 2))
             writeFrame(conn.getOutputStream(), pkt)
             metrics.sent(Kind.FINGERPRINT, pkt.size)
             val frame = codec.decode(readFrame(conn.getInputStream()))
@@ -1472,8 +1491,10 @@ class NodeEngine(
      * held in them, which is what lets the checker turn a bucket index into a
      * name.
      */
-    fun fingerprintReply(buckets: List<Int> = emptyList()): FingerprintReply =
-        store.fingerprint().copy(
+    fun fingerprintReply(buckets: List<Int> = emptyList(), digestVersion: Int = 0): FingerprintReply =
+        store.fingerprint(digestVersion = digestVersion).copy(
+            digestVersion = if (digestVersion == 2) 2 else 0,
+            capabilities = listOf("digest-v2", "empty-value-hash", "expiry-metadata"),
             from = addr,
             nick = nick,
             entries = if (buckets.isEmpty()) emptyList() else store.bucketEntries(FINGERPRINT_BUCKETS, buckets),
@@ -1648,6 +1669,8 @@ class NodeEngine(
 
     // ---- persistence & publishing --------------------------------------
 
+    fun persistenceHealth(): PersistenceHealth = persister?.health ?: PersistenceHealth(enabled = false)
+
     private fun persist() {
         val p = persister ?: return
         val gen: Long
@@ -1790,6 +1813,7 @@ class NodeEngine(
             .sortedBy { it.addr }
 
         return NodeDiagnostics(
+            replicationWarnings = peerLimits.filter { (_, l) -> l.maxValueBytes != config.limits.maxValueBytes || l.maxKeys != config.limits.maxKeys }.map { (addr,l) -> "$addr: max_value_bytes=${l.maxValueBytes}, max_keys=${l.maxKeys}; unequal limits can prevent convergence" },
             addr = addr,
             nick = nick,
             nodeId = nodeId,
@@ -1804,6 +1828,7 @@ class NodeEngine(
             advertiseMismatch = advertiseMismatch(),
             dataFile = dataFile?.path ?: "",
             loadError = persister?.loadError ?: "",
+            persistence = persister?.health ?: PersistenceHealth(enabled = false),
             running = tr != null,
             startedAtMs = startedAtMs,
             uptimeSec = if (startedAtMs == 0L) 0 else (System.currentTimeMillis() - startedAtMs) / 1000,

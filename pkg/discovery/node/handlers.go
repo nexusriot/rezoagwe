@@ -456,6 +456,13 @@ func (n *Node) handleHello(body []byte) {
 	if !n.unmarshal(body, &h) {
 		return
 	}
+	n.limitsMu.Lock()
+	if h.Limits != nil {
+		n.peerLimits[h.From] = *h.Limits
+	} else {
+		delete(n.peerLimits, h.From)
+	}
+	n.limitsMu.Unlock()
 	n.Model.TouchPeer(h.From)
 	if h.Nick != "" {
 		n.Model.SetNick(h.From, h.Nick)
@@ -574,7 +581,7 @@ func (n *Node) serveStream(conn net.Conn) {
 		n.Model.TouchPeer(req.From)
 		// A stream has no datagram ceiling, so this is where a request that
 		// named buckets gets the keys in them answered.
-		resp, err := n.codec.Encode(pb.KindFingerprintReply, n.fingerprintReply(req.Buckets...))
+		resp, err := n.codec.Encode(pb.KindFingerprintReply, n.fingerprintResponse(req))
 		if err != nil {
 			log.Errorf("encode fingerprint: %s", err)
 			return

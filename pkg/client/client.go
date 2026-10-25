@@ -12,6 +12,7 @@ package client
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -193,6 +194,8 @@ func (c *Client) List(prefix string) ([]Entry, error) {
 
 // PutOptions modifies a write.
 type PutOptions struct {
+	// Durable requests an fsync acknowledgement; requires journal-sync on the server.
+	Durable bool
 	// TTL expires the key on every replica at the same instant.
 	TTL time.Duration
 	// IfMatch turns the write into a compare-and-swap against this version.
@@ -203,6 +206,9 @@ type PutOptions struct {
 // Put writes a key and returns the version it landed at.
 func (c *Client) Put(key, value string, opt PutOptions) (string, error) {
 	headers := map[string]string{}
+	if opt.Durable {
+		headers["X-Rezoagwe-Durability"] = "durable"
+	}
 	if opt.TTL > 0 {
 		headers["X-Rezoagwe-TTL"] = strconv.Itoa(int(opt.TTL.Seconds()))
 	}
@@ -421,6 +427,8 @@ func (c *Client) Metrics() (string, error) {
 
 // WatchEvent is one event from a watch stream.
 type WatchEvent struct {
+	ID         string
+	Resnapshot bool
 	// Name is the server-sent event name: "snapshot" for the opening baseline,
 	// "kv" for a mutation, "dropped" when the stream fell behind.
 	Name string
@@ -442,16 +450,31 @@ type WatchEvent struct {
 // lost, at the cost of possibly appearing twice. Every event names its version,
 // which is what makes the duplicate recognisable.
 func (c *Client) Watch(prefix string, stop <-chan struct{}) (<-chan WatchEvent, <-chan error) {
+	return c.WatchFrom(prefix, "", stop)
+}
+
+// WatchFrom resumes from a previously delivered ID. HTTP 409 requires a fresh Watch.
+func (c *Client) WatchFrom(prefix, cursor string, stop <-chan struct{}) (<-chan WatchEvent, <-chan error) {
 	events := make(chan WatchEvent)
 	errCh := make(chan error, 1)
 
 	go func() {
 		defer close(events)
+		defer close(errCh)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		go func() {
+			select {
+			case <-stop:
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
 		path := "/kv?watch=1"
 		if prefix != "" {
 			path += "&prefix=" + queryEscape(prefix)
 		}
-		req, err := http.NewRequest(http.MethodGet, c.base+path, nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+path, nil)
 		if err != nil {
 			errCh <- err
 			return
@@ -460,6 +483,9 @@ func (c *Client) Watch(prefix string, stop <-chan struct{}) (<-chan WatchEvent, 
 			req.Header.Set("Authorization", "Bearer "+c.token)
 		}
 		req.Header.Set("Accept", "text/event-stream")
+		if cursor != "" {
+			req.Header.Set("Last-Event-ID", cursor)
+		}
 
 		// A watch has no deadline by nature; the client's own timeout would
 		// end a healthy stream on a quiet prefix.
@@ -474,10 +500,6 @@ func (c *Client) Watch(prefix string, stop <-chan struct{}) (<-chan WatchEvent, 
 			errCh <- readError(resp)
 			return
 		}
-		go func() {
-			<-stop
-			resp.Body.Close() // unblocks the read below
-		}()
 
 		if err := scanEvents(resp.Body, events, stop); err != nil {
 			select {
@@ -493,7 +515,7 @@ func (c *Client) Watch(prefix string, stop <-chan struct{}) (<-chan WatchEvent, 
 // scanEvents parses the server-sent event stream.
 func scanEvents(r io.Reader, out chan<- WatchEvent, stop <-chan struct{}) error {
 	br := bufio.NewReader(r)
-	var name, data string
+	var name, data, id string
 	for {
 		line, err := br.ReadString('\n')
 		if err != nil {
@@ -503,6 +525,8 @@ func scanEvents(r io.Reader, out chan<- WatchEvent, stop <-chan struct{}) error 
 		switch {
 		case strings.HasPrefix(line, ":"):
 			// A comment; the keep-alive ping is one.
+		case strings.HasPrefix(line, "id: "):
+			id = strings.TrimPrefix(line, "id: ")
 		case strings.HasPrefix(line, "event: "):
 			name = strings.TrimPrefix(line, "event: ")
 		case strings.HasPrefix(line, "data: "):
@@ -512,7 +536,8 @@ func scanEvents(r io.Reader, out chan<- WatchEvent, stop <-chan struct{}) error 
 				continue
 			}
 			ev, err := parseEvent(name, data)
-			name, data = "", ""
+			ev.ID = id
+			name, data, id = "", "", ""
 			if err != nil {
 				continue // a shape this client does not know is not fatal
 			}
@@ -528,6 +553,11 @@ func scanEvents(r io.Reader, out chan<- WatchEvent, stop <-chan struct{}) error 
 func parseEvent(name, data string) (WatchEvent, error) {
 	ev := WatchEvent{Name: name}
 	switch name {
+	case "ready":
+		return ev, nil
+	case "resnapshot":
+		ev.Resnapshot = true
+		return ev, nil
 	case "snapshot":
 		return ev, json.Unmarshal([]byte(data), &ev.Snapshot)
 	case "kv":
@@ -547,19 +577,17 @@ func parseEvent(name, data string) (WatchEvent, error) {
 //
 // Keys are arbitrary strings — a slash, a space and a question mark are all
 // legal — and the gateway routes /kv/{key...}, which takes the rest of the path
-// verbatim. Only the characters that would change which request this is get
-// escaped; a slash is left alone because a key containing one is a path with
-// more segments and the gateway reassembles it.
+// verbatim after unescaping. Encode slashes and dots too: ServeMux cleans
+// literal repeated slashes and dot segments before routing, redirecting the
+// request to a different key (or even the listing endpoint).
 func escapeKey(key string) string {
 	var b strings.Builder
 	for i := 0; i < len(key); i++ {
 		ch := key[i]
 		switch {
-		case ch == '/':
-			b.WriteByte(ch)
 		case ch >= 'a' && ch <= 'z', ch >= 'A' && ch <= 'Z', ch >= '0' && ch <= '9':
 			b.WriteByte(ch)
-		case ch == '-' || ch == '_' || ch == '.' || ch == '~':
+		case ch == '-' || ch == '_' || ch == '~':
 			b.WriteByte(ch)
 		default:
 			fmt.Fprintf(&b, "%%%02X", ch)
@@ -583,4 +611,73 @@ func queryEscape(s string) string {
 		}
 	}
 	return b.String()
+}
+
+// PreviewRepair returns a page of values and versions without changing state.
+func (c *Client) PreviewRepair(keys []string, divergent bool, offset, limit int) (node.RepairPlan, error) {
+	body, err := json.Marshal(map[string]interface{}{"keys": keys, "divergent": divergent, "offset": offset, "limit": limit})
+	if err != nil {
+		return node.RepairPlan{}, err
+	}
+	resp, err := c.request(http.MethodPost, "/repair/preview", bytes.NewReader(body), map[string]string{"Content-Type": "application/json"})
+	if err != nil {
+		return node.RepairPlan{}, err
+	}
+	defer resp.Body.Close()
+	var out node.RepairPlan
+	err = json.NewDecoder(resp.Body).Decode(&out)
+	return out, err
+}
+func (c *Client) ApplyRepairPlan(plan node.RepairPlan) (node.RepairReport, error) {
+	body, err := json.Marshal(plan)
+	if err != nil {
+		return node.RepairReport{}, err
+	}
+	resp, err := c.request(http.MethodPost, "/repair/apply", bytes.NewReader(body), map[string]string{"Content-Type": "application/json"})
+	if err != nil {
+		return node.RepairReport{}, err
+	}
+	defer resp.Body.Close()
+	var out node.RepairReport
+	err = json.NewDecoder(resp.Body).Decode(&out)
+	return out, err
+}
+
+func (c *Client) RepairPlanPage(id string, offset, limit int) (node.RepairPlan, error) {
+	body, _ := json.Marshal(map[string]interface{}{"id": id, "offset": offset, "limit": limit})
+	resp, err := c.request(http.MethodPost, "/repair/preview", bytes.NewReader(body), map[string]string{"Content-Type": "application/json"})
+	if err != nil {
+		return node.RepairPlan{}, err
+	}
+	defer resp.Body.Close()
+	var out node.RepairPlan
+	err = json.NewDecoder(resp.Body).Decode(&out)
+	return out, err
+}
+
+// PreviewRestore inspects a backup without mutating the store.
+func (c *Client) PreviewRestore(backup json.RawMessage, deleteMissing, allowCrossCluster bool) (node.RepairPlan, error) {
+	body, err := json.Marshal(map[string]interface{}{"backup": backup, "delete_missing": deleteMissing, "allow_cross_cluster": allowCrossCluster})
+	if err != nil {
+		return node.RepairPlan{}, err
+	}
+	resp, err := c.request(http.MethodPost, "/restore/preview", bytes.NewReader(body), map[string]string{"Content-Type": "application/json"})
+	if err != nil {
+		return node.RepairPlan{}, err
+	}
+	defer resp.Body.Close()
+	var out node.RepairPlan
+	err = json.NewDecoder(resp.Body).Decode(&out)
+	return out, err
+}
+func (c *Client) ApplyRestore(id string, keys []string) (node.RepairReport, error) {
+	body, _ := json.Marshal(map[string]interface{}{"id": id, "keys": keys})
+	resp, err := c.request(http.MethodPost, "/restore/apply", bytes.NewReader(body), map[string]string{"Content-Type": "application/json"})
+	if err != nil {
+		return node.RepairReport{}, err
+	}
+	defer resp.Body.Close()
+	var out node.RepairReport
+	err = json.NewDecoder(resp.Body).Decode(&out)
+	return out, err
 }

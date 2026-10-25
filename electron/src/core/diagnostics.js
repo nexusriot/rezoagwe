@@ -34,6 +34,13 @@ function healthChecks(d, nowMs) {
   const m = d.metrics;
   const add = (severity, title, detail) => checks.push({ severity, title, detail });
 
+  for(const warning of d.replicationWarnings||[])add(Severity.WARN,'Replication limits differ',warning);
+  if (d.persistence && d.persistence.enabled) {
+    const p = d.persistence;
+    const detail = `Mode: ${p.mode || "snapshot"}; durable: ${!!p.durable}; Last save: ${p.lastSuccessMs ? new Date(p.lastSuccessMs).toISOString() : 'never'}; pending: ${p.pending}; recovery: ${p.recoveryFile || 'none'}`;
+    add(p.error ? Severity.ERROR : p.pending ? Severity.INFO : Severity.OK,
+      p.error ? 'State is not safely saved' : p.pending ? 'State save pending' : 'State saved', `${p.error || ''} ${detail}`);
+  }
   if (!d.running) {
     // A node that failed to *start* is not the same as one nobody started, and
     // the difference is the whole answer. Autostart runs before the window has
@@ -54,7 +61,7 @@ function healthChecks(d, nowMs) {
   if (d.loadError) {
     add(Severity.ERROR, 'State file could not be read',
       `${d.dataFile} did not parse (${d.loadError}), so this node started with an empty store and a new `
-      + 'identity, and has already rewritten that file with the new state. Its earlier writes are '
+      + 'identity. The original is retained for recovery, or saves are blocked if retention failed. Its earlier writes are '
       + 'outranked until anti-entropy refills it from a peer, and every chat line it has said before '
       + 'now reads as coming from a different author.');
   }

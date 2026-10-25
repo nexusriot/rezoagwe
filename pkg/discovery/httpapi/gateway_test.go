@@ -1,8 +1,13 @@
 package httpapi
 
 import (
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -125,6 +130,63 @@ func TestTLSNeedsBothHalves(t *testing.T) {
 	}
 	if _, err := Serve(Config{Addr: "127.0.0.1:0", TLSKey: "key.pem"}, nil); err == nil {
 		t.Fatal("a key without a certificate was accepted")
+	}
+}
+
+func TestInvalidTLSFilesFailStartup(t *testing.T) {
+	srv, err := Serve(Config{Addr: "127.0.0.1:0", TLSCert: t.TempDir() + "/missing.pem", TLSKey: t.TempDir() + "/missing.key"}, nil)
+	if srv != nil {
+		defer srv.Close()
+	}
+	if err == nil {
+		t.Fatal("invalid TLS files reported a successful startup")
+	}
+}
+
+func TestValidTLSServesHTTPS(t *testing.T) {
+	// Reuse the standard test server's local certificate and trust setup.
+	fixture := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer fixture.Close()
+	cert := fixture.TLS.Certificates[0]
+	key, err := x509.MarshalPKCS8PrivateKey(cert.PrivateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	certPath, keyPath := filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
+	if err := os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Certificate[0]}), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: key}), 0600); err != nil {
+		t.Fatal(err)
+	}
+	_, base := guarded(t, Config{TLSCert: certPath, TLSKey: keyPath})
+	resp, err := fixture.Client().Get(base + "/health")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || resp.TLS == nil {
+		t.Fatalf("HTTPS health: status %d, TLS %v", resp.StatusCode, resp.TLS)
+	}
+}
+
+func TestTTLOverflowDoesNotWrite(t *testing.T) {
+	n, base := guarded(t, Config{})
+	for _, ttl := range []string{"9223372037", "18446744074", "9223372036854775807"} {
+		req, _ := http.NewRequest(http.MethodPut, base+"/kv/overflow", strings.NewReader("value"))
+		req.Header.Set("X-Rezoagwe-TTL", ttl)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("TTL %s: status %d", ttl, resp.StatusCode)
+		}
+		if _, ok := n.Get("overflow"); ok {
+			t.Error("invalid TTL mutated the store")
+		}
 	}
 }
 

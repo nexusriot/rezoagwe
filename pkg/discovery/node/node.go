@@ -47,6 +47,7 @@ func (NopEvents) ActivityChanged() {}
 
 // Config describes a node. Zero-valued durations and sizes take their defaults.
 type Config struct {
+	Durability     string
 	BootstrapAddrs []string
 	NodeAddr       string
 	// AdvertiseAddr is the address peers are told to reach this node at. Empty
@@ -165,9 +166,15 @@ func unspecifiedHost(host string) bool {
 
 // Node is a running peer.
 type Node struct {
-	cfg     Config
-	Model   *model.Model
-	Metrics *metrics.Metrics
+	bulk       chan repairJob
+	limitsMu   sync.Mutex
+	peerLimits map[string]pb.StoreLimits
+
+	repairMu    sync.Mutex
+	repairPlans map[string]RepairPlan
+	cfg         Config
+	Model       *model.Model
+	Metrics     *metrics.Metrics
 
 	codec *pb.Codec
 	tr    transport.Transport
@@ -217,9 +224,13 @@ type Node struct {
 	// watchers are live subscriptions to store mutations. The engine already
 	// knew the instant a key changed and told nobody but the UI, which is why
 	// every consumer polled.
-	watchMu  sync.Mutex
-	watchers map[uint64]*Watcher
-	watchSeq uint64
+	watchMu      sync.Mutex
+	watchers     map[uint64]*Watcher
+	watchSeq     uint64
+	eventSeq     uint64
+	watchEpoch   string
+	watchHistory []model.KVEvent
+	watchBytes   int
 
 	// mdns is nil unless LAN discovery is enabled.
 	mdns *mdns.Server
@@ -232,6 +243,9 @@ type Node struct {
 // New builds a node. It does not touch the network until Start.
 func New(cfg Config, ev Events) (*Node, error) {
 	cfg.applyDefaults()
+	if cfg.Durability != "" && cfg.Durability != "snapshot" && cfg.Durability != "journal" && cfg.Durability != "journal-sync" {
+		return nil, fmt.Errorf("invalid durability mode %q", cfg.Durability)
+	}
 	if ev == nil {
 		ev = NopEvents{}
 	}
@@ -249,9 +263,11 @@ func New(cfg Config, ev Events) (*Node, error) {
 		AdvertiseAddr:  cfg.AdvertiseAddr,
 		Nick:           cfg.Nick,
 		DataPath:       cfg.DataPath,
+		Durability:     cfg.Durability,
 	})
 	m.Store.SetLimits(cfg.Limits)
 	n := &Node{
+		bulk: make(chan repairJob, 16), peerLimits: make(map[string]pb.StoreLimits),
 		cfg:        cfg,
 		Model:      m,
 		Metrics:    metrics.New(),
@@ -306,6 +322,8 @@ func (n *Node) Cluster() string { return n.cfg.Cluster }
 // "joining" independently controllable, which is what lets a test wire a
 // cluster up by hand.
 func (n *Node) Start() {
+	n.loop(n.repairWorker)
+	n.loop(n.repairWorker)
 	n.loop(n.packetLoop)
 	n.loop(n.streamLoop)
 	n.loop(n.gossipLoop)
@@ -465,6 +483,7 @@ func (n *Node) helloMessage() pb.Hello {
 	return pb.Hello{
 		From: n.cfg.AdvertiseAddr, Nick: n.Model.Nick(), ID: n.Model.NodeID,
 		ChatSeq: n.Model.ChatSeq(),
+		Limits:  &pb.StoreLimits{MaxValueBytes: n.cfg.Limits.MaxValueBytes, MaxKeys: n.cfg.Limits.MaxKeys},
 	}
 }
 

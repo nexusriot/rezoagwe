@@ -28,8 +28,8 @@ func (n *Node) Set(key, value string, ttl time.Duration) (pb.KVUpdate, error) {
 }
 
 // CompareAndSet writes only if the key currently holds expect. A zero expect
-// requires the key to be absent, which is what turns this store into something
-// you can build a lock or a leader election on. A refused swap returns
+// requires the key to be absent on this replica. It is not a distributed lock:
+// partitioned replicas can both accept a claim. A refused swap returns
 // model.ErrVersionMismatch, which a caller must tell apart from a refusal for
 // size: one means "someone got there first", the other "this will never work".
 func (n *Node) CompareAndSet(key, value string, ttl time.Duration, expect pb.Version) (pb.KVUpdate, error) {

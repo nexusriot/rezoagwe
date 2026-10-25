@@ -88,6 +88,7 @@ class NodeEngine extends EventEmitter {
     super();
     this.config = { ...DEFAULTS, ...config };
     this.dataFile = dataFile || null;
+ this.peerLimits=new Map(); this.repairsActive=0;
     // Injectable so the multi-node tests can run a whole cluster in memory over
     // a lossy network instead of on real sockets.
     this.listen = opts.listen || ((port, o) => UdpTransport.listen(port, o));
@@ -98,7 +99,7 @@ class NodeEngine extends EventEmitter {
     this.seenAt = '';
 
     this.persister = this.dataFile
-      ? new Persister(this.dataFile, { onError: (e) => this.logActivity(`persist failed: ${e.message}`) })
+      ? new Persister(this.dataFile, { durability: this.config.durability, onError: (e) => this.logActivity(`persist failed: ${e.message}`) })
       : null;
 
     let saved = null;
@@ -257,7 +258,7 @@ class NodeEngine extends EventEmitter {
    */
   async stop() {
     const transport = this.transport;
-    if (!transport) return;
+    if (!transport) { if (this.persister) await this.persister.flush(); return; }
     await this.broadcast(Kind.GOODBYE, W.encodeGoodbye({ from: this.addr, nick: this.nick }));
     for (const t of this.timers) clearInterval(t);
     this.timers = [];
@@ -376,7 +377,7 @@ class NodeEngine extends EventEmitter {
   }
 
   helloMessage() {
-    return W.encodeHello({ from: this.addr, nick: this.nick, id: this.nodeId, chatSeq: this.chatSeq });
+    return W.encodeHello({ from: this.addr, nick: this.nick, id: this.nodeId, chatSeq: this.chatSeq, limits:{max_value_bytes:this.store.limits.maxValueBytes,max_keys:this.store.limits.maxKeys} });
   }
 
   helloAllPeers() {
@@ -517,7 +518,7 @@ class NodeEngine extends EventEmitter {
 
   /**
    * Writes only if the key still holds expect; a zero version requires the key to
-   * be absent. This is the primitive a lock or a leader election is built on.
+   * be absent. This protects local optimistic updates; it is not a distributed lock or leader election.
    */
   async compareAndSet(key, value, ttlSeconds, expect) {
     return this.write(key, value, ttlSeconds, expect);
@@ -1078,7 +1079,7 @@ class NodeEngine extends EventEmitter {
    * disagrees, which is exactly the wrong conclusion to draw from packet loss.
    */
   async checkConsistency() {
-    const local = this.store.fingerprint();
+    const local = this.store.fingerprint(W.FINGERPRINT_BUCKETS, 2);
     const peers = [...this.peers.keys()];
     const results = await Promise.all(peers.map((addr) => this.fingerprintPeer(addr, local)));
     results.sort((a, b) => (a.addr < b.addr ? -1 : a.addr > b.addr ? 1 : 0));
@@ -1092,17 +1093,20 @@ class NodeEngine extends EventEmitter {
       peers: results,
       converged: !results.some((p) => p.reachable && !p.agrees),
       unreachable: results.filter((p) => !p.reachable).length,
+      unsupported: results.filter((p) => p.reachable && !p.comparable).length,
+      complete: results.every((p) => p.reachable && p.comparable),
     };
   }
 
   async fingerprintPeer(addr, local) {
     const base = {
       addr, nick: this.nickOf(addr), reachable: false, error: '',
-      keys: 0, tombstones: 0, clock: 0, agrees: false, differingBuckets: [],
+      keys: 0, tombstones: 0, clock: 0, agrees: false, comparable: false, digestVersion: 0, capabilities: [], differingBuckets: [],
       differences: [], moreDifferences: 0,
     };
     const reply = await this.requestFingerprint(addr);
     if (!reply) return { ...base, error: 'no answer' };
+    if (reply.digestVersion !== 2) return { ...base, reachable: true, digestVersion: reply.digestVersion || 0, capabilities: reply.capabilities || [], error: 'unsupported consistency digest: peer needs digest v2' };
     if (reply.buckets.length !== local.buckets.length) {
       // A peer summarising at a different granularity cannot be compared bucket
       // by bucket; say so rather than reporting a false divergence.
@@ -1121,7 +1125,7 @@ class NodeEngine extends EventEmitter {
     return {
       ...base,
       nick: reply.nick || base.nick,
-      reachable: true,
+      reachable: true, comparable: true, digestVersion: reply.digestVersion, capabilities: reply.capabilities || [],
       keys: reply.keys,
       tombstones: reply.tombstones,
       clock: reply.clock,
@@ -1158,7 +1162,7 @@ class NodeEngine extends EventEmitter {
       // neither side is newer, so replication will never resolve it. A peer too
       // old to send a hash sends an empty one, which cannot be compared and so
       // is not treated as a difference.
-      const sameVersion = agreed && !!r.vhash && !!l.vhash && r.vhash !== l.vhash;
+      const sameVersion = agreed && reply.digestVersion === 2 && (r.vhash !== l.vhash || (r.expiresAt || 0) !== (l.expiresAt || 0));
       if (agreed && !sameVersion) continue;
       diffs.push({
         key: l.key,
@@ -1200,7 +1204,7 @@ class NodeEngine extends EventEmitter {
     let conn;
     try {
       conn = await this.transport.dial(peer);
-      const pkt = this.codec.encode(Kind.FINGERPRINT, W.encodeFingerprint({ from: this.addr, buckets }));
+      const pkt = this.codec.encode(Kind.FINGERPRINT, W.encodeFingerprint({ from: this.addr, buckets, digestVersion: 2 }));
       writeFrame(conn, pkt);
       this.metrics.sent(Kind.FINGERPRINT, pkt.length);
 
@@ -1226,8 +1230,10 @@ class NodeEngine extends EventEmitter {
    * A request naming buckets also gets the keys held in them, which is what
    * lets the checker turn a bucket index into a name.
    */
-  fingerprintReply(buckets = []) {
-    const r = this.store.fingerprint();
+  fingerprintReply(buckets = [], digestVersion = 0) {
+    const r = this.store.fingerprint(W.FINGERPRINT_BUCKETS, digestVersion);
+    r.capabilities = ['digest-v2', 'empty-value-hash', 'expiry-metadata'];
+    if (digestVersion === 2) r.digestVersion = 2;
     r.from = this.addr;
     r.nick = this.nick;
     if (buckets.length) r.entries = this.store.bucketEntries(W.FINGERPRINT_BUCKETS, buckets);
@@ -1394,6 +1400,7 @@ class NodeEngine extends EventEmitter {
   }
 
   handleHello(h) {
+ if(h.limits)this.peerLimits.set(h.from,h.limits);else this.peerLimits.delete(h.from);
     this.touchPeer(h.from);
     if (h.nick) this.setPeerNick(h.from, h.nick);
     if (h.id) this.setNodeId(h.id, h.from);
@@ -1484,6 +1491,12 @@ class NodeEngine extends EventEmitter {
 
   /** Ships updates as batches, split on a byte budget so a repair of large values still fits a datagram. */
   async sendUpdates(addr, updates) {
+    if(this.repairsActive>=2){this.logActivity('Repair capacity busy; retry on next anti-entropy round');return;}
+    this.repairsActive++;
+    try { await this.sendRepair(addr,updates); } finally {this.repairsActive--;}
+  }
+  async sendRepair(addr,updates) {
+    const limits=this.peerLimits.get(addr);
     let batch = [];
     let size = 0;
     const flush = async () => {
@@ -1492,10 +1505,12 @@ class NodeEngine extends EventEmitter {
       batch = [];
       size = 0;
       await this.send(addr, Kind.KV_BATCH, payload);
+      await new Promise(resolve=>setImmediate(resolve));
     };
     for (const u of updates) {
       // Rough per-entry overhead for the JSON keys and the version object.
-      const entrySize = u.key.length + (u.value || '').length + 160;
+      if(u.action===KVAction.SET && limits?.max_value_bytes>0 && Buffer.byteLength(u.value||'')>limits.max_value_bytes)continue;
+      const entrySize = Buffer.byteLength(JSON.stringify(W.encodeKVUpdate(u)))+1;
       if (batch.length && (size + entrySize > BATCH_BYTES || batch.length >= BATCH_ENTRIES)) await flush();
       batch.push(u);
       size += entrySize;
@@ -1538,7 +1553,7 @@ class NodeEngine extends EventEmitter {
         // A stream has no datagram ceiling, so this is where a request that
         // named buckets gets the keys in them answered.
         const pkt = this.codec.encode(Kind.FINGERPRINT_REPLY,
-          W.encodeFingerprintReply(this.fingerprintReply(req.buckets)));
+          W.encodeFingerprintReply(this.fingerprintReply(req.buckets, req.digestVersion)));
         writeFrame(conn, pkt);
         this.metrics.sent(Kind.FINGERPRINT_REPLY, pkt.length);
       } else {
@@ -1754,7 +1769,7 @@ class NodeEngine extends EventEmitter {
   }
 
   publishEntries() {
-    this.emit('entries', this.store.entries());
+    this.emit('entries', this.store.page().entries);
     this.publishStatus();
   }
 
@@ -1800,6 +1815,7 @@ class NodeEngine extends EventEmitter {
 
   status() {
     return {
+
       addr: this.addr,
       nick: this.nick,
       nodeId: this.nodeId,
@@ -1851,6 +1867,7 @@ class NodeEngine extends EventEmitter {
       const t = traffic.get(key);
       const view = this.gossipViews.get(key);
       return {
+      replicationWarnings:[...this.peerLimits].filter(([addr,l])=>this.peers.has(addr)&&(l.max_keys!==this.store.limits.maxKeys||l.max_value_bytes!==this.store.limits.maxValueBytes)).map(([addr,l])=>`${addr}: max_value_bytes=${l.max_value_bytes}, max_keys=${l.max_keys}; unequal limits can prevent convergence`),
         addr: peer.addr,
         nick: peer.nick,
         known: true,
@@ -1933,6 +1950,7 @@ class NodeEngine extends EventEmitter {
       activityLines: this.activityLog.length,
       dataFile: this.dataFile || '',
       loadError: this.loadError || '',
+      persistence: this.persister ? { ...this.persister.health } : { enabled: false },
     };
   }
 }

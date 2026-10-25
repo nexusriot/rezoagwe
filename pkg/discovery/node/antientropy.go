@@ -1,6 +1,8 @@
 package node
 
 import (
+	"encoding/json"
+	"fmt"
 	pb "github.com/nexusriot/rezoagwe/pkg/proto"
 )
 
@@ -52,6 +54,9 @@ func (n *Node) antiEntropyRound(target string) {
 func (n *Node) forgetPeerCursor(addr string) {
 	n.aeMu.Lock()
 	delete(n.aeCursors, addr)
+	n.limitsMu.Lock()
+	delete(n.peerLimits, addr)
+	n.limitsMu.Unlock()
 	n.aeMu.Unlock()
 }
 
@@ -94,7 +99,48 @@ func (n *Node) handlePullRequest(body []byte) {
 
 // sendUpdates ships updates as one or more batches, splitting on a byte budget
 // so a repair of large values does not build a datagram nothing can carry.
+type repairJob struct {
+	addr    string
+	updates []pb.KVUpdate
+}
+
 func (n *Node) sendUpdates(addr string, updates []pb.KVUpdate) {
+	select {
+	case <-n.stop:
+		return
+	default:
+	}
+	select {
+	case n.bulk <- repairJob{addr, updates}:
+	default:
+		n.logActivity("repair queue full; deferring updates to next anti-entropy round")
+	}
+}
+func (n *Node) repairWorker() {
+	for {
+		select {
+		case <-n.stop:
+			return
+		case job := <-n.bulk:
+			n.sendRepair(job.addr, job.updates)
+		}
+	}
+}
+func (n *Node) ReplicationWarnings() []string {
+	n.limitsMu.Lock()
+	defer n.limitsMu.Unlock()
+	out := []string{}
+	for addr, l := range n.peerLimits {
+		if l.MaxKeys != n.cfg.Limits.MaxKeys || l.MaxValueBytes != n.cfg.Limits.MaxValueBytes {
+			out = append(out, fmt.Sprintf("%s advertises max_value_bytes=%d, max_keys=%d; unequal limits can prevent convergence", addr, l.MaxValueBytes, l.MaxKeys))
+		}
+	}
+	return out
+}
+func (n *Node) sendRepair(addr string, updates []pb.KVUpdate) {
+	n.limitsMu.Lock()
+	limits := n.peerLimits[addr]
+	n.limitsMu.Unlock()
 	batch := make([]pb.KVUpdate, 0, batchEntries)
 	size := 0
 	flush := func() {
@@ -107,7 +153,11 @@ func (n *Node) sendUpdates(addr string, updates []pb.KVUpdate) {
 	}
 	for _, u := range updates {
 		// Rough per-entry overhead for the JSON keys and the version object.
-		entrySize := len(u.Key) + len(u.Value) + 160
+		if u.Action == pb.KVSet && limits.MaxValueBytes > 0 && len(u.Value) > limits.MaxValueBytes {
+			continue
+		}
+		encoded, _ := json.Marshal(u)
+		entrySize := len(encoded) + 1
 		if len(batch) > 0 && (size+entrySize > batchBytes || len(batch) >= batchEntries) {
 			flush()
 		}

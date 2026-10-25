@@ -1,15 +1,31 @@
 # Rezoagwe — Roadmap
 
-Prioritized backlog. Items are numbered by **global priority** (1 = do next)
-and grouped into thematic tiers. Effort is a rough T-shirt size: **S** ≈ a few
-hours, **M** ≈ about a day, **L** ≈ multi-day.
+Open work, implemented foundations and release history. Numbered items use stable
+IDs, not a promise of implementation order. The recommended next steps below set
+the current suggested order. Effort estimates are rough: **S** is small, **M** is
+moderate, and **L** involves substantial design or cross-platform work.
 
-This complements the *Known limitations & next steps* table in
-[DESIGN.md](DESIGN.md#11-known-limitations--next-steps); each open item notes
-the code it touches.
+Current behavior and limitations are documented in [MANUAL.md](MANUAL.md) and
+[DESIGN.md](DESIGN.md). Suggestions below are not implemented unless explicitly
+marked otherwise.
 
-Item 1 is next. The three Tier 0 items that sat ahead of it have shipped — see
-*0.4.7* below — so the numbering is once again the whole backlog.
+## Working-tree additions (October 25, 2026)
+
+Guarded repair and restore, digest negotiation, persistence health/profiles,
+journal modes, resumable Go watches, bounded desktop browsing and bounded repair
+sends are implemented but not assigned a new release version. Operating details
+are in the [manual](MANUAL.md#13-repair-previews-and-cluster-profiles).
+
+## Recommended next steps
+
+| Order | ID | Feature | Benefit | Effort |
+|---|---|---|---|---|
+| 1 | 13 | Storage-limit controls and preflight checks | Explain incompatible replica limits before users hit refusals | S |
+| 2 | 15 | Automatic watch reconnect | Recover brief outages without custom client retry loops | M |
+| 3 | 14 | Android restore preview | Bring selected, guarded restore to the phone | M |
+| 4 | 16 | Inspectable restore jobs | Show progress and permit safe cancellation of large restores | M |
+| 5 | 17 | Journal inspection and recovery tool | Diagnose corrupt/missing files without hand-editing state | M |
+| 6 | 20 | Per-peer repair scheduling | Keep slow peers from monopolizing the repair budget | M |
 
 ## Shipped
 
@@ -752,32 +768,24 @@ there: the store thinks in per-key versions and carries a Lamport clock.
 **Notes:** touches `model/kvstore.go`, §3.2 and §5, and all three ports
 together. The merge rule per type belongs in DESIGN §5 before any code.
 
-### 2. Leases and locks — **M**
-`POST /lock/{name}?ttl=30` → a token, `POST /lock/{name}/renew`,
-`DELETE /lock/{name}`, and `GET /election/{name}` for the current holder.
-**Why:** the README has said since 0.1.0 that compare-and-swap is "enough to
-build a lock or a leader election on". Nobody wants to build it. It is CAS plus
-TTL plus a renewal loop, and it turns two primitives into something usable.
-**Notes:** must be documented as a *local*-CAS lease, not a consensus lock —
-two partitions will each grant it.
+### 2. Leases and locks — product decision required
+A local CAS-plus-TTL lease can simplify single-replica workflows, but two
+partitions can both grant it. A globally exclusive lock needs a consensus
+coordinator plus fencing enforced by the protected resource. Decide which product
+is wanted before adding endpoints; do not label a local lease a distributed lock.
+The existing CAS semantics are already documented and tested.
 
-### 3. Resumable watch — **M**
-A cursor a client can reconnect from, so a dropped connection does not mean a
-re-read of the whole store.
-**Why:** `?watch=1` ships, and its one honest weakness is that a subscriber
-which falls behind loses events. It is *told* how many (§16), which is the
-difference between a gap and a lie, but the events are gone — the queue is
-bounded because publishing runs on a replication path and must not block.
-**Notes:** needs a bounded per-node event log to resume from, which is most of
-the append-only-log work at 9. Do that first or do them together.
+### 3. Resumable watch — implemented in working tree
+Bounded in-memory replay, process/prefix-bound SSE cursors, and explicit resnapshot
+signals now ship in the Go gateway/client. History does not survive restart.
+See [watch operation](MANUAL.md#resumable-go-watches). Automatic reconnect and
+restart-surviving event history remain open as items 15 and 21.
 
-### 4. Watch in the Kotlin and JavaScript ports — **S**
-The Go engine raises mutation events from the store; the other two raise
-nothing.
-**Why:** the phone and the desktop app both poll their own engines on a timer,
-which is the thing this round removed from the Go node. **Notes:** both have
-the same single-file store with the same mutation sites, so it is the same
-change twice, with no wire implications at all.
+### 4. Mutation subscriptions in Kotlin and JavaScript — **M**
+Expose prefix-scoped per-key events with source, version, expiry and explicit
+bounded-buffer overflow signals. Existing entry-list/UI notifications are not a
+public resumable mutation-stream contract. Define ordering and cancellation first;
+add replay parity only if a network/watch API is introduced for these ports.
 
 ## Tier 2 — Reach
 
@@ -815,21 +823,17 @@ with signed Hellos would close that.
 
 ## Tier 4 — Scale
 
-### 9. Append-only log + snapshot — **M**
-Coalescing bounded how *often* the store is rewritten; it is still rewritten
-whole each time. A log with a periodic snapshot makes a flush proportional to
-what changed, and shrinks the 250 ms a hard kill can lose.
-**Why, with a number:** `BenchmarkState` is 8.4 ms and 11.5 MB allocated at
-100k keys, paid per flush, to persist whatever changed in the last 250 ms.
-**Notes:** `writeAtomic` also never fsyncs. The rename is atomic for a reader,
-which is what the comment claims and all it claims, but a power loss can still
-lose a write the filesystem reported as durable — worth fixing in the same
-pass, and cheap. `-snapshot-dir` (§18) is the backup story and is not this:
-it answers "the disk is gone", not "the process was killed".
+### 9. Append-only log + snapshot — implemented in working tree
+Optional journal and journal-sync modes now exist in Go, Electron and Android,
+with checksummed deltas, checkpointing, tail recovery and persistence health.
+Explicit durable PUT acknowledgements are available in the Go gateway/client/CLI.
+See [journal operation](MANUAL.md#journal-durability). Inspection/recovery tooling
+and a disk-backed store remain open as items 17 and 22.
 
 ### 10. Merkle-tree digests — **M**
-Replace the flat per-key digest with a tree over key ranges, so reconciliation
-costs `O(log n)` rounds instead of walking the keyspace.
+Replace the flat per-key digest with a tree over key ranges, so small differences
+can be located without scanning every key. Transfer cost still depends on how
+much state differs; do not assume logarithmic cost for a full-cluster rebuild.
 **Why:** a cluster with a million keys still converges slowly after a long
 partition. **Notes:** deliberately below the data-model work now that the
 budget clamp and per-peer cursors have fixed the convergence problem clusters
@@ -858,15 +862,97 @@ keys, where 16 ms becomes 160 and the lateness rule (§13) starts firing.
 correctly off the gossip path: the consistency check is operator-driven. It
 would need the tree too before it could run on a timer.
 
-### 11. Backpressure on repair traffic — **S**
-`maxPush`/`maxPull` bound one round, but nothing rate-limits successive rounds;
-a node that falls far behind gets a burst per gossip tick.
+### 11. Backpressure on repair traffic — foundation implemented
+Two active repair sends are allowed per node; Go also queues up to 16 jobs.
+Oversized values are skipped using advertised peer limits, and deferred work is
+retried by anti-entropy. This does not impose byte-rate limits, per-peer fairness,
+or limits on every state-sync and ordinary write path. Remaining scheduling work
+is item 20.
 
 ### 12. Structured logging — **S**
 `-logfile` writes logrus text. JSON lines with the node id would make a
 multi-node run greppable.
 
 ---
+
+## Additional proposals and carried-forward gaps
+
+### 13. Storage-limit controls and preflight checks — **S**, recommended
+Expose maximum keys/value bytes in desktop and Android Settings. Before applying,
+show local entries that exceed the proposed limits and peers advertising different
+limits. Done when settings survive restart, diagnostics explain incompatibility,
+and changing a limit never silently deletes data.
+
+### 14. Android restore preview — **M**, recommended
+Add file-picker backup inspection, before/after values, selected-key apply and
+explicit cross-cluster/delete-missing options. Reuse exact-state guards and keep
+selection across rotation. Done when concurrent edits are skipped and the result
+separates local application from peer convergence; the current Import remains a
+version-merge operation, not a guarded restore wizard.
+
+### 15. Automatic watch reconnect — **M**, recommended
+Add a client helper with cancellation, bounded exponential backoff with jitter,
+and tracking of the last fully applied cursor. On `resnapshot_required`, replace
+the baseline explicitly and report the reset. Done when disconnect/replay tests
+show no silent gaps and retries stop immediately when cancelled. Keep the current
+manual `WatchFrom` API available.
+
+### 16. Inspectable restore jobs — **M**, recommended
+Offer progress, a per-key result view, cancellation between keys, and exportable
+results for restores larger than one selected batch. A cancelled operation must
+report already-applied writes; it must not promise rollback. Keep jobs bound to
+the source profile and reject expired previews. Saved review files may contain
+values, so make their storage/export explicit.
+
+### 17. Journal inspection and recovery tool — **M**, recommended
+Provide read-only checkpoint/WAL validation, checksum/offset diagnostics and a
+list of intact records. An explicit recovery action should write a separate
+candidate state and preserve originals. Done when missing checkpoints and corrupt
+complete records produce actionable errors, with no claim that delta-only state
+can reconstruct omitted checkpoint values.
+
+### 18. Stable key pagination and indexed search — **M**
+Add cursor-based listing with a defined snapshot/revision lifetime and expiry
+response, plus a key index to avoid sorting the full store for each page. Keep
+full values on demand. Done when concurrent inserts/deletes cannot silently skip
+or repeat keys within a valid snapshot and retained snapshots have byte/time caps.
+The current offset pages remain live views.
+
+### 19. Replication acknowledgement options — **L**, design first
+Allow callers to request explicit durable acknowledgement from a stated number
+of replicas, reporting which peers acknowledged and what a timeout means. Define
+membership, retry/idempotency and version semantics before implementation. An
+acknowledged write is still not consensus, linearizability or exclusive ownership.
+Do not overload the existing local `-durable` guarantee.
+
+### 20. Per-peer repair scheduling and transfer budgets — **M**, recommended
+Add fair per-peer queues, byte-rate limits and cancellation/timeouts, with queue
+age, deferred bytes and throughput diagnostics. Extend budgeting to state sync
+where needed. Done when a slow peer cannot starve other peers and heartbeat
+latency remains bounded in repeatable constrained-bandwidth tests.
+
+### 21. Watch replay across restarts — **L**, optional
+Persist an event log with stable cursor epochs, prefix scope and retention caps.
+Design it separately from the state WAL, which stores coalesced deltas rather than
+every event. Done when checkpoint/rotation/restart tests preserve resume semantics
+and expired cursors still trigger an explicit resnapshot.
+
+### 22. Disk-backed storage — **L**, scale-dependent
+Move key/value ownership out of the always-resident map when measured datasets
+justify it. Preserve versions, tombstones, expiry and guarded writes; define
+migration and rollback paths. Benchmark memory use and latency against the
+current full-state checkpoint path before selecting a storage engine.
+
+## Release-readiness work carried forward
+
+- Fault-injection and physical power-loss testing for journal/checkpoint fsync
+  behavior on supported filesystems; automated unit tests do not establish this.
+- Sustained large-store, network-partition and slow-peer load runs with measured
+  memory, convergence time and heartbeat latency.
+- Android device walkthroughs for durability settings, profile switches,
+  import/export and future restore UI, including rotation and process recreation.
+
+These are validation tasks, not unimplemented product guarantees.
 
 ## Dropped
 

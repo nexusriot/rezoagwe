@@ -5,6 +5,7 @@ const path = require('node:path');
 const fs = require('node:fs');
 
 const { Runtime } = require('./core/runtime');
+const restorePlans = new (require('./core/restore').RestorePlans)();
 const { healthChecks, asReport } = require('./core/diagnostics');
 const { StoreRefusal } = require('./core/refusal');
 const { version, versionZero } = require('./proto/wire');
@@ -159,6 +160,7 @@ function registerIpc() {
 
   handle('app:snapshot', () => ({ ...runtime.snapshot(), version: app.getVersion() }));
   handle('app:settings', () => runtime.settings);
+  handle('app:previewCluster', (cluster) => runtime.previewCluster(cluster));
   handle('app:applySettings', (partial) => runtime.applySettings(partial));
 
   handle('node:start', () => runtime.startNode());
@@ -169,6 +171,8 @@ function registerIpc() {
     writer: runtime.engine.writerName(h.version.node),
   })));
 
+  handle('kv:list', (req) => runtime.engine.store.page(req || {}));
+  handle('kv:get', (key) => runtime.engine.store.entry(key));
   handle('kv:set', async ({ key, value, ttlSeconds, guard, expect }) => {
     // A guarded write is a compare-and-swap against the version the form was
     // opened with; a guard on a new key means "only if absent", which is the
@@ -221,6 +225,15 @@ function registerIpc() {
   });
 
   handle('store:export', () => exportStore().then(() => ({ ok: true })));
+  handle('restore:open', async (options) => {
+    const {canceled,filePaths}=await dialog.showOpenDialog(win,{title:'Preview backup restore',properties:['openFile'],filters:[{name:'JSON',extensions:['json']}]});
+    if(canceled||!filePaths.length)return null;
+    const stat=fs.statSync(filePaths[0]);if(stat.size>64*1024*1024)throw new Error('Backup exceeds 64 MiB; split the backup for larger exports');
+    return restorePlans.preview(runtime.engine,JSON.parse(fs.readFileSync(filePaths[0],'utf8')),options||{});
+  });
+  handle('restore:page', (id,offset)=>restorePlans.page(runtime.engine,id,offset));
+  handle('restore:detail',(id,key)=>restorePlans.detail(runtime.engine,id,key));
+  handle('restore:apply',(id,keys)=>runtime.withProfile(engine=>restorePlans.apply(engine,id,keys)));
   handle('store:import', (asLocalWrites) => importStore(asLocalWrites).then(() => ({ ok: true })));
 }
 
@@ -347,7 +360,42 @@ function runSelfTest() {
         return r;
       })()`);
 
+      // Exercise the large-key workflow through the real renderer and IPC.
+      for (let i=0;i<201;i++) runtime.engine.store.write(`verify-${String(i).padStart(3,'0')}`, 'x'.repeat(2000));
+      runtime.engine.publishEntries();
+      raw.browsing = await win.webContents.executeJavaScript(`(async () => {
+        window.__test.show('keys');
+        await new Promise(r=>setTimeout(r,200));
+        const filter=document.querySelector('#pane-main .toolbar input');
+        filter.value='verify-';filter.dispatchEvent(new Event('input',{bubbles:true}));
+        await new Promise(r=>setTimeout(r,350));
+        const rows=document.querySelectorAll('#pane-main .kv-row').length;
+        [...document.querySelectorAll('#pane-main .kv-row button')].find(b=>b.textContent==='Edit').click();
+        await new Promise(r=>setTimeout(r,150));
+        const fullLength=document.querySelector('#modal-root textarea').value.length;
+        [...document.querySelectorAll('#modal-root button')].find(b=>b.textContent==='Cancel').click();
+        [...document.querySelectorAll('#pane-main button')].find(b=>b.textContent==='Next').click();
+        await new Promise(r=>setTimeout(r,200));
+        return {rows,fullLength,lastPage:document.querySelector('#pane-main .kv-key')?.textContent};
+      })()`);
+      runtime.engine.store.remove('verify-200');runtime.engine.publishEntries();
+      raw.pageAfterDelete = await win.webContents.executeJavaScript(`(async () => {
+        await new Promise(r=>setTimeout(r,250));
+        const key=document.querySelector('#pane-main .kv-key')?.textContent;
+        [...document.querySelectorAll('#pane-main .kv-row button')].find(b=>b.textContent==='Delete').click();
+        return key;
+      })()`);
+      runtime.engine.store.write('verify-000','peer-newer');runtime.engine.publishEntries();
+      raw.deleteRefusal = await win.webContents.executeJavaScript(`(async () => {
+        [...document.querySelectorAll('#modal-root button')].find(b=>b.textContent==='Delete').click();
+        await new Promise(r=>setTimeout(r,250));
+        return document.querySelector('#pane-main .notice')?.textContent;
+      })()`);
       const problems = [];
+      if(raw.browsing.rows>30 || raw.browsing.rows<1)problems.push('key rows are not virtualized');
+      if(raw.browsing.fullLength!==2000)problems.push('Edit did not fetch the full value');
+      if(raw.browsing.lastPage!=='verify-200'||raw.pageAfterDelete!=='verify-000')problems.push('key page recovery failed');
+      if(!raw.deleteRefusal?.includes('Delete refused')||runtime.engine.store.get('verify-000')!=='peer-newer')problems.push('guarded delete lost a concurrent write or hid the refusal');
       if (raw.bridge !== 'object') problems.push('preload bridge missing');
       if (!raw.status) problems.push('status header did not render');
       for (const [name, count] of Object.entries(raw.panes)) {

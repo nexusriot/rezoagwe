@@ -91,6 +91,7 @@ private fun ConsistencyCard(report: NodeEngine.ConsistencyReport) {
             val name = if (p.nick.isNotEmpty()) "${p.nick} (${p.addr})" else p.addr
             val detail = when {
                 !p.reachable -> "did not answer: ${p.error}"
+                p.error.isNotEmpty() -> "comparison unavailable: ${p.error}"
                 p.agrees -> "agrees — ${p.keys} keys, clock ${p.clock}"
                 // No names means the peer could not be asked for them — an
                 // older node, or a second round that failed. The ranges are

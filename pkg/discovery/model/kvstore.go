@@ -115,6 +115,7 @@ var (
 	ErrTooLarge        = errors.New("value exceeds the configured size limit")
 	ErrTooManyKeys     = errors.New("store is at its configured key limit")
 	ErrVersionMismatch = errors.New("key does not hold the expected version")
+	ErrClockExhausted  = errors.New("version counter exhausted")
 	// ErrUnshippable is not a configured limit but a fact about the protocol:
 	// a value this large cannot be replicated by any path. The datagram
 	// refuses it on size, the stream refuses the frame, and a state sync
@@ -167,11 +168,16 @@ func representable(key, value string, checkValue bool) error {
 // WriteOptions modifies a write. The zero value is an unconditional write with
 // no expiry.
 type WriteOptions struct {
+	ExpectMissing bool // exact absence, including absence of a tombstone (restore guard)
+	// AfterCounter stamps explicit repairs after the peer clocks observed before applying.
+	AfterCounter uint64
+	// ExpectUpdate guards a repair against any change since its preview, including tombstones.
+	ExpectUpdate *pb.KVUpdate
 	// ExpiresAt is an absolute unix second; 0 means the key never expires.
 	ExpiresAt int64
 	// Expect turns the write into a compare-and-swap: it only lands if the
 	// current version matches. A zero Version requires the key to be absent
-	// (or tombstoned/expired), which is what makes "claim this lock" work.
+	// (or tombstoned/expired) on this replica. It does not coordinate peers.
 	Expect *pb.Version
 }
 
@@ -193,6 +199,7 @@ const (
 // been invisible for as long as the configured age, so an event for it would
 // tell a watcher a key was "deleted" long after the delete it is still holding.
 type KVEvent struct {
+	ID     string        `json:"id,omitempty"`
 	Source KVEventSource `json:"source"`
 	Update pb.KVUpdate   `json:"update"`
 }
@@ -413,6 +420,20 @@ func (kv *KVStore) mutate(key, value string, remove bool, opt WriteOptions) (pb.
 	}
 	kv.mu.Lock()
 	now := kv.now().Unix()
+	if opt.ExpectMissing {
+		if _, ok := kv.store[key]; ok {
+			kv.mu.Unlock()
+			return pb.KVUpdate{}, ErrVersionMismatch
+		}
+	}
+	if opt.ExpectUpdate != nil {
+		cur, ok := kv.store[key]
+		expected := opt.ExpectUpdate
+		if !ok || !cur.Version.Equal(expected.Version) || cur.Deleted != (expected.Action == pb.KVDelete) || cur.Value != expected.Value || cur.ExpiresAt != expected.ExpiresAt {
+			kv.mu.Unlock()
+			return pb.KVUpdate{}, ErrVersionMismatch
+		}
+	}
 	if !remove {
 		if err := kv.admitLocked(key, value, now); err != nil {
 			kv.mu.Unlock()
@@ -433,7 +454,15 @@ func (kv *KVStore) mutate(key, value string, remove bool, opt WriteOptions) (pb.
 			return pb.KVUpdate{}, ErrVersionMismatch
 		}
 	}
-	kv.clock++
+	nextClock := kv.clock
+	if opt.AfterCounter > nextClock {
+		nextClock = opt.AfterCounter
+	}
+	if nextClock == ^uint64(0) {
+		kv.mu.Unlock()
+		return pb.KVUpdate{}, ErrClockExhausted
+	}
+	kv.clock = nextClock + 1
 	ver := pb.Version{Counter: kv.clock, Node: kv.node}
 	e := kvEntry{Value: value, Version: ver, Deleted: remove, ExpiresAt: opt.ExpiresAt}
 	if remove {
@@ -724,6 +753,11 @@ func (kv *KVStore) Reconcile(d pb.Digest, maxPush, maxPull int) (push []pb.KVUpd
 // Tombstones are included: two replicas that disagree about whether a key is
 // deleted have diverged just as much as two that disagree about its value.
 func (kv *KVStore) Fingerprint(buckets int) pb.FingerprintReply {
+	return kv.FingerprintVersion(buckets, 0)
+}
+
+// FingerprintVersion preserves legacy digests unless version 2 is requested.
+func (kv *KVStore) FingerprintVersion(buckets, version int) pb.FingerprintReply {
 	if buckets <= 0 {
 		buckets = pb.FingerprintBuckets
 	}
@@ -747,6 +781,9 @@ func (kv *KVStore) Fingerprint(buckets int) pb.FingerprintReply {
 		fmt.Fprintf(h, "%d/%s/%t", e.Version.Counter, e.Version.Node, e.Deleted)
 		h.Write([]byte{0})
 		h.Write([]byte(e.valueHash()))
+		if version == 2 {
+			fmt.Fprintf(h, "\x00%d", e.ExpiresAt)
+		}
 		var sum [sha256.Size]byte
 		copy(sum[:], h.Sum(nil))
 
@@ -801,7 +838,7 @@ func (kv *KVStore) BucketEntries(buckets int, want []int) []pb.KeyVersion {
 			continue
 		}
 		out = append(out, pb.KeyVersion{
-			Key: k, Version: e.Version, Deleted: e.Deleted, ValueHash: e.valueHash(),
+			Key: k, Version: e.Version, Deleted: e.Deleted, ValueHash: e.valueHash(), ExpiresAt: e.ExpiresAt,
 		})
 	}
 	kv.mu.RUnlock()

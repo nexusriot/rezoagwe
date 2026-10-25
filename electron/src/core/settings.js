@@ -5,6 +5,7 @@ const path = require('node:path');
 
 const DEFAULTS = Object.freeze({
   nick: 'desktop',
+  durability: 'snapshot',
   port: 3137,
   advertiseHost: '',
   seeds: ':9999',
@@ -38,6 +39,7 @@ function sanitize(s, fallback = DEFAULTS) {
   const bootstrapPort = Number(s.bootstrapPort);
   const ttl = Number(s.tombstoneTtlSec);
   return {
+    durability: ['snapshot','journal','journal-sync'].includes(s.durability) ? s.durability : fallback.durability,
     nick: String(s.nick ?? '').trim() || fallback.nick,
     port: Number.isInteger(port) && port > 0 && port <= 65535 ? port : fallback.port,
     advertiseHost: String(s.advertiseHost ?? '').trim(),
@@ -82,6 +84,7 @@ function refusals(s, fallback = DEFAULTS) {
 
 function toNodeConfig(s) {
   return {
+    ...(s.durability && s.durability!=='snapshot' ? {durability:s.durability} : {}),
     advertiseHost: s.advertiseHost,
     port: s.port,
     nick: s.nick,
@@ -98,6 +101,7 @@ function toBootstrapConfig(s) {
 
 /** Which settings are baked into a running socket or codec, and so need a restart to take effect. */
 function nodeNeedsRestart(previous, updated) {
+  if(previous.durability!==updated.durability)return true;
   return previous.port !== updated.port
     || previous.psk !== updated.psk
     || previous.cluster !== updated.cluster
