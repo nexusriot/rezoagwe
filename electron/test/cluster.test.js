@@ -1278,3 +1278,25 @@ test('an unknown source that went quiet stops being reported', async () => {
 
   await engine.stop();
 });
+
+// The Go fix, mirrored: hearsay is not passed on, so a dead address dies out.
+// It used to circulate for as long as the cluster ran — each node evicted it
+// and taught it to the others first. Found when a tablet moved from IPv6 to
+// IPv4 and this client kept sending to its old address minutes later.
+test('a dead address is not kept alive by gossip', async () => {
+  const fast = { gossipIntervalMs: 15, heartbeatIntervalMs: 15, evictThresholdMs: 150 };
+  const c = cluster();
+  try {
+    const nodes = [await c.make('a', fast), await c.make('b', fast), await c.make('c', fast)];
+    for (const n of nodes) for (const m of nodes) n.addPeer(m.addr);
+    const dead = '127.0.0.1:3999';
+    nodes[0].addPeer(dead);
+    await new Promise((r) => setTimeout(r, 900));
+    for (const n of nodes) {
+      assert.deepEqual(n.peerAddrs().sort(), nodes.filter((m) => m !== n).map((m) => m.addr).sort(),
+        `${n.addr} holds ${JSON.stringify(n.peerAddrs())}`);
+    }
+  } finally {
+    await c.stopAll();
+  }
+});

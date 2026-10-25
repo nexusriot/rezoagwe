@@ -9,7 +9,7 @@ const { Codec, DecodeError, DecodeException, keyFingerprint } = require('../prot
 const { UdpTransport, PacketTooLargeError } = require('../net/udp');
 const { StoreRefusal } = require('./refusal');
 const { writeFrame, readFrame, frameWithLength } = require('../net/framing');
-const { normalizeAddr, validPeerAddr, localIpv4, splitHostPort, sameHost } = require('../net/addr');
+const { normalizeAddr, validPeerAddr, joinHostPort, localIpv4, splitHostPort, sameHost } = require('../net/addr');
 const { KvStore } = require('./kvstore');
 const { ChatTracker, ChatOutcome } = require('./chatseq');
 const { Metrics } = require('./metrics');
@@ -153,6 +153,9 @@ class NodeEngine extends EventEmitter {
     // peers the random target happened to pick, so covering the whole store
     // against any single peer took as many wraps as there were peers.
     this.aeCursors = new Map();
+    // When a packet carrying each address as its sender last arrived.
+    // lastSeenMs cannot answer that: adopting a peer from gossip stamps it too.
+    this.heardAtMs = new Map();
     // This node's own broadcast counter; chatGaps follows everyone else's.
     this.chatSeq = 0;
     this.chatGaps = new ChatTracker();
@@ -185,7 +188,7 @@ class NodeEngine extends EventEmitter {
 
   /** The address peers are told to reach this node at. */
   get addr() {
-    return `${this.config.advertiseHost || localIpv4()}:${this.config.port}`;
+    return joinHostPort(this.config.advertiseHost || localIpv4(), this.config.port);
   }
 
   /**
@@ -265,6 +268,7 @@ class NodeEngine extends EventEmitter {
     this.transport = null;
     await transport.close();
     this.peers.clear();
+    this.heardAtMs.clear();
     this.idToAddr.clear();
     this.idBindings.clear();
     this.impostors.clear();
@@ -404,8 +408,21 @@ class NodeEngine extends EventEmitter {
 
   touchPeer(addr) {
     if (!addr || this.isSelf(addr)) return;
+    this.heardAtMs.set(addr, this.now());
     const existing = this.peers.get(addr);
     if (existing) this.peers.set(addr, { ...existing, lastSeenMs: this.now() });
+  }
+
+  /**
+   * The peer list worth passing on: peers this node has heard from itself
+   * within the eviction window. Repeating hearsay is how a dead address
+   * outlived its owner — each node evicted it but taught it to the others
+   * first, so it circulated for as long as the cluster ran (found when a
+   * tablet moved from IPv6 to IPv4 and its old address stayed on every graph).
+   */
+  gossipPeers() {
+    const cutoff = this.now() - this.config.evictThresholdMs;
+    return this.peerAddrs().filter((a) => (this.heardAtMs.get(a) || 0) > cutoff);
   }
 
   setPeerNick(addr, nick) {
@@ -419,6 +436,8 @@ class NodeEngine extends EventEmitter {
 
   removePeer(addr) {
     this.peers.delete(addr);
+    this.peerLimits.delete(addr);
+    this.heardAtMs.delete(addr);
     for (const [id, mapped] of [...this.idToAddr]) if (mapped === addr) this.idToAddr.delete(id);
     for (const [id, b] of [...this.idBindings]) if (b.addr === addr) this.idBindings.delete(id);
     this.publishPeers();
@@ -1697,7 +1716,7 @@ class NodeEngine extends EventEmitter {
   async gossipTo(target) {
     if (!target) return;
     await this.send(target, Kind.PEER_GOSSIP, W.encodePeerGossip({
-      from: this.addr, nick: this.nick, id: this.nodeId, peers: this.peerAddrs(),
+      from: this.addr, nick: this.nick, id: this.nodeId, peers: this.gossipPeers(),
     }));
     await this.antiEntropyRound(target);
     // And the same for chat, which has no digest of its own.
@@ -1715,6 +1734,8 @@ class NodeEngine extends EventEmitter {
 
   evictTick() {
     const now = this.now();
+    // Strangers are heard too; their stamps go once they are no use.
+    for (const [a, t] of this.heardAtMs) if (!this.peers.has(a) && now - t > this.config.evictThresholdMs) this.heardAtMs.delete(a);
     const stale = [...this.peers.values()].filter((p) => now - p.lastSeenMs > this.config.evictThresholdMs);
     for (const peer of stale) {
       this.removePeer(peer.addr);
@@ -1867,7 +1888,6 @@ class NodeEngine extends EventEmitter {
       const t = traffic.get(key);
       const view = this.gossipViews.get(key);
       return {
-      replicationWarnings:[...this.peerLimits].filter(([addr,l])=>this.peers.has(addr)&&(l.max_keys!==this.store.limits.maxKeys||l.max_value_bytes!==this.store.limits.maxValueBytes)).map(([addr,l])=>`${addr}: max_value_bytes=${l.max_value_bytes}, max_keys=${l.max_keys}; unequal limits can prevent convergence`),
         addr: peer.addr,
         nick: peer.nick,
         known: true,
@@ -1917,6 +1937,13 @@ class NodeEngine extends EventEmitter {
       .sort((a, b) => (a.addr < b.addr ? -1 : 1));
 
     return {
+      // Store limits each peer advertised on its heartbeat that differ from
+      // ours: a key one side holds and the other refuses can never converge.
+      replicationWarnings: [...this.peerLimits]
+        .filter(([addr, l]) => this.peers.has(addr)
+          && (l.max_keys !== this.store.limits.maxKeys || l.max_value_bytes !== this.store.limits.maxValueBytes))
+        .sort(([a], [b]) => (a < b ? -1 : 1))
+        .map(([addr, l]) => `${addr}: max_value_bytes=${l.max_value_bytes}, max_keys=${l.max_keys}; unequal limits can prevent convergence`),
       addr: this.addr,
       nick: this.nick,
       nodeId: this.nodeId,

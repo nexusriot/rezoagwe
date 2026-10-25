@@ -128,6 +128,18 @@ data class NodeStatus(
     val connected: Boolean get() = peers > 0
 }
 
+data class ImportOutcome(val applied: Int, val total: Int, val cluster: String) {
+    /**
+     * What the Settings screen says once an import ran. It used to say nothing
+     * — and leave the previous failure on screen beside it — so a merge from
+     * another cluster, which can outrank every replica here, went unremarked.
+     */
+    fun message(currentCluster: String): String {
+        val base = "Imported $applied of $total entr${if (total == 1) "y" else "ies"} (merge by version)"
+        return if (cluster.isNotEmpty() && cluster != currentCluster) "$base, from cluster $cluster, not $currentCluster" else base
+    }
+}
+
 @Serializable
 data class ExportFile(
     val node: String = "",
@@ -161,6 +173,7 @@ class NodeEngine(
     private val codec = Codec(config.psk, config.cluster)
     private var transport: UdpTransport? = null
     private val jobs = mutableListOf<Job>()
+    @Volatile private var joinJob: Job? = null
     private val lock = Any()
 
     private val peers = LinkedHashMap<String, Peer>()
@@ -196,6 +209,9 @@ class NodeEngine(
     // peers the random target happened to pick, so covering the whole store
     // against any single peer took as many wraps as there were peers.
     private val aeCursors = HashMap<String, String>()
+    // When a packet carrying each address as its sender last arrived. lastSeenMs
+    // cannot answer that: adopting a peer from gossip stamps it too.
+    private val heardAtMs = HashMap<String, Long>()
     private var startedAtMs = 0L
     private var nick: String = config.nick
 
@@ -220,7 +236,7 @@ class NodeEngine(
     private val _topology = MutableStateFlow(Topology())
     val topology: StateFlow<Topology> = _topology.asStateFlow()
 
-    val addr: String get() = "${config.advertiseHost.ifEmpty { localIpv4() }}:${config.port}"
+    val addr: String get() = joinHostPort(config.advertiseHost.ifEmpty { localIpv4() }, config.port)
 
     /**
      * The source address a rendezvous service last observed this node arriving
@@ -289,9 +305,16 @@ class NodeEngine(
         jobs += scope.launch { heartbeatLoop() }
         jobs += scope.launch { evictLoop() }
         jobs += scope.launch { sweepLoop() }
-        scope.launch { join() }
+        joinJob = scope.launch { join() }
         publishStatus()
     }
+
+    /**
+     * Blocks until the join start() launched has run. A test that adds peers
+     * by hand needs it: a join that lands afterwards state-syncs from one of
+     * them, and quietly converges whatever divergence the test set up.
+     */
+    internal fun awaitJoined() = kotlinx.coroutines.runBlocking { joinJob?.join() }
 
     fun stop() {
         val tr = synchronized(lock) { transport } ?: return
@@ -312,6 +335,7 @@ class NodeEngine(
             impostorAddrs.clear()
             rendezvousAddrs.clear()
             gossipViews.clear()
+            heardAtMs.clear()
         }
         publishPeers()
         publishStatus()
@@ -403,6 +427,18 @@ class NodeEngine(
 
     private fun peerAddrs(): List<String> = synchronized(lock) { peers.keys.toList() }
 
+    /**
+     * The peer list worth passing on: peers this node has heard from itself
+     * within the eviction window. Repeating hearsay is how a dead address
+     * outlived its owner — each node evicted it, but taught it to the others
+     * first, so it circulated for as long as the cluster ran (found when this
+     * tablet moved from IPv6 to IPv4 and its old address stayed on every graph).
+     */
+    private fun gossipPeers(): List<String> = synchronized(lock) {
+        val cutoff = System.currentTimeMillis() - config.evictThresholdMs
+        peers.keys.filter { (heardAtMs[it] ?: 0L) > cutoff }
+    }
+
     private fun helloMessage() = Hello(from = addr, nick = nick, id = nodeId, chatSeq = chatSeq, limits = com.nexusriot.rezoagwe.proto.StoreLimits(config.limits.maxValueBytes, config.limits.maxKeys))
 
     private fun helloAllPeers() = broadcast(Kind.HELLO, helloMessage())
@@ -425,8 +461,10 @@ class NodeEngine(
 
     private fun touchPeer(peerAddr: String) {
         if (peerAddr.isEmpty() || isSelf(peerAddr)) return
+        val now = System.currentTimeMillis()
         synchronized(lock) {
-            peers[peerAddr]?.let { peers[peerAddr] = it.copy(lastSeenMs = System.currentTimeMillis()) }
+            heardAtMs[peerAddr] = now
+            peers[peerAddr]?.let { peers[peerAddr] = it.copy(lastSeenMs = now) }
         }
     }
 
@@ -447,6 +485,8 @@ class NodeEngine(
             // accumulates one per address it has ever spoken to, and a peer that
             // returns resumes a walk from before it left.
             aeCursors.remove(peerAddr)
+            peerLimits.remove(peerAddr)
+            heardAtMs.remove(peerAddr)
         }
         publishPeers()
     }
@@ -580,13 +620,13 @@ class NodeEngine(
         return update
     }
 
-    fun export(): String = WireJson.encodeToString(
-        ExportFile(
-            node = addr,
-            cluster = config.cluster,
-            exported_at = System.currentTimeMillis() / 1000,
-            entries = store.updates(),
-        )
+    fun export(): String = WireJson.encodeToString(exportFile())
+
+    fun exportFile(): ExportFile = ExportFile(
+        node = addr,
+        cluster = config.cluster,
+        exported_at = System.currentTimeMillis() / 1000,
+        entries = store.updates(),
     )
 
     /**
@@ -594,7 +634,10 @@ class NodeEngine(
      * last-write-wins rule — a restore; re-stamping every entry as a fresh local
      * write forces it to win — a seed.
      */
-    fun import(data: String, asLocalWrites: Boolean): Int {
+    fun import(data: String, asLocalWrites: Boolean): Int = importFile(data, asLocalWrites).applied
+
+    /** An import, with what the screen needs to say about it afterwards. */
+    fun importFile(data: String, asLocalWrites: Boolean): ImportOutcome {
         val file = WireJson.decodeFromString<ExportFile>(data)
         var applied = 0
         for (u in file.entries) {
@@ -616,7 +659,7 @@ class NodeEngine(
             logActivity("imported $applied entries")
             publishEntries()
         }
-        return applied
+        return ImportOutcome(applied = applied, total = file.entries.size, cluster = file.cluster)
     }
 
     // ---- chat -----------------------------------------------------------
@@ -1605,7 +1648,7 @@ class NodeEngine(
      */
     fun gossipTo(target: String) {
         if (target.isEmpty()) return
-        send(target, Kind.PEER_GOSSIP, PeerGossip(from = addr, nick = nick, id = nodeId, peers = peerAddrs()))
+        send(target, Kind.PEER_GOSSIP, PeerGossip(from = addr, nick = nick, id = nodeId, peers = gossipPeers()))
         antiEntropyRound(target)
         // And the same for chat, which has no digest of its own.
         pullChatGaps()
@@ -1626,6 +1669,8 @@ class NodeEngine(
             delay(config.heartbeatIntervalMs)
             val now = System.currentTimeMillis()
             val stale = synchronized(lock) {
+                // Strangers are heard too; their stamps go once they are no use.
+                heardAtMs.entries.removeAll { it.key !in peers && now - it.value > config.evictThresholdMs }
                 peers.values.filter { now - it.lastSeenMs > config.evictThresholdMs }
             }
             for (peer in stale) {
@@ -1812,8 +1857,9 @@ class NodeEngine(
             }
             .sortedBy { it.addr }
 
+        val current = synchronized(lock) { peers.keys.toSet() }
         return NodeDiagnostics(
-            replicationWarnings = peerLimits.filter { (_, l) -> l.maxValueBytes != config.limits.maxValueBytes || l.maxKeys != config.limits.maxKeys }.map { (addr,l) -> "$addr: max_value_bytes=${l.maxValueBytes}, max_keys=${l.maxKeys}; unequal limits can prevent convergence" },
+            replicationWarnings = peerLimits.toSortedMap().filter { (a, l) -> a in current && (l.maxValueBytes != config.limits.maxValueBytes || l.maxKeys != config.limits.maxKeys) }.map { (addr,l) -> "$addr: max_value_bytes=${l.maxValueBytes}, max_keys=${l.maxKeys}; unequal limits can prevent convergence" },
             addr = addr,
             nick = nick,
             nodeId = nodeId,
@@ -1858,10 +1904,18 @@ class NodeEngine(
             val host = addr.substring(0, i)
             val port = addr.substring(i + 1).toIntOrNull() ?: return false
             if (port !in 1..65535) return false
+            // An IPv6 literal must be bracketed, as Go's net.SplitHostPort
+            // insists: "2a00::1:3137" has no single reading, and a Go peer
+            // refuses it, so a node advertising it is unreachable to them.
+            if (host.contains(':') && !(host.startsWith("[") && host.endsWith("]"))) return false
             // An empty host is allowed: it is what a node bound to the wildcard
             // address advertises, and it resolves to the loopback interface.
             return host.none { it.isWhitespace() }
         }
+
+        /** "host:port", bracketing an IPv6 literal the way every peer parses it. */
+        fun joinHostPort(host: String, port: Int): String =
+            if (host.contains(':') && !host.startsWith("[")) "[$host]:$port" else "$host:$port"
 
         /** Canonicalises an address so a node recognises the aliases of its own. */
         fun normalizeAddr(addr: String): String {

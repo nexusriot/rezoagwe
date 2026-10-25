@@ -146,7 +146,9 @@ class NodeEngineTest {
         val a = engine(freePort(), "alice")
         val b = engine(freePort(), "bob")
         a.start()
+        a.awaitJoined()
         b.start()
+        b.awaitJoined()
         a.addPeer(b.addr)
         b.addPeer(a.addr)
         return a to b
@@ -277,13 +279,19 @@ class NodeEngineTest {
         val bPort = freePort()
         val b = engine(bPort, "bob")
         a.start()
+        a.awaitJoined()
 
         // b is not listening yet, so this write is lost to the network.
         a.addPeer("127.0.0.1:$bPort")
         a.set("lost", "value")
 
+        // b is deliberately not told about a: start() launches a join that
+        // state-syncs from a random known peer, and if that ran after an
+        // addPeer here it delivered the key with nothing pulled — a race the
+        // assertion below lost about one run in six. A digest is answered
+        // whoever sent it, so the repair needs no membership.
         b.start()
-        b.addPeer(a.addr)
+        b.awaitJoined()
         assertNull("precondition: the peer must not have the write", b.store["lost"])
 
         a.antiEntropyRound(b.addr)
@@ -300,7 +308,10 @@ class NodeEngineTest {
         b.set("only-b", "2")
 
         a.start()
+
+        a.awaitJoined()
         b.start()
+        b.awaitJoined()
         a.addPeer(b.addr)
         b.addPeer(a.addr)
 
@@ -364,6 +375,7 @@ class NodeEngineTest {
 
         val joiner = engine(freePort(), "joiner")
         joiner.start()
+        joiner.awaitJoined()
         joiner.addPeer(a.addr)
         joiner.requestStateFrom(a.addr)
 
@@ -376,6 +388,7 @@ class NodeEngineTest {
     fun foreignClusterTrafficIsRejected() {
         val a = engine(freePort(), "alice")
         a.start()
+        a.awaitJoined()
 
         val intruder = NodeEngine(
             NodeConfig(advertiseHost = "127.0.0.1", port = freePort(), cluster = "someone-elses-cluster"),
@@ -384,6 +397,7 @@ class NodeEngineTest {
         )
         engines += intruder
         intruder.start()
+        intruder.awaitJoined()
         intruder.addPeer(a.addr)
         intruder.set("injected", "evil")
 
@@ -400,10 +414,12 @@ class NodeEngineTest {
 
         val a = engine(freePort(), "alice", seeds = listOf("127.0.0.1:$bootPort"))
         a.start()
+        a.awaitJoined()
         waitFor("alice to register") { boot.roster.value.any { it.addr == a.addr } }
 
         val b = engine(freePort(), "bob", seeds = listOf("127.0.0.1:$bootPort"))
         b.start()
+        b.awaitJoined()
         waitFor("bob to learn about alice from bootstrap") { b.peerList.value.any { it.addr == a.addr } }
         assertFalse(
             "the roster must not contain the requester",
@@ -447,6 +463,7 @@ class NodeEngineTest {
         )
         engines += wrong
         wrong.start()
+        wrong.awaitJoined()
 
         waitFor("the rendezvous to report an address") { wrong.advertiseMismatch().isNotEmpty() }
         val observed = wrong.advertiseMismatch()
@@ -478,6 +495,7 @@ class NodeEngineTest {
 
         val a = engine(freePort(), "alice", seeds = listOf("127.0.0.1:$bootPort"))
         a.start()
+        a.awaitJoined()
         waitFor("alice to register") { boot.roster.value.any { it.addr == a.addr } }
 
         assertEquals("", a.advertiseMismatch())
@@ -513,10 +531,12 @@ class NodeEngineTest {
 
         val a = engine(freePort(), "alice", seeds = listOf("127.0.0.1:$bootPort"))
         a.start()
+        a.awaitJoined()
         waitFor("alice to register") { boot.roster.value.any { it.addr == a.addr } }
 
         val b = engine(freePort(), "bob", seeds = listOf("127.0.0.1:$bootPort"))
         b.start()
+        b.awaitJoined()
         waitFor("bob to learn alice from the roster") { b.peerList.value.any { it.addr == a.addr } }
 
         waitFor("the join to be announced") {
@@ -529,6 +549,7 @@ class NodeEngineTest {
     fun submitHandlesCommands() {
         val a = engine(freePort(), "alice")
         a.start()
+        a.awaitJoined()
 
         a.submit("/set colour blue")
         assertEquals("blue", a.store["colour"])
@@ -556,12 +577,24 @@ class NodeEngineTest {
     fun gossipTeachesUsLinksBetweenOtherNodes() {
         val a = engine(freePort(), "alice")
         val b = engine(freePort(), "bob")
-        val carol = "127.0.0.1:${freePort()}"
+        val c = engine(freePort(), "carol")
         a.start()
+        a.awaitJoined()
         b.start()
+        b.awaitJoined()
+        c.start()
+        c.awaitJoined()
+        val carol = c.addr
         a.addPeer(b.addr)
         b.addPeer(a.addr)
+        // Bob only passes on peers he has heard from himself, so carol speaks first.
         b.addPeer(carol)
+        c.addPeer(b.addr)
+        c.gossipTo(b.addr)
+        a.gossipTo(b.addr)
+        waitFor("bob to hear carol and alice") {
+            b.diagnostics().peers.count { (it.addr == carol || it.addr == a.addr) && it.packetsIn > 0 } == 2
+        }
 
         b.gossipTo(a.addr)
         waitFor("alice to learn the link between bob and carol") {
@@ -580,12 +613,21 @@ class NodeEngineTest {
     fun aPeerListedByNobodyWeTalkToStaysIndirect() {
         val a = engine(freePort(), "alice")
         val b = engine(freePort(), "bob")
-        val ghost = "127.0.0.1:${freePort()}"
+        val g = engine(freePort(), "ghost")
         a.start()
+        a.awaitJoined()
         b.start()
+        b.awaitJoined()
+        g.start()
+        g.awaitJoined()
+        val ghost = g.addr
         a.addPeer(b.addr)
         b.addPeer(a.addr)
+        // Bob passes on only peers he has heard, so the ghost speaks to him first.
         b.addPeer(ghost)
+        g.addPeer(b.addr)
+        g.gossipTo(b.addr)
+        waitFor("bob to hear the ghost") { b.diagnostics().peers.any { it.addr == ghost && it.packetsIn > 0 } }
         b.gossipTo(a.addr)
 
         // Alice adopts every gossiped address, so the ghost becomes a peer of hers
@@ -637,6 +679,7 @@ class NodeEngineTest {
         val port = freePort()
         val victim = engine(port, "alice")
         victim.start()
+        victim.awaitJoined()
         val stranger = NodeEngine(
             NodeConfig(advertiseHost = "127.0.0.1", port = freePort(), nick = "intruder", psk = "wrong-key"),
             dataFile = null,
@@ -644,6 +687,7 @@ class NodeEngineTest {
         )
         engines += stranger
         stranger.start()
+        stranger.awaitJoined()
         stranger.addPeer("127.0.0.1:$port")
         stranger.set("hello", "there")
 
@@ -691,12 +735,14 @@ class NodeEngineTest {
     fun antiEntropyRepairsAnOversizedValue() {
         val a = engine(freePort(), "alice")
         a.start()
+        a.awaitJoined()
         val big = "y".repeat(MAX_DATAGRAM_PAYLOAD + 1)
         a.set("big", big)
 
         // b only learns of a afterwards, so it never saw the write go out.
         val b = engine(freePort(), "bob")
         b.start()
+        b.awaitJoined()
         a.addPeer(b.addr)
         b.addPeer(a.addr)
 
@@ -712,6 +758,7 @@ class NodeEngineTest {
     fun anOversizedValueWithNoReachablePeerIsASendError() {
         val a = engine(freePort(), "alice")
         a.start()
+        a.awaitJoined()
         a.addPeer("127.0.0.1:${freePort()}") // nothing bound: both paths fail
 
         a.set("big", "z".repeat(MAX_DATAGRAM_PAYLOAD + 1))
@@ -731,6 +778,7 @@ class NodeEngineTest {
     fun aConsistencyReportNamesTheDivergingKey() {
         val a = engine(freePort(), "alice")
         a.start()
+        a.awaitJoined()
         for (k in listOf("alpha", "beta", "gamma", "delta")) a.set(k, "shared")
 
         // b is built from a's updates directly, then given one of its own, so
@@ -738,6 +786,7 @@ class NodeEngineTest {
         // partition between two real sockets.
         val b = engine(freePort(), "bob")
         b.start()
+        b.awaitJoined()
         a.store.updates().forEach { b.store.apply(it) }
         b.set("beta", "only-on-b")
 
@@ -764,7 +813,9 @@ class NodeEngineTest {
         val a = engine(freePort(), "alice")
         val b = engine(freePort(), "bob")
         a.start()
+        a.awaitJoined()
         b.start()
+        b.awaitJoined()
         b.set("orphan", "never-arrived")
         a.addPeer(b.addr)
         b.addPeer(a.addr)
@@ -785,7 +836,9 @@ class NodeEngineTest {
         val a = engine(freePort(), "alice")
         val b = engine(freePort(), "bob")
         a.start()
+        a.awaitJoined()
         b.start()
+        b.awaitJoined()
         a.set("doomed", "v")
         a.store.updates().forEach { b.store.apply(it) }
         b.delete("doomed")
@@ -805,7 +858,9 @@ class NodeEngineTest {
         val a = engine(freePort(), "alice")
         val b = engine(freePort(), "bob")
         a.start()
+        a.awaitJoined()
         b.start()
+        b.awaitJoined()
         a.set("k", "v")
         a.store.updates().forEach { b.store.apply(it) }
         a.addPeer(b.addr)
@@ -859,12 +914,14 @@ class NodeEngineTest {
     fun aJoinerReceivesEveryCopyOfALineSaidTwice() {
         val a = engine(freePort(), "alice")
         a.start()
+        a.awaitJoined()
         a.sendChat("ok")
         a.sendChat("ok")
         waitFor("the writer to hold both") { a.chat.value.count { it.text == "ok" } == 2 }
 
         val joiner = engine(freePort(), "carol")
         joiner.start()
+        joiner.awaitJoined()
         joiner.addPeer(a.addr)
         joiner.requestStateFrom(a.addr)
         waitFor("the joiner to receive both copies") {
@@ -941,7 +998,9 @@ class NodeEngineTest {
         val a = engine(freePort(), "a", seeds = listOf(seed))
         val rendezvous = engine(seedPort, "rendezvous")
         a.start()
+        a.awaitJoined()
         rendezvous.start()
+        rendezvous.awaitJoined()
 
         val roster = Codec("", Codec.DEFAULT_CLUSTER).encode(
             Kind.BOOTSTRAP_ROSTER,
@@ -976,6 +1035,7 @@ class NodeEngineTest {
     fun `an unknown source that went quiet stops being reported`() {
         val e = engine(freePort(), "a")
         e.start()
+        e.awaitJoined()
 
         // The body claims one address while the packet comes from another,
         // which is what the list exists to catch.
@@ -1071,7 +1131,9 @@ class NodeEngineTest {
         val a = engine(freePort(), "alice")
         val b = engine(freePort(), "bob")
         a.start()
+        a.awaitJoined()
         b.start()
+        b.awaitJoined()
 
         val shared = Version(100, "00000000-dead-beef")
         a.store.apply(KVUpdate(action = KVAction.SET, key = "split", value = "written-by-a", version = shared))

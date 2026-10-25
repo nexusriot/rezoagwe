@@ -1,6 +1,6 @@
 # Rezoagwe — a step-by-step manual
 
-Everything here was run against **0.4.8** on a real LAN: two Go nodes and a Go
+Everything here was run against **0.5.0** on a real LAN: two Go nodes and a Go
 rendezvous on a laptop, the Electron desktop client beside them, and the Android
 app on a tablet, all in one cluster. Where a step has a trap in it, the trap is
 written down next to the step rather than left for you to find.
@@ -147,6 +147,18 @@ If you get it wrong, you do not have to guess: **Diag** (`D` in the TUI,
 
 It names the value to use, because the rendezvous saw it.
 
+> **IPv6.** The Go node and the Android app work over IPv6; write the literal in
+> brackets wherever a port follows it (`-advertise [2a00:db8::23]:3137`,
+> `-bootstrap [2a00:db8::10]:9999`). On Android, type the advertise host bare —
+> the app adds the brackets. The **desktop client is IPv4 only**: its sockets
+> are `udp4`, and its Settings refuse an IPv6 advertise host with a message
+> rather than publish an address it does not listen on. If the host uses IPv6
+> privacy addresses (`use_tempaddr=2`, the default on most desktops), bind
+> `-node` to the address you advertise, not to `[::]`: from a wildcard the
+> kernel answers from a *temporary* address, so peers never see packets from
+> the advertised one and report this node as "never answered" while
+> replication works.
+
 > **On a LAN with no rendezvous at all**, `-mdns` finds peers over multicast
 > DNS. It does not work across subnets and is commonly blocked on guest Wi-Fi;
 > a `-bootstrap` seed works where multicast does not.
@@ -209,7 +221,7 @@ A node with no terminal, driven over HTTP:
 | `/kv` | GET | list keys; `prefix`, `limit`, `offset`, `preview`; `watch=1` opens SSE |
 | `/kv/{key}` | GET PUT DELETE | read, write, delete one key |
 | `/history/{key}` | GET | the recorded versions of a key |
-| `/chat` | GET POST | read the conversation, say a line |
+| `/chat` | GET POST | read the conversation, say a line (the POST body is the line itself, as plain text) |
 | `/export` `/import` | GET POST | the whole store out and back |
 | `/snapshot` | POST | write a snapshot now |
 | `/repair` | POST | make this node's copy of named keys win |

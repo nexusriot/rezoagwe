@@ -180,7 +180,7 @@ class BootstrapServer(
         // of this address means anything — which is why the rule that consumes
         // it compares hosts. Formatted exactly as the datagram path formats
         // Packet.from, so a reader cannot tell which transport carried it.
-        val from = conn.inetAddress?.hostAddress?.let { "$it:${conn.port}" } ?: ""
+        val from = conn.inetAddress?.hostAddress?.let { NodeEngine.joinHostPort(it, conn.port) } ?: ""
         handle(frame.kind, String(frame.body), from) { reply ->
             writeFrame(conn.getOutputStream(), reply)
         }

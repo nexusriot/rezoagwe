@@ -430,11 +430,55 @@ run does not chase them: the send failures are the radio, not the app — plain
 shortly after a restart is only a gossip tick that has not come round yet, since
 each node gossips to one random peer per interval.
 
+### 2026-10-25 — IPv6, a moved address, and the new profile tools
+
+The same PRITOM M10 with Go `alice` (snapshot) and `bob` (`journal-sync`), a Go
+rendezvous and the desktop client, cluster `hwlab`. The run began by accident on
+an **IPv6-only** network — the tablet's 5 GHz link got no DHCPv4 lease — and then
+moved to 192.168.18.x. The happy path held on both: writes from all three
+implementations everywhere, chat from each, TTL expiry, delete with tombstones,
+and `/consistency` on digest v2 agreeing from every side. So did the new
+features: the cluster-switch confirmation surviving a rotation (and *Cancel*
+leaving the node where it was), a switch to `journal-sync` surviving
+`am force-stop` with identity and keys, a half-typed key dialog surviving a
+rotation both ways, and a Settings export that Go imports as-is.
+
+What it found, each fixed in every implementation that had it and each with a
+test that fails without the fix:
+
+* **The app advertised an unbracketed IPv6 address.** `2a00:…:add9:3137` has no
+  single reading, Go refuses it, so the tablet saw the cluster and the cluster
+  never saw it. Its own address, packet sources and roster sources are now
+  bracketed, and the unbracketed form is refused at the door as Go refuses it.
+  The desktop, whose sockets are IPv4, now refuses an IPv6 advertise host by name.
+* **A dead address circulated forever.** After the move, the tablet's IPv6
+  address stayed on every node's graph, "joined" and "left" the chat every few
+  seconds, and every send to it failed — because gossip repeated hearsay. A node
+  now passes on only peers it has heard from itself (DESIGN §4.2).
+* **The desktop never warned that replica limits differ, and this app warned
+  for ever.** The desktop built the list inside each peer row, where no finding
+  read it; once moved it would have warned about every phone, because this
+  encoder omits zero fields and sends `"limits":{}`. Here, a departed peer kept
+  its warning for the life of the node.
+* **Import and export said nothing.** A merge from another cluster — which can
+  outrank every replica — went unremarked, with the previous file's *Import
+  failed* still on screen beside it. Both now report what they did and name a
+  foreign cluster, and the export file is named for its cluster and time.
+* **Diag printed "Last save: 1792946341473 ms UTC".** Now an ISO time, as on the
+  desktop; Go's report had the same raw epoch.
+
+Recorded, not changed: join-time state sync carries the sender's system lines,
+so a joiner reads other nodes' "X joined" — including about itself; and a Go
+node bound to `[::]` on a host with IPv6 privacy addresses answers from a
+temporary address, so peers report it as "never answered" while it replicates
+(MANUAL §3 says to bind the advertised address).
+
 ## Known gaps
 
 * The battery cost of the 10 s gossip tick is still unmeasured; **Diag**
   reports whether Doze applies and links to the exemption setting.
-* No import/export UI yet; the engine supports both.
+* Import is merge-by-version only; *seed as local writes* and the guarded restore
+  preview are desktop and Go features (ROADMAP item 14).
 * **Settings** does not expose the store limits (`maxValueBytes`, `maxKeys`).
   They are `NodeConfig` options and enforced by the engine against a peer as
   well as a local writer, but only the Go node has flags for them.

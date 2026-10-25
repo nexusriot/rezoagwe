@@ -7,7 +7,10 @@ import com.nexusriot.rezoagwe.core.NodeEngine
 import com.nexusriot.rezoagwe.core.Refusal
 import com.nexusriot.rezoagwe.core.WriteOptions
 import com.nexusriot.rezoagwe.proto.FINGERPRINT_BUCKETS
+import com.nexusriot.rezoagwe.proto.Hello
 import com.nexusriot.rezoagwe.proto.MAX_REPLICABLE_VALUE_BYTES
+import com.nexusriot.rezoagwe.proto.StoreLimits
+import com.nexusriot.rezoagwe.proto.WireJson
 import com.nexusriot.rezoagwe.proto.KVAction
 import com.nexusriot.rezoagwe.proto.KVUpdate
 import com.nexusriot.rezoagwe.proto.Version
@@ -44,14 +47,14 @@ class ParityTest {
 
     private fun freePort(): Int = ServerSocket(0).use { it.localPort }
 
-    private fun engine(nick: String, limits: Limits = Limits()): NodeEngine {
+    private fun engine(nick: String, limits: Limits = Limits(), heartbeatMs: Long = 3_600_000): NodeEngine {
         val e = NodeEngine(
             NodeConfig(
                 advertiseHost = "127.0.0.1",
                 port = freePort(),
                 nick = nick,
                 gossipIntervalMs = 3_600_000,
-                heartbeatIntervalMs = 3_600_000,
+                heartbeatIntervalMs = heartbeatMs,
                 evictThresholdMs = 3_600_000,
                 sweepIntervalMs = 3_600_000,
                 limits = limits,
@@ -313,4 +316,88 @@ class ParityTest {
         }
     }
 
+    // A peer's advertised limits outlived the peer: removePeer dropped its
+    // cursor and its id bindings but not its limits, and the warning list was
+    // not filtered to current peers, so a node that left kept its "limits
+    // differ" finding for the life of this one.
+    @Test
+    fun `a departed peer takes its limits warning with it`() {
+        // Limits travel on the heartbeat, so a's has to come round.
+        val a = engine("a", Limits(maxKeys = 5), heartbeatMs = 50)
+        val b = engine("b")
+        a.addPeer(b.addr)
+        b.addPeer(a.addr)
+        val deadline = System.currentTimeMillis() + 5_000
+        while (b.diagnostics().replicationWarnings.isEmpty() && System.currentTimeMillis() < deadline) Thread.sleep(10)
+        assertEquals(1, b.diagnostics().replicationWarnings.size)
+        b.forgetPeer(a.addr)
+        assertEquals(emptyList<String>(), b.diagnostics().replicationWarnings)
+    }
+
+    // The encoder omits defaults, so "no limits" goes out as `"limits":{}`.
+    // Every reader must take the missing fields as zero; the desktop once read
+    // them as absent and reported every phone as a limits mismatch.
+    @Test
+    fun `no limits are advertised as an empty object`() {
+        val hello = Hello(from = "a", limits = StoreLimits())
+        assertTrue(WireJson.encodeToString(Hello.serializer(), hello).contains("\"limits\":{}"))
+    }
+
+    // Found on an IPv6-only Wi-Fi: the app advertised "2a00:…:add9:3137",
+    // which no Go peer can parse, so it saw the cluster and the cluster never
+    // saw it. Both its own address and every packet source are bracketed now,
+    // and the unbracketed form is refused at the door as Go refuses it.
+    @Test
+    fun `an IPv6 host is bracketed wherever an address is built`() {
+        assertEquals("[2a00:f3c::1]:3137", NodeEngine.joinHostPort("2a00:f3c::1", 3137))
+        assertEquals("[2a00:f3c::1]:3137", NodeEngine.joinHostPort("[2a00:f3c::1]", 3137))
+        assertEquals("[fe80::1%wlan0]:3137", NodeEngine.joinHostPort("fe80::1%wlan0", 3137))
+        assertEquals("10.0.0.2:3137", NodeEngine.joinHostPort("10.0.0.2", 3137))
+        assertFalse(NodeEngine.validPeerAddr("2a00:f3c::1:3137"))
+        assertTrue(NodeEngine.validPeerAddr("[2a00:f3c::1]:3137"))
+        assertTrue(NodeEngine.validPeerAddr(":3137"))
+        val e = NodeEngine(NodeConfig(advertiseHost = "2a00:f3c::1", port = 3137), dataFile = null, scope = scope)
+        assertEquals("[2a00:f3c::1]:3137", e.addr)
+        assertNotNull(com.nexusriot.rezoagwe.net.UdpTransport.parseAddr(e.addr))
+    }
+
+    @Test
+    fun `a peer advertising an IPv6 address is adopted under it`() {
+        val a = engine("a")
+        val b = NodeEngine(
+            NodeConfig(advertiseHost = "::1", port = freePort(), nick = "b",
+                gossipIntervalMs = 3_600_000, heartbeatIntervalMs = 3_600_000,
+                evictThresholdMs = 3_600_000, sweepIntervalMs = 3_600_000),
+            dataFile = null, scope = scope,
+        ).also { engines += it; it.start() }
+        b.addPeer(a.addr)
+        b.gossipTo(a.addr)
+        val deadline = System.currentTimeMillis() + 5_000
+        while (a.peerList.value.none { it.addr == b.addr } && System.currentTimeMillis() < deadline) Thread.sleep(10)
+        assertEquals(listOf(b.addr), a.peerList.value.map { it.addr })
+    }
+
+    // The Go fix, mirrored: a hearsay peer is not passed on, so a dead address
+    // dies out instead of circulating (found on the tablet after an IPv6 to
+    // IPv4 move: its old address was on every node's graph minutes later).
+    @Test
+    fun `a dead address is not kept alive by gossip`() {
+        val nodes = (1..3).map { i ->
+            NodeEngine(
+                NodeConfig(advertiseHost = "127.0.0.1", port = freePort(), nick = "n$i",
+                    gossipIntervalMs = 20, heartbeatIntervalMs = 20,
+                    evictThresholdMs = 200, sweepIntervalMs = 3_600_000),
+                dataFile = null, scope = scope,
+            ).also { engines += it; it.start(); it.awaitJoined() }
+        }
+        for (n in nodes) for (m in nodes) n.addPeer(m.addr)
+        val dead = "127.0.0.1:" + freePort()
+        nodes[0].addPeer(dead)
+        Thread.sleep(1_500)
+        for (n in nodes) {
+            val held = n.peerList.value.map { it.addr }
+            assertFalse("${n.addr} still holds $dead: $held", dead in held)
+            assertEquals(2, held.size)
+        }
+    }
 }

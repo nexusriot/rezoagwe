@@ -214,3 +214,12 @@ test('applying a refused value warns before it stores anything', async () => {
   assert.match(warnings[0], /Settings: node port 0 is not a usable port/);
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+// The Android port said nothing at all after an import from another cluster;
+// both clients now name it.
+test('an import names a cluster other than this one', () => {
+  const { importMessage } = require('../src/core/settings');
+  assert.equal(importMessage(1, 'hwlab', 'hwlab'), 'Imported 1 entry');
+  assert.equal(importMessage(3, 'otherlab', 'hwlab'), 'Imported 3 entries, from cluster otherlab, not hwlab');
+  assert.equal(importMessage(0, undefined, 'hwlab'), 'Imported 0 entries');
+});

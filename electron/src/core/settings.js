@@ -34,6 +34,8 @@ function seedList(seeds) {
  * nothing on screen to show why. Paste is exactly the source of one: copying a
  * key out of a terminal picks up the trailing newline.
  */
+const ipv6Literal = (h) => String(h ?? '').includes(':');
+
 function sanitize(s, fallback = DEFAULTS) {
   const port = Number(s.port);
   const bootstrapPort = Number(s.bootstrapPort);
@@ -42,7 +44,9 @@ function sanitize(s, fallback = DEFAULTS) {
     durability: ['snapshot','journal','journal-sync'].includes(s.durability) ? s.durability : fallback.durability,
     nick: String(s.nick ?? '').trim() || fallback.nick,
     port: Number.isInteger(port) && port > 0 && port <= 65535 ? port : fallback.port,
-    advertiseHost: String(s.advertiseHost ?? '').trim(),
+    // The sockets are udp4: an IPv6 host would be advertised to a cluster
+    // that then sends to an address this node never listens on.
+    advertiseHost: ipv6Literal(s.advertiseHost) ? fallback.advertiseHost : String(s.advertiseHost ?? '').trim(),
     seeds: String(s.seeds ?? '').trim(),
     psk: String(s.psk ?? '').trim(),
     cluster: String(s.cluster ?? '').trim() || fallback.cluster,
@@ -78,6 +82,9 @@ function refusals(s, fallback = DEFAULTS) {
     out.push(`bootstrap port ${s.bootstrapPort} is not a usable port, kept ${fallback.bootstrapPort}`);
   }
   if (!String(s.nick ?? '').trim()) out.push(`nickname cannot be blank, kept ${fallback.nick}`);
+  if (ipv6Literal(s.advertiseHost)) {
+    out.push(`advertise host ${String(s.advertiseHost).trim()} is IPv6; the desktop client speaks IPv4 only, kept ${fallback.advertiseHost || 'the detected LAN address'}`);
+  }
   if (!String(s.cluster ?? '').trim()) out.push(`cluster name cannot be blank, kept ${fallback.cluster}`);
   return out;
 }
@@ -151,7 +158,18 @@ class SettingsStore {
   }
 }
 
+/**
+ * What an import says it did. A merge from another cluster can outrank every
+ * replica here — export and import are the documented way to migrate between
+ * clusters, so it is allowed, but it is named rather than passed over.
+ */
+function importMessage(applied, fromCluster, currentCluster) {
+  const base = `Imported ${applied} entr${applied === 1 ? 'y' : 'ies'}`;
+  return fromCluster && fromCluster !== currentCluster ? `${base}, from cluster ${fromCluster}, not ${currentCluster}` : base;
+}
+
 module.exports = {
+  importMessage,
   refusals,
   DEFAULTS,
   SettingsStore,

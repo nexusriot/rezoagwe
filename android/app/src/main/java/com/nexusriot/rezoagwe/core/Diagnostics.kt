@@ -147,6 +147,18 @@ data class NodeDiagnostics(
  * Pure on purpose: every rule here is a claim about the protocol ("auth failures
  * mean a key mismatch"), and a claim like that is worth a test.
  */
+/**
+ * The saved-state line, worded as the desktop words it. It printed the raw
+ * epoch ("Last save: 1792946341473 ms UTC") and a leading space whenever there
+ * was no error to put in front of it.
+ */
+internal fun persistenceDetail(p: PersistenceHealth): String {
+    val last = if (p.lastSuccessMs > 0) java.time.Instant.ofEpochMilli(p.lastSuccessMs).toString() else "never"
+    val detail = "Mode: ${p.mode}; durable: ${p.durable}; Last save: $last; pending: ${p.pending}; " +
+        "recovery: ${p.recoveryFile.ifEmpty { "none" }}"
+    return if (p.error.isEmpty()) detail else "${p.error} $detail"
+}
+
 fun healthChecks(
     d: NodeDiagnostics,
     nowMs: Long,
@@ -158,7 +170,7 @@ fun healthChecks(
     if (p.enabled) checks += HealthCheck(
         if (p.error.isNotEmpty()) Severity.ERROR else if (p.pending) Severity.INFO else Severity.OK,
         if (p.error.isNotEmpty()) "State is not safely saved" else if (p.pending) "State save pending" else "State saved",
-        "${p.error} Mode: ${p.mode}; durable: ${p.durable}; Last save: ${p.lastSuccessMs} ms UTC; pending: ${p.pending}; recovery: ${p.recoveryFile.ifEmpty { "none" }}",
+        persistenceDetail(p),
     )
     val m = d.metrics
 

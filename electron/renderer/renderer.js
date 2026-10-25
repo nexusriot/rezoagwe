@@ -294,8 +294,8 @@ function restoreDialog(){
       for(const item of page.items){
         const box=h('input',{type:'checkbox',checked:chosen.has(item.key),onchange:e=>{if(e.target.checked)chosen.add(item.key);else chosen.delete(item.key);}});
         body.append(h('div',{class:'history-entry'},h('label',{},box,` ${item.change}: ${S.displayKey(item.key)}`),
-          h('div',{text:`Current: ${item.current?S.displayValue(item.current.value):'(absent)'}`}),
-          h('div',{text:`Backup: ${S.displayValue(item.desired.value||'')} · expires ${item.desired.expiresAt||'never'}`}),
+          h('div',{text:`Current: ${S.describeRestoreSide(item.current)}`}),
+          h('div',{text:`Backup: ${S.describeRestoreSide(item.desired)}`}),
           h('button',{class:'btn tiny',text:'Compare full values',onclick:async()=>{
             const full=await api.restore.detail(page.id,item.key);
             const detail=h('textarea',{class:'restore-detail',readOnly:true,value:JSON.stringify(full,null,2)});body.append(detail);detail.focus();
@@ -307,7 +307,9 @@ function restoreDialog(){
     modal.append(h('h2',{text:'Restore selected backup keys'}),h('label',{},missing,' Delete local keys absent from backup'),h('label',{},cross,' Allow a backup from another cluster'),
       h('button',{class:'btn',text:'Choose backup and preview',onclick:async()=>{try{page=await api.restore.open({deleteMissing:missing.checked,allowCrossCluster:cross.checked});chosen.clear();draw();}catch(e){message.textContent=e.message;}}}),message,body,
       h('div',{class:'actions'},h('button',{class:'btn',text:'Cancel',onclick:close}),h('button',{class:'btn primary',text:'Restore selected keys',onclick:async()=>{
-        if(!page||!chosen.size)return;
+        // Selections clear after an apply, so a second press used to do nothing at all.
+        if(!page){message.textContent='Choose a backup to preview first.';return;}
+        if(!chosen.size){message.textContent='Select at least one key to restore.';return;}
         try{const result=await api.restore.apply(page.id,[...chosen]);message.textContent=`Restored ${result.restored}; changed since preview ${result.changed}; refused ${result.refused}. Replicas ${result.after.converged?'agree':'still differ'}.`;chosen.clear();draw();}catch(e){message.textContent=e.message;}
       }})));
   });
@@ -1029,7 +1031,12 @@ screens.settings = () => {
             if (!window.confirm(`Switch from ${preview.from} to ${preview.destination}?\nCurrent profile: ${preview.currentEntries} entries retained.\nDestination: ${preview.destinationEntries === null ? "entry count available after journal replay" : `${preview.destinationEntries} entries`}.\n${preview.policy}`)) return;
           }
           state.settings = await api.app.applySettings(partial);
-          toast('ok', 'Settings applied');
+          // What the store refused is put back the way it is in effect; the
+          // runtime has already raised a warning saying why, which an "applied"
+          // toast beside it would contradict.
+          const notKept = S.settingsNotKept(partial, state.settings);
+          for (const name of notKept) fields[name].value = String(state.settings[name] ?? '');
+          if (notKept.length === 0) toast('ok', 'Settings applied');
           render();
           } catch (e) { toast('error', e.message || String(e)); }
         },

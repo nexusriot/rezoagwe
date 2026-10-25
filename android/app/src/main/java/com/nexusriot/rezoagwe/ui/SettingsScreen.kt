@@ -26,8 +26,10 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
+import com.nexusriot.rezoagwe.core.ExportFile
 import com.nexusriot.rezoagwe.core.NodeEngine
 import com.nexusriot.rezoagwe.core.Runtime
+import com.nexusriot.rezoagwe.proto.WireJson
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 
@@ -52,6 +54,7 @@ fun SettingsScreen() {
     // What the last Apply would not keep. Without this a refused value stays in
     // the field with nothing in effect behind it.
     var refusals by rememberSaveable { mutableStateOf(listOf<String>()) }
+    var notice by rememberSaveable { mutableStateOf("") }
     var pendingSwitch by rememberSaveable(stateSaver = androidx.compose.runtime.saveable.listSaver<com.nexusriot.rezoagwe.core.Settings?, Any>(
         save = { s -> if (s == null) emptyList() else listOf(s.nick, s.port, s.advertiseHost, s.seeds, s.psk, s.cluster, s.bootstrapPort, s.tombstoneTtlSec, s.durability) },
         restore = { v -> if (v.isEmpty()) null else com.nexusriot.rezoagwe.core.Settings(v[0] as String, v[1] as Int, v[2] as String, v[3] as String, v[4] as String, v[5] as String, v[6] as Int, v[7] as Long, v[8] as String) },
@@ -72,14 +75,23 @@ fun SettingsScreen() {
     val export = androidx.activity.compose.rememberLauncherForActivityResult(
         androidx.activity.result.contract.ActivityResultContracts.CreateDocument("application/json")
     ) { uri -> if (uri != null) scope.launch(Dispatchers.IO) {
-        try { context.contentResolver.openOutputStream(uri)?.use { it.write(Runtime.engine(context).export().toByteArray()) } }
-        catch (e: Exception) { refusals = listOf("Export failed: ${e.message}") }
+        refusals = emptyList(); notice = ""
+        try {
+            val file = Runtime.engine(context).exportFile()
+            context.contentResolver.openOutputStream(uri)?.use { it.write(WireJson.encodeToString(ExportFile.serializer(), file).toByteArray()) }
+            notice = "Exported ${file.entries.size} entries from cluster ${file.cluster}"
+        } catch (e: Exception) { refusals = listOf("Export failed: ${e.message}") }
     } }
     val importLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
         androidx.activity.result.contract.ActivityResultContracts.OpenDocument()
     ) { uri -> if (uri != null) scope.launch(Dispatchers.IO) {
-        try { context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { Runtime.engine(context).import(it.readText(), false) } }
-        catch (e: Exception) { refusals = listOf("Import failed: ${e.message}") }
+        refusals = emptyList(); notice = ""
+        try {
+            val outcome = context.contentResolver.openInputStream(uri)?.bufferedReader()?.use {
+                Runtime.engine(context).importFile(it.readText(), false)
+            }
+            if (outcome != null) notice = outcome.message(saved.cluster)
+        } catch (e: Exception) { refusals = listOf("Import failed: ${e.message}") }
     } }
     Column(
         modifier = Modifier
@@ -154,8 +166,11 @@ fun SettingsScreen() {
         ) { Text("Apply") }
 
         Text("Data migration is explicit. Export before switching, then import into the destination profile (merge by version).")
-        Button(onClick = { export.launch("rezoagwe-export.json") }) { Text("Export profile data") }
+        Button(onClick = { export.launch("rezoagwe-${saved.cluster}-${System.currentTimeMillis()}.json") }) { Text("Export profile data") }
         Button(onClick = { importLauncher.launch(arrayOf("application/json")) }) { Text("Import into this profile") }
+        if (notice.isNotEmpty()) {
+            Text(text = notice, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 8.dp))
+        }
         if (refusals.isNotEmpty()) {
             Text(
                 text = refusals.joinToString("\n"),

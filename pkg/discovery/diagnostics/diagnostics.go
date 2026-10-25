@@ -152,7 +152,7 @@ func Checks(d Snapshot, now time.Time) []Check {
 	}
 	if d.Persistence.Enabled {
 		p := d.Persistence
-		detail := fmt.Sprintf("Mode: %s; durable: %t; last successful save: %d ms UTC; pending: %t; retained recovery file: %s", p.Mode, p.Durable, p.LastSuccess, p.Pending, p.RecoveryFile)
+		detail := persistenceDetail(p.Mode, p.Durable, p.LastSuccess, p.Pending, p.RecoveryFile)
 		if p.Error != "" {
 			add(SeverityError, "State is not safely saved", p.Error+". "+detail)
 		} else if p.Pending {
@@ -683,4 +683,18 @@ func orDash(s string) string {
 		return "-"
 	}
 	return s
+}
+
+// persistenceDetail is the saved-state line, worded the same in all three
+// implementations. It used to print the raw epoch ("1792948669209 ms UTC") and
+// an empty recovery-file name when there was none.
+func persistenceDetail(mode string, durable bool, lastSuccessMs int64, pending bool, recovery string) string {
+	last := "never"
+	if lastSuccessMs > 0 {
+		last = time.UnixMilli(lastSuccessMs).UTC().Format(time.RFC3339)
+	}
+	if recovery == "" {
+		recovery = "none"
+	}
+	return fmt.Sprintf("Mode: %s; durable: %t; Last save: %s; pending: %t; recovery: %s", mode, durable, last, pending, recovery)
 }

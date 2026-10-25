@@ -1,5 +1,6 @@
 package com.nexusriot.rezoagwe.net
 
+import com.nexusriot.rezoagwe.core.NodeEngine
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.IOException
@@ -128,7 +129,7 @@ class UdpTransport(
                 continue
             }
             val data = packet.data.copyOfRange(packet.offset, packet.offset + packet.length)
-            val from = "${packet.address.hostAddress}:${packet.port}"
+            val from = NodeEngine.joinHostPort(packet.address.hostAddress ?: "", packet.port)
             try {
                 onPacket(Packet(from, data))
             } catch (e: Exception) {

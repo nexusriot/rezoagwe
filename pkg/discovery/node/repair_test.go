@@ -278,3 +278,21 @@ func TestRepairChosenSourceOutranksNewerPeer(t *testing.T) {
 		t.Fatal("repair did not outrank observed peer")
 	}
 }
+
+// MANUAL says pages are capped at 500; a limit over it fell back to the
+// default of 100 instead, a smaller page than either number in play.
+func TestARepairPageLimitOverTheCapIsCappedNotReset(t *testing.T) {
+	n := newTestNode(t, transport.NewMemNet(1), "10.0.0.1:3137")
+	keys := make([]string, 0, 600)
+	for i := 0; i < 600; i++ {
+		k := fmt.Sprintf("k%03d", i)
+		n.Set(k, "v", 0)
+		keys = append(keys, k)
+	}
+	if got := len(n.PreviewRepair(keys, 0, 1000).Items); got != 500 {
+		t.Fatalf("limit 1000 gave a page of %d, want the 500 cap", got)
+	}
+	if got := len(n.PreviewRepair(keys, 0, 0).Items); got != 100 {
+		t.Fatalf("no limit gave a page of %d, want the default 100", got)
+	}
+}

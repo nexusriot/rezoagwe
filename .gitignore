@@ -19,6 +19,10 @@ dist/
 # Go test artifacts
 *.test
 *.out
+# `go test -cpuprofile/-memprofile` and `go tool cover -html` output
+*.prof
+*.pprof
+coverage.html
 # -logfile writes wherever it is pointed, and that is usually here
 *.log
 
@@ -30,6 +34,8 @@ dist/
 *.corrupt-*
 *.profile-owner
 *.migrated
+# what `-snapshot-dir .` rotates in the working directory (rezoagwe-<stamp>.json)
+rezoagwe-[0-9]*-[0-9]*.json
 
 # Android
 android/.gradle/
@@ -39,6 +45,11 @@ android/local.properties
 android/.idea/
 # Kotlin 2.x keeps its build session here
 android/.kotlin/
+android/captures/
+android/app/release/
+# signing keys never belong in the repository, debug or not
+*.jks
+*.keystore
 
 # Electron
 electron/node_modules/

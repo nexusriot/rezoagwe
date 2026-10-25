@@ -518,7 +518,7 @@ func (n *Node) gossipLoop() {
 				From:  n.cfg.AdvertiseAddr,
 				Nick:  n.Model.Nick(),
 				ID:    n.Model.NodeID,
-				Peers: peers,
+				Peers: n.Model.GossipPeers(n.cfg.EvictThreshold),
 			})
 			// Piggyback reconciliation on the same tick: gossip already picked a
 			// random peer, and the digest is what turns "eventually consistent"

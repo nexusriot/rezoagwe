@@ -8,6 +8,7 @@ const { Runtime } = require('./core/runtime');
 const restorePlans = new (require('./core/restore').RestorePlans)();
 const { healthChecks, asReport } = require('./core/diagnostics');
 const { StoreRefusal } = require('./core/refusal');
+const { importMessage } = require('./core/settings');
 const { version, versionZero } = require('./proto/wire');
 
 let runtime;
@@ -143,8 +144,9 @@ async function importStore(asLocalWrites) {
   });
   if (canceled || !filePaths.length) return;
   try {
-    const applied = await runtime.engine.import(fs.readFileSync(filePaths[0], 'utf8'), asLocalWrites);
-    send('toast', { kind: 'ok', text: `Imported ${applied} entr${applied === 1 ? 'y' : 'ies'}` });
+    const text = fs.readFileSync(filePaths[0], 'utf8');
+    const applied = await runtime.engine.import(text, asLocalWrites);
+    send('toast', { kind: 'ok', text: importMessage(applied, JSON.parse(text).cluster, runtime.settings.cluster) });
   } catch (e) {
     send('toast', { kind: 'error', text: `Import failed: ${e.message}` });
   }

@@ -74,9 +74,14 @@ test('everything a build generates is ignored', { skip: !gitAvailable() && 'not 
   const generated = [
     'dist/x', 'build/x', 'x.deb', 'x.test', 'coverage.out', 'debug.log',
     // `make clean` names these, so a build can leave them in the root.
-    'rezoagwe-bootstrap', 'rezoagwe-discovery',
+    'rezoagwe-bootstrap', 'rezoagwe-discovery', 'rezoagwectl',
     // and this is what `go build ./cmd/...` drops without -o
-    'bootstrap', 'discovery',
+    'bootstrap', 'discovery', 'ctl', 'cpu.prof', 'coverage.html',
+    // what a node run from the checkout leaves behind: journal, retained
+    // corruption evidence, profile-migration markers, rotated snapshots
+    'node.json.wal', 'node.json.corrupt-1761400000000', 'node.json.corrupt-1-x.wal',
+    'node.json.profile-owner', 'node.json.migrated', 'rezoagwe-20261025-120000.json',
+    'android/captures/x', 'android/app/release/app-release.apk', 'release.jks', 'debug.keystore',
     'android/.gradle/x', 'android/app/build/x', 'android/local.properties', 'android/.kotlin/x',
     'electron/node_modules/x', 'electron/dist/x', 'electron/shots/keys.png',
     'electron/build/icon.png', 'electron/build/icons/16x16.png',
@@ -96,6 +101,9 @@ test('nothing a person wrote is ignored', { skip: !gitAvailable() && 'not a git 
     'android/app/build.gradle.kts', 'android/gradle/wrapper/gradle-wrapper.jar',
     'electron/package.json', 'electron/package-lock.json', 'electron/Makefile',
     'electron/build-deb.sh', 'electron/src/main.js', 'electron/renderer/index.html',
+    // fixtures and sources sharing a name or suffix with a runtime rule above
+    'testdata/journal.json', 'testdata/boundaries.json', 'pkg/discovery/model/journal.go',
+    'electron/src/core/profiles.js',
     // The repository-wide build/ rule swallows electron/build, where a packaging
     // resource would live; the negation that rescues it is easy to lose.
     'electron/build/entitlements.mac.plist',

@@ -9,12 +9,13 @@ Current behavior and limitations are documented in [MANUAL.md](MANUAL.md) and
 [DESIGN.md](DESIGN.md). Suggestions below are not implemented unless explicitly
 marked otherwise.
 
-## Working-tree additions (October 25, 2026)
+## 0.5.0 additions
 
 Guarded repair and restore, digest negotiation, persistence health/profiles,
 journal modes, resumable Go watches, bounded desktop browsing and bounded repair
-sends are implemented but not assigned a new release version. Operating details
-are in the [manual](MANUAL.md#13-repair-previews-and-cluster-profiles).
+sends shipped in **0.5.0**, together with the device round described under
+*0.5.0* below. Operating details are in the
+[manual](MANUAL.md#13-repair-previews-and-cluster-profiles).
 
 ## Recommended next steps
 
@@ -29,9 +30,17 @@ are in the [manual](MANUAL.md#13-repair-previews-and-cluster-profiles).
 
 ## Shipped
 
-The repository is at **0.4.8** — the version the Makefile stamps into the Go
+The repository is at **0.5.0** — the version the Makefile stamps into the Go
 binaries and their `.deb`, the desktop client's `package.json`, and the Android
 app's `versionName`; a test keeps the four in step.
+
+0.5.0 releases the persistence, profile, restore and guarded-repair work above
+and a device round over it: a tablet, the desktop client and two Go peers, first
+on an IPv6-only network and then on IPv4. It found that gossip kept a dead
+address alive for as long as the cluster ran, that both ports wrote IPv6
+addresses no Go peer can parse, and that the replica-limits warning added in
+this release never fired on the desktop and never cleared on Android. See
+*0.5.0* below.
 
 0.4.8 is a device round: a tablet, the desktop client and two Go peers on one
 LAN. It found that the reflexive address 0.4.7 added had shipped in the Go
@@ -98,6 +107,46 @@ the Kotlin and JavaScript ports — which had been carrying the same anti-entrop
 defect all along.
 
 Newest first.
+
+### 0.5.0 — the device round over the new persistence and profile work
+
+PRITOM M10 tablet, the desktop client and Go `alice` (snapshot) and `bob`
+(`journal-sync`) with a Go rendezvous, cluster `hwlab`. Before it, the pairing
+between the three implementations was checked — the interop suite against real
+Go binaries, and every wire field the release added read back in each port —
+and the new documentation was checked claim by claim against the code. The
+happy path held on IPv6 and on IPv4; the details are in
+[android/README.md](android/README.md#2026-10-25--ipv6-a-moved-address-and-the-new-profile-tools).
+Found and fixed, each with a test that fails without the fix:
+
+* **Gossip kept a dead address alive for ever** (all three). Hearsay was
+  repeated as freely as first-hand contact, so every node evicted an address
+  nobody answered from and re-taught it to the others first. Gossip now lists
+  only peers the sender has heard from within the eviction window (DESIGN §4.2).
+* **IPv6 addresses were written without brackets** (Android, desktop), so a
+  phone on an IPv6 network advertised an address Go refuses. Both now bracket
+  their own address and every observed source, and refuse the unbracketed form;
+  the desktop, which is IPv4-only, refuses an IPv6 advertise host by name.
+* **The replica-limits warning** never reached the desktop's findings (the list
+  sat inside each peer row), would have fired for every Android peer once it did
+  (Kotlin omits zero fields: `"limits":{}`), and on Android outlived the peer.
+* **The desktop kept a refused setting on screen** — port `0`, an IPv6 host —
+  with "Settings applied" beside the warning saying it was not. The form now
+  puts back what is in effect and stays quiet when something was refused.
+* **Android import and export said nothing**, leaving an earlier failure on
+  screen beside a successful merge from another cluster. Both report the
+  outcome and name a foreign cluster, on the desktop too.
+* **The desktop restore preview** called a tombstone "(empty)", printed expiry as
+  epoch seconds, and ignored a press with nothing selected.
+* **Diagnostics printed the last save as raw epoch milliseconds** (Go, Android).
+* **A repair page limit over 500 fell back to 100** instead of the documented
+  cap; `rezoagwe-discovery -h` still gave the pre-profile `-data` default.
+* Two Android unit tests were flaky (about one run in six): `start()` launches a
+  join that state-synced the very divergence the test had set up.
+
+Also: `.gitignore` covers profiler output, rotated snapshots, the profile
+migration markers and signing keys; `.dockerignore` keeps `electron/` (460 MB of
+`node_modules`) out of the e2e build context.
 
 ### 0.4.8 — a second device round, on a different network
 
@@ -775,7 +824,7 @@ coordinator plus fencing enforced by the protected resource. Decide which produc
 is wanted before adding endpoints; do not label a local lease a distributed lock.
 The existing CAS semantics are already documented and tested.
 
-### 3. Resumable watch — implemented in working tree
+### 3. Resumable watch — implemented in 0.5.0
 Bounded in-memory replay, process/prefix-bound SSE cursors, and explicit resnapshot
 signals now ship in the Go gateway/client. History does not survive restart.
 See [watch operation](MANUAL.md#resumable-go-watches). Automatic reconnect and
@@ -823,7 +872,7 @@ with signed Hellos would close that.
 
 ## Tier 4 — Scale
 
-### 9. Append-only log + snapshot — implemented in working tree
+### 9. Append-only log + snapshot — implemented in 0.5.0
 Optional journal and journal-sync modes now exist in Go, Electron and Android,
 with checksummed deltas, checkpointing, tail recovery and persistence health.
 Explicit durable PUT acknowledgements are available in the Go gateway/client/CLI.

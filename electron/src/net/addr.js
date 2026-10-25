@@ -26,7 +26,16 @@ function validPeerAddr(addr) {
   if (typeof addr !== 'string') return false;
   const parts = splitHostPort(addr);
   if (!parts) return false;
+  // An IPv6 literal must be bracketed, as Go's net.SplitHostPort insists:
+  // "2a00::1:3137" has no single reading and a Go peer refuses it.
+  const host = addr.slice(0, addr.lastIndexOf(':'));
+  if (host.includes(':') && !(host.startsWith('[') && host.endsWith(']'))) return false;
   return !/[\s]/.test(parts.host);
+}
+
+/** "host:port", bracketing an IPv6 literal the way every peer parses it. */
+function joinHostPort(host, port) {
+  return host.includes(':') && !host.startsWith('[') ? `[${host}]:${port}` : `${host}:${port}`;
 }
 
 /** Canonicalises an address so a node recognises the aliases of its own. */
@@ -81,4 +90,4 @@ function sameHost(advertised, observed) {
   return true;
 }
 
-module.exports = { splitHostPort, validPeerAddr, normalizeAddr, targetOf, localIpv4, sameHost };
+module.exports = { splitHostPort, joinHostPort, validPeerAddr, normalizeAddr, targetOf, localIpv4, sameHost };

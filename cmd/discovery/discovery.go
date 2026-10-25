@@ -26,7 +26,7 @@ func main() {
 	nodeAddr := flag.String("node", ":3137", "address to bind")
 	advertise := flag.String("advertise", "", "address peers should use to reach this node; \"auto\" asks bootstrap (default: -node)")
 	nick := flag.String("nick", "anon", "chat nickname")
-	data := flag.String("data", "", "state file (default: <config dir>/rezoagwe/<node>.json; \"-\" disables)")
+	data := flag.String("data", "", "state file (default: <config dir>/rezoagwe/profiles/<cluster hash>/<node>.json; \"-\" disables)")
 	psk := flag.String("psk", "", "pre-shared key authenticating every packet")
 	durability := flag.String("durability", "snapshot", "persistence mode: snapshot, journal, journal-sync")
 	cluster := flag.String("cluster", "rezoagwe", "cluster name; nodes only talk to their own cluster")

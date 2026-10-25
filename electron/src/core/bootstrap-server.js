@@ -6,6 +6,7 @@ const W = require('../proto/wire');
 const { Kind } = W;
 const { Codec } = require('../proto/codec');
 const { UdpTransport } = require('../net/udp');
+const { joinHostPort } = require('../net/addr');
 const { writeFrame, readFrame } = require('../net/framing');
 const { Persister } = require('./persistence');
 
@@ -162,7 +163,7 @@ class BootstrapServer extends EventEmitter {
       // A stream is dialled from an ephemeral source port, so only the host of
       // this address means anything — which is why the rule that consumes it
       // compares hosts.
-      const from = conn.remoteAddress ? `${conn.remoteAddress}:${conn.remotePort}` : '';
+      const from = conn.remoteAddress ? joinHostPort(conn.remoteAddress, conn.remotePort) : '';
       this.handle(frame.kind, body, from, (reply) => writeFrame(conn, reply));
     } catch {
       // a malformed or unauthenticated stream is dropped in silence

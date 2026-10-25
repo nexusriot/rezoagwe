@@ -3,7 +3,7 @@
 const dgram = require('node:dgram');
 const net = require('node:net');
 const { EventEmitter } = require('node:events');
-const { targetOf } = require('./addr');
+const { targetOf, joinHostPort } = require('./addr');
 
 /**
  * The largest payload a datagram can carry: 65535 less the 8-byte UDP and
@@ -49,7 +49,7 @@ class UdpTransport extends EventEmitter {
     this.port = port;
     this.closed = false;
     socket.on('message', (data, rinfo) => {
-      this.emit('packet', { from: `${rinfo.address}:${rinfo.port}`, data: Buffer.from(data) });
+      this.emit('packet', { from: joinHostPort(rinfo.address, rinfo.port), data: Buffer.from(data) });
     });
     socket.on('error', (e) => {
       if (!this.closed) this.emit('error', { what: 'datagram socket', error: e });

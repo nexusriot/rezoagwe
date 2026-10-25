@@ -112,6 +112,10 @@ Then in **Settings**: seeds `192.168.1.10:9999`, cluster `home`, key `demo`.
 Leave *Advertise host* blank and the app uses its own LAN address, which is what
 peers need to reach it.
 
+The client speaks **IPv4 only** (its sockets are `udp4`). Settings refuse an
+IPv6 advertise host by name instead of publishing an address nothing listens on;
+Go nodes and the Android app can use IPv6, but not to reach this client.
+
 Nodes only talk to peers with the same cluster **and** key. Without a key the
 framing key comes from the cluster name alone: that separates two clusters
 sharing a network, but provides no secrecy.

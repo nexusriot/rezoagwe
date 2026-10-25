@@ -790,3 +790,52 @@ func TestPartitionedCASClaimsBothSucceedLocally(t *testing.T) {
 	}
 	waitFor(t, "LWW settles the claims", func() bool { av, _ := a.Get("claim"); bv, _ := b.Get("claim"); return av == winner && bv == winner })
 }
+
+// A dead address must die out. Hearsay used to be repeated as freely as
+// first-hand contact, so each node evicted the address after the threshold but
+// taught it to the others first, and it circulated for as long as the cluster
+// ran. Found on hardware when a phone moved from IPv6 to IPv4: its old address
+// stayed on every graph and every send to it failed, minutes after the move.
+func TestADeadAddressIsNotKeptAliveByGossip(t *testing.T) {
+	net := transport.NewMemNet(1)
+	addrs := []string{"10.0.0.1:3137", "10.0.0.2:3137", "10.0.0.3:3137"}
+	nodes := make([]*Node, 0, len(addrs))
+	for _, addr := range addrs {
+		n, err := New(Config{
+			NodeAddr:          addr,
+			Nick:              addr,
+			Transport:         net.Node(addr),
+			GossipInterval:    15 * time.Millisecond,
+			HeartbeatInterval: 15 * time.Millisecond,
+			EvictThreshold:    150 * time.Millisecond,
+			SweepInterval:     idleInterval,
+		}, nil)
+		if err != nil {
+			t.Fatalf("new node %s: %v", addr, err)
+		}
+		n.Start()
+		t.Cleanup(n.Stop)
+		nodes = append(nodes, n)
+	}
+	for _, n := range nodes {
+		for _, addr := range addrs {
+			n.Model.AddPeer(addr)
+		}
+	}
+	const dead = "10.0.0.9:3137"
+	nodes[0].Model.AddPeer(dead)
+
+	// Several eviction windows: long enough for the old behaviour to have
+	// passed the address round the whole cluster many times over.
+	time.Sleep(900 * time.Millisecond)
+	for _, n := range nodes {
+		for _, p := range n.Model.GetNodes() {
+			if p == dead {
+				t.Fatalf("%s still holds the dead address %s", n.Addr(), dead)
+			}
+		}
+		if got := len(n.Model.GetNodes()); got != 2 {
+			t.Fatalf("%s has %d peers, want the 2 live ones: %v", n.Addr(), got, n.Model.GetNodes())
+		}
+	}
+}

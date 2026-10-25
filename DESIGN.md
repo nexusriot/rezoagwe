@@ -267,6 +267,17 @@ stall startup.
   reads, in the one log a user actually watches, as a node leaving twice. It
   shows up when a node drops to zero peers, re-asks its seeds (the only time
   it re-discovers) and adopts an address bootstrap has not yet aged out.
+
+  **Gossip passes on only what the sender has heard first-hand.** A
+  `PeerGossip` lists the peers from which a packet carrying their own address
+  as sender arrived within the eviction window — not every address the node
+  holds. A peer adopted from someone else's gossip is hearsay until it speaks.
+  Repeating hearsay is how a dead address outlived its owner: each node evicted
+  it after 15 s, but taught it to the others first, so it circulated for as
+  long as the cluster ran. It was found when a tablet moved from IPv6 to IPv4:
+  its old address stayed on every graph, joined and left the chat every few
+  seconds, and every send to it failed, minutes after the move. All three
+  implementations apply the rule; each has a test that fails without it.
 * **TTL sweep** turns expired entries into tombstones, keeping each entry's
   existing version (§5.2), and — when `-tombstone-ttl` is set — reclaims
   tombstones older than that.

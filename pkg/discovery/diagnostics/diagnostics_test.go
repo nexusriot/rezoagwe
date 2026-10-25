@@ -830,3 +830,17 @@ func TestARecentSendErrorIsStillAWarning(t *testing.T) {
 		t.Fatal("a node failing to send right now reads as healthy")
 	}
 }
+
+// Read off a live node's report: "last successful save: 1792948669209 ms UTC;
+// ... retained recovery file: " — a raw epoch and an empty name. The Android
+// port printed the same; the desktop already said it as a time.
+func TestTheSavedStateLineReadsAsATime(t *testing.T) {
+	got := persistenceDetail("journal-sync", true, 1792948669209, false, "")
+	want := "Mode: journal-sync; durable: true; Last save: 2026-10-25T17:17:49Z; pending: false; recovery: none"
+	if got != want {
+		t.Fatalf("got  %q\nwant %q", got, want)
+	}
+	if got := persistenceDetail("snapshot", false, 0, true, "/x.corrupt-1"); !strings.Contains(got, "Last save: never") || !strings.Contains(got, "recovery: /x.corrupt-1") {
+		t.Fatalf("got %q", got)
+	}
+}

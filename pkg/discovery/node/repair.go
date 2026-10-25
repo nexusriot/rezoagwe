@@ -149,8 +149,12 @@ func (n *Node) RepairPlanPage(id string, offset, limit int) RepairPlan {
 	if offset > len(p.Items) {
 		offset = len(p.Items)
 	}
-	if limit <= 0 || limit > 500 {
+	// Capped, as documented: asking for 1000 used to fall back to the default
+	// of 100, a smaller page than either number the caller had in mind.
+	if limit <= 0 {
 		limit = 100
+	} else if limit > 500 {
+		limit = 500
 	}
 	end := offset + limit
 	if end > len(p.Items) {

@@ -143,6 +143,34 @@
    */
   const FINGERPRINT_BUCKETS = 16;
 
+  /**
+   * The settings the store did not keep as typed: a refused port, a blank
+   * nickname, an address this client cannot use. Trimming is not a refusal.
+   * The form is not repainted on events, so without this a refused value
+   * stays on screen with the old one quietly in effect behind it.
+   */
+  /**
+   * One side of a restore preview row. A tombstone printed "(empty)" — the same
+   * words as a key holding an empty string, which is a legal and different
+   * value — and an expiry printed as raw epoch seconds.
+   */
+  function describeRestoreSide(u) {
+    if (!u) return '(absent)';
+    if (u.action === 'delete') return '(deleted)';
+    const expiry = u.expiresAt ? `expires ${new Date(u.expiresAt * 1000).toISOString()}` : 'expires never';
+    return `${displayValue(u.value)} · ${expiry}`;
+  }
+
+  function settingsNotKept(typed, stored) {
+    const out = [];
+    for (const [name, value] of Object.entries(typed)) {
+      if (typeof value === 'boolean' || !(name in stored)) continue;
+      const want = typeof value === 'number' ? value : String(value ?? '').trim();
+      if (want !== stored[name]) out.push(name);
+    }
+    return out;
+  }
+
   function isStale(lastSeenMs, nowMs) {
     return lastSeenMs > 0 && nowMs - lastSeenMs > STALE_AFTER_MS;
   }
@@ -162,6 +190,8 @@
     statusLabel,
     ttlRemaining,
     isStale,
+    settingsNotKept,
+    describeRestoreSide,
     STALE_AFTER_MS,
     FINGERPRINT_BUCKETS,
     PALETTE,

@@ -2,6 +2,8 @@
 # context, and the Android tree alone is larger than the rest of the repository.
 .git
 android
+# the e2e image builds only cmd/ and pkg/; electron/node_modules alone is ~460 MB
+electron
 build
 dist
 DEBIAN

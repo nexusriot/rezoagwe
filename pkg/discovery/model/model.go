@@ -48,8 +48,11 @@ type Model struct {
 	Store    *KVStore
 	Nodes    *sync.Map // address -> bool
 	lastSeen sync.Map  // address -> time.Time (last packet observed)
-	nicks    sync.Map  // address -> string (peer-reported nickname)
-	views    sync.Map  // address -> PeerView (the peer list that peer last gossiped)
+	// heard is when a packet carrying this address as its sender last arrived.
+	// lastSeen cannot answer that: adopting a peer from gossip stamps it too.
+	heard sync.Map // address -> time.Time
+	nicks sync.Map // address -> string (peer-reported nickname)
+	views sync.Map // address -> PeerView (the peer list that peer last gossiped)
 	// normalized is the peer set keyed by NormalizeAddr, so a lookup by the
 	// address a datagram *came from* is O(1). Peers are stored under the
 	// address they advertise, which is rarely the same string.
@@ -350,13 +353,36 @@ func (bn *Model) TouchPeer(addr string) {
 	if addr == "" || bn.IsSelf(addr) {
 		return
 	}
-	bn.lastSeen.Store(addr, time.Now())
+	now := time.Now()
+	bn.lastSeen.Store(addr, now)
+	bn.heard.Store(addr, now)
+}
+
+// GossipPeers is the peer list worth passing on: the peers this node has heard
+// from itself within window. A peer adopted from gossip and never heard is
+// hearsay, and repeating hearsay is how a dead address outlives its owner —
+// each node evicts it after the threshold, but re-teaches it to the others
+// first, so an address nobody answers from circulates for as long as the
+// cluster runs. Found when a phone moved from IPv6 to IPv4: its old address
+// was still on every graph, and every send to it failed, minutes later.
+func (bn *Model) GossipPeers(window time.Duration) []string {
+	cutoff := time.Now().Add(-window)
+	var res []string
+	bn.Nodes.Range(func(key, value interface{}) bool {
+		addr := key.(string)
+		if t, ok := bn.heard.Load(addr); ok && t.(time.Time).After(cutoff) {
+			res = append(res, addr)
+		}
+		return true
+	})
+	return res
 }
 
 // RemovePeer drops a peer entirely.
 func (bn *Model) RemovePeer(addr string) {
 	bn.Nodes.Delete(addr)
 	bn.lastSeen.Delete(addr)
+	bn.heard.Delete(addr)
 	bn.nicks.Delete(addr)
 	bn.views.Delete(addr)
 	bn.normalized.Delete(NormalizeAddr(addr))

@@ -590,3 +590,22 @@ test('the GC exposure is reported before anything is deleted', () => {
   d.store = { ...d.store, tombstones: 0 };
   assert.ok(find(healthChecks(d, Date.now()), 'Tombstones are reclaimed'));
 });
+
+// Found driving the desktop on hardware: a refused port or an IPv6 advertise
+// host stayed on screen after Apply — the settings pane never repaints — with
+// "Settings applied" toasted next to the warning that said it was not.
+test('a refused setting is named so the form can put back what is in effect', () => {
+  const stored = { nick: 'desk', port: 3137, advertiseHost: '', seeds: 'h:9999', psk: 'k', tombstoneTtlSec: 0 };
+  assert.deepEqual(S.settingsNotKept({ nick: ' desk ', port: 3137, advertiseHost: '', seeds: 'h:9999 ', psk: 'k', autoStartNode: true }, stored), []);
+  assert.deepEqual(S.settingsNotKept({ nick: 'desk', port: 0, advertiseHost: '2a00::1', seeds: 'h:9999', psk: 'k' }, stored), ['port', 'advertiseHost']);
+  assert.deepEqual(S.settingsNotKept({ nick: '', port: 3137 }, stored), ['nick']);
+});
+
+// Seen restoring a Go export on the desktop: a key deleted locally read
+// "Current: (empty)", indistinguishable from a key holding "".
+test('a restore preview tells a tombstone from an empty value, and dates an expiry', () => {
+  assert.equal(S.describeRestoreSide(null), '(absent)');
+  assert.equal(S.describeRestoreSide({ action: 'delete', value: '' }), '(deleted)');
+  assert.equal(S.describeRestoreSide({ action: 'set', value: '', expiresAt: 0 }), '(empty) · expires never');
+  assert.equal(S.describeRestoreSide({ action: 'set', value: 'v', expiresAt: 1792948030 }), 'v · expires 2026-10-25T17:07:10.000Z');
+});

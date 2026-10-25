@@ -295,8 +295,15 @@ function encodeHello(h) {
     ['nick', 'id', 'chat_seq']);
 }
 
+// A port that omits zero-valued fields (the Kotlin encoder does) sends
+// `"limits":{}` for "no limits"; both fields are read with their zero default so
+// that compares equal to a node that spelled the zeros out.
+function decodeStoreLimits(l) {
+  return { max_value_bytes: num(l.max_value_bytes), max_keys: num(l.max_keys) };
+}
+
 function decodeHello(o) {
-  return { from: str(o && o.from), nick: str(o && o.nick), id: str(o && o.id), chatSeq: num(o && o.chat_seq), ...(o?.limits ? {limits:o.limits} : {}) };
+  return { from: str(o && o.from), nick: str(o && o.nick), id: str(o && o.id), chatSeq: num(o && o.chat_seq), ...(o && o.limits && typeof o.limits === 'object' ? { limits: decodeStoreLimits(o.limits) } : {}) };
 }
 
 function encodeGoodbye(g) {
